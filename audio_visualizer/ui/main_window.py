@@ -1354,7 +1354,6 @@ class MainWindow(QMainWindow):
                     continue
                 
                 # Cache the computed tile
-                logger.debug(f"Storing tile: view={view_type}, time={tile_time_range}, freq={tile_freq_range}, shape={tile_data.shape}")
                 self.tile_cache.put(
                     view_type, tile_time_range, tile_freq_range, tile_data, resolution_level=0
                 )
@@ -1434,22 +1433,17 @@ class MainWindow(QMainWindow):
                     tile_freq_end = min(current_freq + tile_freq_bandwidth, freq_end)
                     
                     # Get tile from cache
-                    tile_key = (current_time, tile_time_end)
-                    freq_key = (current_freq, tile_freq_end)
-                    logger.debug(f"Retrieving tile: view={view_type}, time={tile_key}, freq={freq_key}")
-                    
                     tile_data = self.tile_cache.get(
                         view_type,
-                        tile_key,
-                        freq_key,
+                        (current_time, tile_time_end),
+                        (current_freq, tile_freq_end),
                         resolution_level=0
                     )
                     
                     if tile_data is not None and tile_data.size > 0:
-                        logger.debug(f"Found tile: shape={tile_data.shape}")
                         freq_tiles.append(tile_data)
                     else:
-                        logger.warning(f"Missing tile data for time={current_time:.1f}-{tile_time_end:.1f}, freq={current_freq:.1f}-{tile_freq_end:.1f}")
+                        logger.warning(f"Missing tile for time={current_time:.1f}-{tile_time_end:.1f}, freq={current_freq:.1f}-{tile_freq_end:.1f}")
                     
                     current_freq = tile_freq_end
                 
