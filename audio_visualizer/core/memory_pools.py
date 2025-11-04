@@ -298,6 +298,80 @@ class MemoryOptimizer:
                 cp.add(array, value, out=out)
                 return out
     
+    def inplace_log10(self, array, out=None):
+        """In-place log10 to avoid temporary arrays.
+        
+        Args:
+            array: Input array
+            out: Output buffer (if None, modifies array in-place)
+            
+        Returns:
+            Result array
+        """
+        if out is None:
+            if isinstance(array, np.ndarray):
+                np.log10(array, out=array)
+                return array
+            elif HAS_CUPY and isinstance(array, cp.ndarray):
+                cp.log10(array, out=array)
+                return array
+        else:
+            if isinstance(array, np.ndarray):
+                np.log10(array, out=out)
+                return out
+            elif HAS_CUPY and isinstance(array, cp.ndarray):
+                cp.log10(array, out=out)
+                return out
+    
+    def inplace_maximum(self, array, value, out=None):
+        """In-place maximum to avoid temporary arrays.
+        
+        Args:
+            array: Input array
+            value: Comparison value
+            out: Output buffer (if None, modifies array in-place)
+            
+        Returns:
+            Result array
+        """
+        if out is None:
+            if isinstance(array, np.ndarray):
+                np.maximum(array, value, out=array)
+                return array
+            elif HAS_CUPY and isinstance(array, cp.ndarray):
+                cp.maximum(array, value, out=array)
+                return array
+        else:
+            if isinstance(array, np.ndarray):
+                np.maximum(array, value, out=out)
+                return out
+            elif HAS_CUPY and isinstance(array, cp.ndarray):
+                cp.maximum(array, value, out=out)
+                return out
+    
+    def inplace_abs(self, array, out=None):
+        """In-place absolute value to avoid temporary arrays.
+        
+        Args:
+            array: Input array (complex or real)
+            out: Output buffer (if None, creates new array for complex input)
+            
+        Returns:
+            Result array
+        """
+        if isinstance(array, np.ndarray):
+            if out is None and np.iscomplexobj(array):
+                # Complex abs needs output buffer (can't modify in-place)
+                out = self.get_cpu_workspace(array.shape, dtype=np.float32)
+            np.abs(array, out=out if out is not None else array)
+            return out if out is not None else array
+        elif HAS_CUPY and isinstance(array, cp.ndarray):
+            if out is None and cp.iscomplexobj(array):
+                # Complex abs needs output buffer
+                out = self.get_gpu_workspace(array.shape, dtype=cp.float32)
+            cp.abs(array, out=out if out is not None else array)
+            return out if out is not None else array
+    
     def cleanup(self):
         """Cleanup all workspace pools."""
         self.cpu_pool.clear()
