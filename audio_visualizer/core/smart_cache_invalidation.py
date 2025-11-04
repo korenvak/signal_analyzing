@@ -168,7 +168,8 @@ class SmartCacheInvalidator:
         """Determine which cache dependencies are affected by parameter changes."""
         affected = set()
         
-        for param_type in changed_params.keys():\n            deps = self.parameter_dependencies.get(param_type, set())
+        for param_type in changed_params.keys():
+            deps = self.parameter_dependencies.get(param_type, set())
             affected.update(deps)
         
         return affected
