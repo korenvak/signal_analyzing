@@ -1411,19 +1411,39 @@ class MainWindow(QMainWindow):
             # For now, stitch tiles together into a single image
             # TODO: Implement proper texture atlas rendering in Phase 3.5
             
-            # Get all tile data
+            # Reconstruct tile grid from time/freq ranges
+            tile_time_duration = 60.0  # Must match ensure_tiles_exist
+            tile_freq_bandwidth = 2000.0
+            
+            time_start, time_end = time_range
+            freq_start, freq_end = freq_range
+            
+            # Get all tile data by reconstructing the grid
             tile_data_list = []
-            for tile_info in tiles:
+            current_time = time_start
+            
+            while current_time < time_end:
+                tile_time_end = min(current_time + tile_time_duration, time_end)
+                current_freq = freq_start
+                
+                # For now, only handle first frequency band (full spectrum)
+                # Multi-band rendering can be added later
+                tile_freq_end = freq_end
+                
                 # Get tile from cache
                 tile_data = self.tile_cache.get(
                     view_type,
-                    tile_info.get('time_range', time_range),
-                    tile_info.get('freq_range', freq_range),
+                    (current_time, tile_time_end),
+                    (current_freq, tile_freq_end),
                     resolution_level=0
                 )
                 
-                if tile_data is not None:
+                if tile_data is not None and tile_data.size > 0:
                     tile_data_list.append(tile_data)
+                else:
+                    logger.warning(f"Missing tile data for time={current_time:.1f}-{tile_time_end:.1f}")
+                
+                current_time = tile_time_end
             
             if not tile_data_list:
                 logger.warning("No tile data available for rendering")
