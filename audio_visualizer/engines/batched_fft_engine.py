@@ -163,6 +163,9 @@ class BatchedFFTEngine:
         # Memory optimizer for workspace management
         self.memory_optimizer = get_memory_optimizer()
         
+        # Window function cache - eliminates repeated computation
+        self._window_cache: Dict[Tuple[int, str], np.ndarray] = {}
+        
         logger.info(f"BatchedFFTEngine initialized (GPU: {self.use_gpu})")
     
     def get_or_create_plan(self, fft_size: int, batch_size: int) -> BatchedFFTPlan:
@@ -179,6 +182,33 @@ class BatchedFFTEngine:
         if key not in self.plans:
             self.plans[key] = BatchedFFTPlan(fft_size, batch_size, self.use_gpu)
         return self.plans[key]
+    
+    def _get_window(self, size: int, window_type: str) -> np.ndarray:
+        """Get window function from cache or create it.
+        
+        Args:
+            size: Window size
+            window_type: Window type ('hann', 'hamming', 'blackman', etc.)
+            
+        Returns:
+            Window array (float32)
+        """
+        key = (size, window_type)
+        if key not in self._window_cache:
+            # Create window (always float32)
+            if window_type == 'hann':
+                window = np.hanning(size).astype(np.float32)
+            elif window_type == 'hamming':
+                window = np.hamming(size).astype(np.float32)
+            elif window_type == 'blackman':
+                window = np.blackman(size).astype(np.float32)
+            else:
+                window = np.ones(size, dtype=np.float32)
+            
+            self._window_cache[key] = window
+            logger.debug(f"Cached window: {window_type}({size})")
+        
+        return self._window_cache[key]
     
     def compute_stft_batched(self, audio: np.ndarray, fft_size: int = 2048,
                             hop_length: int = 512, window: str = 'hann',
@@ -210,15 +240,8 @@ class BatchedFFTEngine:
             logger.warning(f"No frames to compute")
             return np.zeros((fft_size // 2 + 1, 1), dtype=np.float32), np.array([0.0], dtype=np.float32)
         
-        # Create window
-        if window == 'hann':
-            win = np.hanning(fft_size).astype(np.float32)
-        elif window == 'hamming':
-            win = np.hamming(fft_size).astype(np.float32)
-        elif window == 'blackman':
-            win = np.blackman(fft_size).astype(np.float32)
-        else:
-            win = np.ones(fft_size, dtype=np.float32)
+        # Get window from cache (eliminates repeated computation)
+        win = self._get_window(fft_size, window)
         
         # Prepare framed data (batch) using workspace pool
         # Shape: (n_frames, fft_size)
@@ -234,8 +257,8 @@ class BatchedFFTEngine:
         
         # Execute batched FFT
         if use_gpu and HAS_CUPY:
-            # Move to GPU
-            gpu_frames = cp.asarray(frames)
+            # Move to GPU using pinned memory for 2-3x faster transfer
+            gpu_frames = self.memory_optimizer.copy_to_gpu_pinned(frames)
             stft_gpu = plan.execute(gpu_frames)
             
             # Compute magnitude on GPU
@@ -258,14 +281,15 @@ class BatchedFFTEngine:
             # Transpose to (freq_bins, time_frames)
             magnitude_db = magnitude_db.T
         
-        # Generate time array
-        times = np.arange(n_frames) * hop_length / sample_rate
+        # Generate time array (float32 from start)
+        times = (np.arange(n_frames, dtype=np.float32) * hop_length) / sample_rate
         
-        return magnitude_db.astype(np.float32), times.astype(np.float32)
+        return magnitude_db.astype(np.float32), times
     
     def cleanup(self):
-        """Cleanup FFT plans and workspaces."""
+        """Cleanup FFT plans, window cache, and workspaces."""
         self.plans.clear()
+        self._window_cache.clear()
         
         # Cleanup memory optimizer
         if hasattr(self, 'memory_optimizer'):
