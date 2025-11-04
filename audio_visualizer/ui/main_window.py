@@ -33,6 +33,7 @@ from ..engines.cepstrogram_engine import CepstrogramEngine
 from ..engines.fk_engine import FKEngine
 from ..rendering.render_manager import RenderManager
 from ..rendering.texture_atlas import TextureAtlas
+from ..rendering.shader_renderer import get_shader_renderer
 
 logger = logging.getLogger(__name__)
 
@@ -956,10 +957,10 @@ class ControlsWidget(QWidget):
         """Connect widget signals."""
         self.fft_size_combo.currentTextChanged.connect(self.emit_parameters_changed)
         self.hop_combo.currentTextChanged.connect(self.emit_parameters_changed)
-        self.colormap_combo.currentTextChanged.connect(self.colormap_changed.emit)
+        self.colormap_combo.currentTextChanged.connect(self.on_colormap_changed_realtime)
         
-        self.db_min_slider.valueChanged.connect(self.update_db_range)
-        self.db_max_slider.valueChanged.connect(self.update_db_range)
+        self.db_min_slider.valueChanged.connect(self.update_db_range_realtime)
+        self.db_max_slider.valueChanged.connect(self.update_db_range_realtime)
         
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
     
@@ -970,6 +971,16 @@ class ControlsWidget(QWidget):
             'hop_length': int(self.hop_combo.currentText())
         }
         self.parameters_changed.emit(params)
+    
+    def on_colormap_changed_realtime(self, colormap: str):
+        """Handle real-time colormap changes with shader uniforms."""
+        # Emit traditional signal for compatibility
+        self.colormap_changed.emit(colormap)
+        
+        # PERFORMANCE: Update shader uniforms directly for instant change
+        main_window = self.parent()
+        if hasattr(main_window, 'update_shader_colormap'):
+            main_window.update_shader_colormap(colormap)
     
     def update_db_range(self):
         """Update dB range display and emit signal."""
@@ -989,6 +1000,31 @@ class ControlsWidget(QWidget):
         self.db_max_label.setText(str(db_max))
         
         self.db_range_changed.emit(db_min, db_max)
+    
+    def update_db_range_realtime(self):
+        """Handle real-time dB range changes with shader uniforms."""
+        db_min = self.db_min_slider.value()
+        db_max = self.db_max_slider.value()
+        
+        # Ensure min < max
+        if db_min >= db_max:
+            if self.sender() == self.db_min_slider:
+                db_max = db_min + 10
+                self.db_max_slider.setValue(db_max)
+            else:
+                db_min = db_max - 10
+                self.db_min_slider.setValue(db_min)
+        
+        self.db_min_label.setText(str(db_min))
+        self.db_max_label.setText(str(db_max))
+        
+        # Emit traditional signal for compatibility
+        self.db_range_changed.emit(db_min, db_max)
+        
+        # PERFORMANCE: Update shader uniforms directly for instant change
+        main_window = self.parent()
+        if hasattr(main_window, 'update_shader_db_range'):
+            main_window.update_shader_db_range(db_min, db_max)
 
 class MainWindow(QMainWindow):
     """Main application window."""
@@ -1015,6 +1051,9 @@ class MainWindow(QMainWindow):
         
         # Smart Cache Invalidation
         self.smart_invalidator = get_smart_cache_invalidator()
+        
+        # Shader-based Rendering for instant parameter updates
+        self.shader_renderer = get_shader_renderer()
         
         # Tile-based caching and rendering
         self.tile_cache = TileCache(max_memory_tiles=100, max_disk_gb=10.0)
@@ -1359,6 +1398,36 @@ class MainWindow(QMainWindow):
                 
         except Exception as e:
             logger.error(f"Error updating dB range: {e}")
+    
+    def update_shader_colormap(self, colormap: str):
+        """Update shader colormap in real-time without recomputation."""
+        try:
+            if self.shader_renderer.is_enabled():
+                changed = self.shader_renderer.set_colormap(colormap)
+                if changed:
+                    # Trigger redraw if shader is active
+                    self.update_displays()
+                    logger.debug(f"Shader colormap updated instantly: {colormap}")
+            else:
+                # Fallback to traditional colormap change
+                logger.debug(f"Shader not available, using traditional colormap: {colormap}")
+        except Exception as e:
+            logger.error(f"Error updating shader colormap: {e}")
+    
+    def update_shader_db_range(self, db_min: float, db_max: float):
+        """Update shader dB range in real-time without recomputation."""
+        try:
+            if self.shader_renderer.is_enabled():
+                changed = self.shader_renderer.set_db_range(db_min, db_max)
+                if changed:
+                    # Trigger redraw if shader is active
+                    self.update_displays()
+                    logger.debug(f"Shader dB range updated instantly: [{db_min:.1f}, {db_max:.1f}]")
+            else:
+                # Fallback to traditional dB range change
+                logger.debug(f"Shader not available, using traditional dB range: [{db_min:.1f}, {db_max:.1f}]")
+        except Exception as e:
+            logger.error(f"Error updating shader dB range: {e}")
     
     def on_tab_changed(self, index: int):
         """Handle tab changes - lazy loading trigger."""
