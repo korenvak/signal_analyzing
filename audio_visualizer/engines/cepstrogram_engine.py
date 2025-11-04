@@ -14,6 +14,7 @@ except ImportError:
 
 from ..core.cache_manager import CacheManager
 from ..core.task_manager import TaskManager, TaskPriority
+from ..core.memory_pools import get_memory_optimizer
 from .spectrogram_engine import SpectrogramEngine
 
 class CepstrogramEngine:
@@ -34,6 +35,9 @@ class CepstrogramEngine:
         # GPU optimization
         self.use_gpu = HAS_CUPY
         self.gpu_batch_size = 8
+        
+        # Memory optimizer for workspace management
+        self.memory_optimizer = get_memory_optimizer()
         
         # Threading
         self._computation_lock = threading.RLock()
@@ -79,28 +83,30 @@ class CepstrogramEngine:
     
     def _create_mel_filterbank(self, freq_bins: np.ndarray, 
                               sample_rate: int) -> np.ndarray:
-        """Create mel-frequency filterbank."""
+        """Create mel-frequency filterbank (float32, cached)."""
         if self._mel_filterbank is not None:
             return self._mel_filterbank
         
-        # Frequency range
-        min_freq = 0
-        max_freq = sample_rate / 2
+        # Frequency range (float32 from start)
+        min_freq = 0.0
+        max_freq = float(sample_rate) / 2.0
         
         if self.use_mel_scale:
             # Convert to mel scale
-            min_mel = self._hz_to_mel(np.array([min_freq]))[0]
-            max_mel = self._hz_to_mel(np.array([max_freq]))[0]
+            min_mel = self._hz_to_mel(np.array([min_freq], dtype=np.float32))[0]
+            max_mel = self._hz_to_mel(np.array([max_freq], dtype=np.float32))[0]
             
-            # Create mel-spaced filter centers
-            mel_centers = np.linspace(min_mel, max_mel, self.mel_filters + 2)
+            # Create mel-spaced filter centers (float32)
+            mel_centers = np.linspace(min_mel, max_mel, self.mel_filters + 2, dtype=np.float32)
             hz_centers = self._mel_to_hz(mel_centers)
         else:
-            # Linear frequency spacing
-            hz_centers = np.linspace(min_freq, max_freq, self.mel_filters + 2)
+            # Linear frequency spacing (float32)
+            hz_centers = np.linspace(min_freq, max_freq, self.mel_filters + 2, dtype=np.float32)
         
-        # Create triangular filters
-        filterbank = np.zeros((self.mel_filters, len(freq_bins)))
+        # Create triangular filters using workspace pool (float32)
+        filterbank = self.memory_optimizer.get_cpu_workspace(
+            (self.mel_filters, len(freq_bins)), dtype=np.float32)
+        filterbank.fill(0.0)
         
         for i in range(self.mel_filters):
             left = hz_centers[i]
@@ -112,38 +118,37 @@ class CepstrogramEngine:
             center_idx = np.argmin(np.abs(freq_bins - center))
             right_idx = np.argmin(np.abs(freq_bins - right))
             
-            # Create triangular filter
+            # Create triangular filter (vectorized for speed)
             if left_idx < center_idx:
                 # Rising edge
-                for j in range(left_idx, center_idx + 1):
-                    if center_idx > left_idx:
-                        filterbank[i, j] = (j - left_idx) / (center_idx - left_idx)
+                indices = np.arange(left_idx, center_idx + 1)
+                filterbank[i, indices] = (indices - left_idx).astype(np.float32) / (center_idx - left_idx)
             
             if center_idx < right_idx:
                 # Falling edge
-                for j in range(center_idx, right_idx + 1):
-                    if right_idx > center_idx:
-                        filterbank[i, j] = 1.0 - (j - center_idx) / (right_idx - center_idx)
+                indices = np.arange(center_idx, right_idx + 1)
+                filterbank[i, indices] = 1.0 - (indices - center_idx).astype(np.float32) / (right_idx - center_idx)
         
-        self._mel_filterbank = filterbank
+        # Cache the filterbank (copy from workspace)
+        self._mel_filterbank = filterbank.copy()
         self._mel_freqs = hz_centers[1:-1]  # Remove endpoints
         
-        return filterbank
+        return self._mel_filterbank
     
     def compute_mfcc_gpu(self, magnitude_spectrum: cp.ndarray, 
                         frequencies: np.ndarray,
                         progress_callback: Optional[Callable] = None) -> cp.ndarray:
-        """Compute MFCCs using GPU acceleration."""
+        """Compute MFCCs using GPU acceleration with pinned memory transfers."""
         if not HAS_CUPY:
             raise RuntimeError("CuPy not available for GPU acceleration")
         
         if progress_callback:
             progress_callback(0.1, "Creating mel filterbank")
         
-        # Create mel filterbank on CPU then move to GPU
+        # Create mel filterbank on CPU then move to GPU using pinned memory
         mel_filterbank = self._create_mel_filterbank(frequencies, 
                                                    self.spectrogram_engine.sample_rate)
-        gpu_filterbank = cp.asarray(mel_filterbank)
+        gpu_filterbank = self.memory_optimizer.copy_to_gpu_pinned(mel_filterbank)
         
         if progress_callback:
             progress_callback(0.3, "Applying mel filterbank")
@@ -246,7 +251,8 @@ class CepstrogramEngine:
         # Compute MFCCs
         if self.use_gpu and magnitude_linear.size > 50000:
             try:
-                gpu_magnitude = cp.asarray(magnitude_linear)
+                # Use pinned memory for 2-3x faster transfer
+                gpu_magnitude = self.memory_optimizer.copy_to_gpu_pinned(magnitude_linear)
                 cepstral_coeffs = self.compute_mfcc_gpu(
                     gpu_magnitude, frequencies, progress_callback)
                 
