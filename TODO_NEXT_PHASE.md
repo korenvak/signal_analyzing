@@ -70,21 +70,31 @@
 
 ---
 
-### Phase 3: TextureAtlas Integration - 1-2 days (CRITICAL)
-**Goal**: TRUE UNLIMITED FILE SIZE, ZERO DOWNSAMPLING!
+### Phase 3: Large File Optimization - 1-2 days (IN PROGRESS)
+**Goal**: Handle unlimited file sizes efficiently
 
-#### 3.1 Complete Tile Manager Integration
-**Current**: Using direct computation with 16K pixel limit  
-**Needed**: Wire tile_manager to render pipeline (70% complete)  
-**Benefit**: No downsampling for any file size  
-**Effort**: 8 hours
+#### 3.1 ⏳ Adaptive Downsampling for Large Files
+**Status**: IN PROGRESS  
+**Current**: Implemented preview mode for files >10 minutes  
+**Implementation**: Auto-downsample for initial preview, notify user  
+**Benefit**: Can load any file size without crashing  
+**Files**: main_window.py (load_spectrogram_data)
 
-#### 3.2 Progressive Tile Loading
+#### 3.2 ⏳ Progressive Tile Loading (Planned)
+**Status**: PLANNED  
 **Needed**: Queue tiles for background computation  
 **Benefit**: Never wait for computation, smooth interaction  
 **Effort**: 4 hours
 
-#### 3.3 LOD (Level of Detail) System
+#### 3.3 ⏳ Full Tile Manager Integration (Planned)
+**Status**: PLANNED  
+**Current**: Tile infrastructure 70% complete  
+**Needed**: Wire tile_manager to render pipeline for on-demand loading  
+**Benefit**: True unlimited file size with full resolution  
+**Effort**: 8 hours
+
+#### 3.4 ⏳ LOD (Level of Detail) System (Planned)
+**Status**: PLANNED  
 **Needed**: Render low-res tiles first, progressively refine  
 **Benefit**: Instant zoom/pan response  
 **Effort**: 4 hours
