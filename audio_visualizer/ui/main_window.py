@@ -1066,15 +1066,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to load audio file:\n{str(e)}")
             self.statusBar().showMessage("Ready")
     
-    def open_audio_file(self):
-        """Open an audio file dialog for analysis."""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open Audio File",
-            "", "Audio Files (*.wav *.flac *.mp3 *.ogg);;All Files (*)"
-        )
-        
-        if file_path:
-            self.load_audio_file(file_path)
     
     def on_parameters_changed(self, params: dict):
         """Handle parameter changes."""
@@ -1370,12 +1361,8 @@ class MainWindow(QMainWindow):
             # Use batched FFT engine
             magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_chunk)
             
-            # Filter frequency range
-            if freq_range[1] < frequencies[-1]:
-                freq_mask = (frequencies >= freq_range[0]) & (frequencies <= freq_range[1])
-                if np.any(freq_mask):
-                    magnitude_db = magnitude_db[freq_mask, :]
-            
+            # Return full spectrum - let the camera/transform handle the visible frequency range
+            # Filtering here causes display issues because the data shape doesn't match the extent
             return magnitude_db.astype(np.float32)
             
         except Exception as e:
@@ -1493,9 +1480,20 @@ class MainWindow(QMainWindow):
         else:
             display_data = np.zeros_like(data)
         
-        # Update image
-        self.spectrogram_canvas.update_image(display_data.astype(np.float32))
-        self.spectrogram_canvas.set_data_bounds(time_range[0], time_range[1], freq_range[0], freq_range[1])
+        # Calculate proper extent based on actual data
+        # Data shape is (freq_bins, time_frames)
+        # Frequencies go from 0 to sample_rate/2
+        sample_rate = self.spectrogram_engine.sample_rate
+        extent = (time_range[0], time_range[1], 0, sample_rate / 2)
+        
+        # Update image with extent
+        self.spectrogram_canvas.update_image(display_data.astype(np.float32), extent)
+        
+        # Reset camera to show full data
+        self.spectrogram_canvas.view.camera.set_range(
+            x=(time_range[0], time_range[1]),
+            y=(0, sample_rate / 2)
+        )
         self.spectrogram_canvas.update()
     
     def update_cepstrogram_display(self, data: np.ndarray, time_range: tuple, freq_range: tuple):
