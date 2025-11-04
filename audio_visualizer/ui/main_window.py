@@ -847,14 +847,17 @@ class MainWindow(QMainWindow):
         self.cepstrogram_engine = CepstrogramEngine(self.cache_manager, self.task_manager, self.spectrogram_engine)
         self.fk_engine = FKEngine(self.cache_manager, self.task_manager, self.spectrogram_engine)
         
+        # Engines dictionary for easy access
+        self.engines = {
+            'spectrogram': self.spectrogram_engine,
+            'cepstrogram': self.cepstrogram_engine,
+            'fk_transform': self.fk_engine
+        }
+        
         # Tile manager (coordinates tiles, cache, and atlases)
         self.tile_manager = TileMgr(
             tile_cache=self.tile_cache,
-            engines={
-                'spectrogram': self.spectrogram_engine,
-                'cepstrogram': self.cepstrogram_engine,
-                'fk_transform': self.fk_engine
-            }
+            engines=self.engines
         )
         
         # Set up default array geometry for F-K analysis (simulated linear array)
@@ -1182,38 +1185,58 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Error: {str(e)}")
     
     def load_view_data_tiled(self, view_type: str, time_range: tuple, freq_range: tuple) -> bool:
-        """Load data using tile system. Returns True if successful."""
+        """Load data using tile system with on-demand tile generation. Returns True if successful."""
         try:
-            # Update tile manager with current visible region
+            # For large files, use tile-based rendering to avoid OpenGL texture limits
+            # Check if we need tiling (file duration > 6 minutes or width > OpenGL limit)
+            duration = time_range[1] - time_range[0]
+            sample_rate = self.spectrogram_engine.sample_rate
+            hop_length = self.spectrogram_engine.hop_length
+            
+            # Calculate expected width
+            n_samples = int(duration * sample_rate)
+            expected_width = 1 + (n_samples - self.spectrogram_engine.fft_size) // hop_length
+            
+            # OpenGL texture size limit
+            max_texture_size = 16384
+            
+            if expected_width <= max_texture_size:
+                # File is small enough for direct rendering
+                logger.debug(f"File width ({expected_width}) fits in single texture, using direct computation")
+                return False
+            
+            # File is too large - use tile-based rendering
+            logger.info(f"File width ({expected_width}) exceeds limit ({max_texture_size}), using tile system")
+            
+            # Compute tiles on-demand for this region
             zoom_level = self.estimate_zoom_level(time_range, freq_range)
+            
+            # Request tiles to be computed if they don't exist
+            if not self.ensure_tiles_exist(view_type, time_range, freq_range, zoom_level):
+                logger.warning(f"Failed to generate tiles for {view_type}")
+                return False
+            
+            # Update visible region
             self.tile_manager.update_visible_region(view_type, time_range, freq_range, zoom_level)
             
-            # Get visible tiles for this region
+            # Get tiles for rendering
             visible_tiles = self.tile_manager.get_visible_tiles(view_type, time_range, freq_range, zoom_level)
             
             if not visible_tiles:
-                logger.warning(f"No visible tiles found for {view_type}")
+                logger.warning(f"No visible tiles after generation for {view_type}")
                 return False
             
-            # Check if we have cached tiles for this region
-            atlas = self.tile_manager.atlases.get(view_type)
-            if not atlas:
-                logger.warning(f"No atlas found for {view_type}")
-                return False
-            
-            # For now, use a simplified approach: request the most important tiles
-            # and display what we have while computing missing ones
-            self.request_tiles_for_region(view_type, time_range, freq_range, zoom_level)
-            
-            # Try to display available atlas data
-            if self.update_atlas_display_improved(view_type, time_range, freq_range):
-                self.statusBar().showMessage(f"{view_type.title()} tiles loaded")
+            # Render tiles to display
+            if self.render_tiles_to_display(view_type, visible_tiles, time_range, freq_range):
+                self.statusBar().showMessage(f"{view_type.title()} rendered from {len(visible_tiles)} tiles")
                 return True
             
             return False
             
         except Exception as e:
             logger.error(f"Tile-based loading failed for {view_type}: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def load_view_data_direct(self, view_type: str, time_range: tuple):
@@ -1237,6 +1260,228 @@ class MainWindow(QMainWindow):
             self.load_cepstrogram_data(audio_data)
         elif view_type == 'fk_transform':
             self.load_fk_data(audio_data)
+    
+    def ensure_tiles_exist(self, view_type: str, time_range: tuple, freq_range: tuple, zoom_level: float) -> bool:
+        """Ensure tiles exist for the given region, computing them if necessary."""
+        try:
+            # Define tile size (in seconds for time, Hz for frequency)
+            tile_time_duration = 60.0  # 60 seconds per tile
+            tile_freq_bandwidth = 2000.0  # 2000 Hz per tile (adjustable)
+            
+            # Calculate how many tiles we need to cover this region
+            time_start, time_end = time_range
+            freq_start, freq_end = freq_range
+            
+            # Generate tile grid
+            tiles_needed = []
+            current_time = time_start
+            while current_time < time_end:
+                current_freq = freq_start
+                tile_time_end = min(current_time + tile_time_duration, time_end)
+                
+                while current_freq < freq_end:
+                    tile_freq_end = min(current_freq + tile_freq_bandwidth, freq_end)
+                    
+                    tiles_needed.append({
+                        'time_range': (current_time, tile_time_end),
+                        'freq_range': (current_freq, tile_freq_end)
+                    })
+                    
+                    current_freq = tile_freq_end
+                
+                current_time = tile_time_end
+            
+            logger.info(f"Need {len(tiles_needed)} tiles to cover region {time_range} × {freq_range}")
+            
+            # Get audio data for computation
+            sample_rate = self.spectrogram_engine.sample_rate
+            start_sample = int(time_start * sample_rate)
+            end_sample = int(time_end * sample_rate)
+            end_sample = min(end_sample, self.audio_loader.total_samples)
+            
+            audio_data = self.audio_loader.get_chunk(start_sample, end_sample - start_sample)
+            
+            if audio_data is None or len(audio_data) == 0:
+                logger.error("Failed to load audio data for tile generation")
+                return False
+            
+            # Compute each tile
+            computed_tiles = []
+            for tile_info in tiles_needed:
+                tile_time_range = tile_info['time_range']
+                tile_freq_range = tile_info['freq_range']
+                
+                # Check if tile already exists in cache
+                cached_tile = self.tile_cache.get_tile(
+                    view_type, tile_time_range, tile_freq_range, resolution_level=0
+                )
+                
+                if cached_tile is not None:
+                    logger.debug(f"Tile already cached: {tile_time_range}")
+                    computed_tiles.append(cached_tile)
+                    continue
+                
+                # Compute tile
+                logger.debug(f"Computing tile: time={tile_time_range}, freq={tile_freq_range}")
+                
+                # Extract audio chunk for this tile (relative to our audio_data)
+                tile_start_sample = int((tile_time_range[0] - time_start) * sample_rate)
+                tile_end_sample = int((tile_time_range[1] - time_start) * sample_rate)
+                tile_end_sample = min(tile_end_sample, len(audio_data))
+                
+                if tile_start_sample >= len(audio_data):
+                    logger.warning(f"Tile start beyond audio data, skipping")
+                    continue
+                
+                audio_chunk = audio_data[tile_start_sample:tile_end_sample]
+                
+                # Compute based on view type
+                engine = self.engines.get(view_type)
+                if not engine:
+                    logger.error(f"No engine for {view_type}")
+                    return False
+                
+                if view_type == 'spectrogram':
+                    tile_data = self._compute_spectrogram_tile_data(audio_chunk, tile_freq_range)
+                elif view_type == 'cepstrogram':
+                    tile_data = self._compute_cepstrogram_tile_data(audio_chunk, tile_freq_range)
+                else:
+                    logger.warning(f"Unsupported view type for tiling: {view_type}")
+                    return False
+                
+                if tile_data is None or tile_data.size == 0:
+                    logger.warning(f"Empty tile data for {tile_time_range}")
+                    continue
+                
+                # Cache the computed tile
+                self.tile_cache.store_tile(
+                    view_type, tile_time_range, tile_freq_range, tile_data
+                )
+                
+                computed_tiles.append(tile_data)
+            
+            logger.info(f"Successfully ensured {len(computed_tiles)} tiles exist")
+            return len(computed_tiles) > 0
+            
+        except Exception as e:
+            logger.error(f"Error ensuring tiles exist: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _compute_spectrogram_tile_data(self, audio_chunk: np.ndarray, freq_range: tuple) -> np.ndarray:
+        """Compute spectrogram data for a tile."""
+        try:
+            # Use batched FFT engine
+            magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_chunk)
+            
+            # Filter frequency range
+            if freq_range[1] < frequencies[-1]:
+                freq_mask = (frequencies >= freq_range[0]) & (frequencies <= freq_range[1])
+                if np.any(freq_mask):
+                    magnitude_db = magnitude_db[freq_mask, :]
+            
+            return magnitude_db.astype(np.float32)
+            
+        except Exception as e:
+            logger.error(f"Error computing spectrogram tile: {e}")
+            return None
+    
+    def _compute_cepstrogram_tile_data(self, audio_chunk: np.ndarray, freq_range: tuple) -> np.ndarray:
+        """Compute cepstrogram data for a tile."""
+        try:
+            # First get spectrogram
+            magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_chunk)
+            
+            # Then compute cepstrogram
+            cepstral = self.cepstrogram_engine.compute_cepstrogram_from_spectrogram(magnitude_db, frequencies)
+            
+            return cepstral.astype(np.float32)
+            
+        except Exception as e:
+            logger.error(f"Error computing cepstrogram tile: {e}")
+            return None
+    
+    def render_tiles_to_display(self, view_type: str, tiles: list, time_range: tuple, freq_range: tuple) -> bool:
+        """Render tiles to the display by stitching them together."""
+        try:
+            if not tiles:
+                return False
+            
+            # For now, stitch tiles together into a single image
+            # TODO: Implement proper texture atlas rendering in Phase 3.5
+            
+            # Get all tile data
+            tile_data_list = []
+            for tile_info in tiles:
+                # Get tile from cache
+                tile_data = self.tile_cache.get_tile(
+                    view_type,
+                    tile_info.get('time_range', time_range),
+                    tile_info.get('freq_range', freq_range),
+                    resolution_level=0
+                )
+                
+                if tile_data is not None:
+                    tile_data_list.append(tile_data)
+            
+            if not tile_data_list:
+                logger.warning("No tile data available for rendering")
+                return False
+            
+            # Stitch tiles horizontally (time axis)
+            # This is a simplified approach - full implementation would use texture atlas
+            stitched_data = np.concatenate(tile_data_list, axis=1)
+            
+            logger.info(f"Stitched {len(tile_data_list)} tiles into shape {stitched_data.shape}")
+            
+            # Update the display with stitched data
+            if view_type == 'spectrogram':
+                self.update_spectrogram_display(stitched_data, time_range, freq_range)
+            elif view_type == 'cepstrogram':
+                self.update_cepstrogram_display(stitched_data, time_range, freq_range)
+            else:
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error rendering tiles: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def update_spectrogram_display(self, data: np.ndarray, time_range: tuple, freq_range: tuple):
+        """Update spectrogram display with pre-computed data."""
+        if not HAS_VISPY or not hasattr(self, 'spectrogram_canvas'):
+            return
+        
+        # Normalize data for display
+        if data.min() < data.max():
+            display_data = (data - data.min()) / (data.max() - data.min())
+        else:
+            display_data = np.zeros_like(data)
+        
+        # Update image
+        self.spectrogram_canvas.update_image(display_data.astype(np.float32))
+        self.spectrogram_canvas.set_data_bounds(time_range[0], time_range[1], freq_range[0], freq_range[1])
+        self.spectrogram_canvas.update()
+    
+    def update_cepstrogram_display(self, data: np.ndarray, time_range: tuple, freq_range: tuple):
+        """Update cepstrogram display with pre-computed data."""
+        if not HAS_VISPY or not hasattr(self, 'cepstrogram_canvas'):
+            return
+        
+        # Normalize data for display
+        if data.min() < data.max():
+            display_data = (data - data.min()) / (data.max() - data.min())
+        else:
+            display_data = np.zeros_like(data)
+        
+        # Update image
+        self.cepstrogram_canvas.update_image(display_data.astype(np.float32))
+        self.cepstrogram_canvas.set_data_bounds(time_range[0], time_range[1], 0, data.shape[0])
+        self.cepstrogram_canvas.update()
     
     def estimate_zoom_level(self, time_range: tuple, freq_range: tuple) -> float:
         """Estimate zoom level based on visible range."""
