@@ -1,7 +1,8 @@
 import sys
 import os
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
+import math
 import numpy as np
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
@@ -55,11 +56,14 @@ class VisPyCanvas(scene.SceneCanvas):
         self.view.camera.set_range(x=(-1, 1), y=(-1, 1))
         
         # Store data bounds for camera constraints
-        self.data_bounds = None  # Will be set when data is loaded
+        self.data_extent = None  # {'time': (min, max), 'freq': (min, max)}
+        self._view_change_callback = None
+        self._grid_dirty = True
         
         # Image visual for spectrogram data
         # Use 'nearest' interpolation to avoid blurring
         self.image_visual = scene.visuals.Image(parent=self.view.scene, interpolation='nearest')
+        self.image_visual.clim = (0, 1)
         
         # OpenGL texture size limit (will be detected)
         self.max_texture_size = 16384  # Conservative default
@@ -82,11 +86,20 @@ class VisPyCanvas(scene.SceneCanvas):
         self.mouse_pos = (0, 0)
         self.crosshair_enabled = False
         
+        # Grid visuals
+        self.grid_v = scene.visuals.Line(parent=self.view.scene, color=(0.4, 0.4, 0.4, 0.4), width=1, method='gl')
+        self.grid_h = scene.visuals.Line(parent=self.view.scene, color=(0.4, 0.4, 0.4, 0.4), width=1, method='gl')
+        self.grid_v.visible = False
+        self.grid_h.visible = False
+        self._tick_texts_x: List[scene.visuals.Text] = []
+        self._tick_texts_y: List[scene.visuals.Text] = []
+
         # Timer for updating camera constraints and labels
         self.update_timer = app.Timer(interval=0.1, connect=self.on_timer, start=True)
         
         # Connect events for zoom control
         self.events.mouse_wheel.connect(self.on_mouse_wheel)
+        self.view.camera.events.transform_changed.connect(self._on_camera_changed)
         
         self.freeze()
     
@@ -96,6 +109,7 @@ class VisPyCanvas(scene.SceneCanvas):
         self.constrain_camera_to_bounds()
         # Update axis labels
         self.update_axis_labels()
+        self.update_grid_and_ticks()
     
     def on_mouse_wheel(self, event):
         """Handle mouse wheel for axis-specific zoom.
@@ -126,7 +140,7 @@ class VisPyCanvas(scene.SceneCanvas):
     
     def constrain_camera_to_bounds(self):
         """Constrain camera to data bounds - prevent panning to empty areas."""
-        if self.data_bounds is None:
+        if self.data_extent is None:
             return
         
         # Get current camera range
@@ -136,7 +150,8 @@ class VisPyCanvas(scene.SceneCanvas):
             return
         
         # Extract bounds
-        time_min, freq_min, time_max, freq_max = self.data_bounds
+        time_min, time_max = self.data_extent['time']
+        freq_min, freq_max = self.data_extent['freq']
         
         x_min, x_max = x_range
         y_min, y_max = y_range
@@ -168,13 +183,12 @@ class VisPyCanvas(scene.SceneCanvas):
         if constrained:
             logger.info(f"Constraining camera: X=[{x_min:.1f}, {x_max:.1f}], Y=[{y_min:.1f}, {y_max:.1f}]")
             self.view.camera.set_range(x=(x_min, x_max), y=(y_min, y_max), margin=0)
+            self._grid_dirty = True
     
     def update_axis_labels(self):
         """Update axis labels with appropriate units based on zoom level."""
-        if self.data_bounds is None:
+        if self.data_extent is None:
             return
-        
-        # Get camera range instead of rect
         try:
             x_range, y_range = self.view.camera.get_range()
             if x_range is None or y_range is None:
@@ -182,45 +196,29 @@ class VisPyCanvas(scene.SceneCanvas):
         except Exception as e:
             logger.debug(f"Cannot get camera range: {e}")
             return
-        
-        time_min, freq_min, time_max, freq_max = self.data_bounds
+
         x_min, x_max = x_range
         y_min, y_max = y_range
-        w = x_max - x_min
-        h = y_max - y_min
-        
-        # Format time axis label (X-axis)
-        time_span = w
-        if time_span < 1.0:
-            time_unit = "TIME (ms)"
-        elif time_span < 60.0:
-            time_unit = "TIME (s)"
-        elif time_span < 3600.0:
-            time_unit = "TIME (min)"
-        else:
-            time_unit = "TIME (hr)"
-        
-        # Format frequency axis label (Y-axis)
-        freq_span = h
-        if freq_span < 1000.0:
-            freq_unit = "FREQ (Hz)"
-        else:
-            freq_unit = "FREQ (kHz)"
-        
-        # Position labels at visible locations
-        # Bottom right for time axis label
-        self.x_axis_label.text = time_unit
-        self.x_axis_label.pos = (x_max - w * 0.15, y_min + h * 0.05)
+        w = max(x_max - x_min, 1e-6)
+        h = max(y_max - y_min, 1e-6)
+
+        time_label = self._format_time_axis_label(w)
+        freq_label = self._format_freq_axis_label(h)
+
+        time_offset = max(h * 0.05, 1e-6)
+        freq_offset = max(w * 0.05, 1e-6)
+
+        self.x_axis_label.text = time_label
+        self.x_axis_label.pos = (x_min + w / 2.0, y_min - time_offset)
         self.x_axis_label.font_size = 18
-        self.x_axis_label.color = (1, 1, 0, 1)  # Bright yellow
-        
-        # Top left for frequency axis label  
-        self.y_axis_label.text = freq_unit
-        self.y_axis_label.pos = (x_min + w * 0.1, y_max - h * 0.05)
+        self.x_axis_label.color = (1, 1, 0, 1)
+        self.x_axis_label.visible = True
+
+        self.y_axis_label.text = freq_label
+        self.y_axis_label.pos = (x_min - freq_offset, y_min + h / 2.0)
         self.y_axis_label.font_size = 18
-        self.y_axis_label.color = (1, 1, 0, 1)  # Bright yellow
-        
-        logger.debug(f"Labels updated: {time_unit} at {self.x_axis_label.pos}, {freq_unit} at {self.y_axis_label.pos}")
+        self.y_axis_label.color = (1, 1, 0, 1)
+        self.y_axis_label.visible = True
     
     def zoom_axis(self, axis: str, factor: float):
         """Zoom on a specific axis only.
@@ -229,141 +227,115 @@ class VisPyCanvas(scene.SceneCanvas):
             axis: 'x' for time, 'y' for frequency
             factor: Zoom factor (<1 zoom in, >1 zoom out)
         """
-        if self.data_bounds is None:
+        if self.data_extent is None:
             return
         
         try:
-            x_range, y_range = self.view.camera.get_range()
-        except:
+            ranges = self.get_camera_ranges()
+        except Exception:
             return
-        
+        if ranges[0] is None or ranges[1] is None:
+            return
+        x_range, y_range = ranges
         x_min, x_max = x_range
         y_min, y_max = y_range
+        time_min, time_max = self.data_extent['time']
+        freq_min, freq_max = self.data_extent['freq']
         
         if axis == 'x':
             # Zoom time axis (X) only
             w = x_max - x_min
             new_w = w * factor
             center_x = (x_min + x_max) / 2
-            new_x_min = center_x - new_w / 2
-            new_x_max = center_x + new_w / 2
+            new_w = max(min(new_w, time_max - time_min), 1e-6)
+            new_x_min = max(time_min, center_x - new_w / 2)
+            new_x_max = min(time_max, center_x + new_w / 2)
+            if new_x_max - new_x_min < 1e-6:
+                return
             self.view.camera.set_range(x=(new_x_min, new_x_max), y=y_range, margin=0)
         elif axis == 'y':
             # Zoom frequency axis (Y) only
             h = y_max - y_min
             new_h = h * factor
             center_y = (y_min + y_max) / 2
-            new_y_min = center_y - new_h / 2
-            new_y_max = center_y + new_h / 2
+            new_h = max(min(new_h, freq_max - freq_min), 1e-6)
+            new_y_min = max(freq_min, center_y - new_h / 2)
+            new_y_max = min(freq_max, center_y + new_h / 2)
+            if new_y_max - new_y_min < 1e-6:
+                return
             self.view.camera.set_range(x=x_range, y=(new_y_min, new_y_max), margin=0)
+
+        self._grid_dirty = True
     
-    def update_image(self, data: np.ndarray, extent: tuple = None):
-        """Update the displayed image data."""
-        if data is not None and data.size > 0:
-            # Ensure data is in correct format for VisPy
-            # VisPy Image expects: rows=Y-axis, columns=X-axis
-            # For spectrogram: we want time=X-axis, frequency=Y-axis
-            # Data comes as (frequency_bins, time_frames) which is already correct!
-            if data.ndim == 2:
-                # Data format (freq_bins, time_frames) is correct for VisPy
-                # freq_bins = rows = Y-axis (frequency)
-                # time_frames = columns = X-axis (time)
-                display_data = data.astype(np.float32)
-                
-                # Check OpenGL texture size limits
-                original_shape = display_data.shape
-                downsample_factor_x = 1
-                downsample_factor_y = 1
-                
-                # Check if we exceed texture limits
-                if display_data.shape[1] > self.max_texture_size:
-                    downsample_factor_x = int(np.ceil(display_data.shape[1] / self.max_texture_size))
-                    logger.warning(f"Data width ({display_data.shape[1]}) exceeds OpenGL limit ({self.max_texture_size})")
-                    logger.warning(f"Downsampling by {downsample_factor_x}x in time to fit texture")
-                    display_data = display_data[:, ::downsample_factor_x]
-                
-                if display_data.shape[0] > self.max_texture_size:
-                    downsample_factor_y = int(np.ceil(display_data.shape[0] / self.max_texture_size))
-                    logger.warning(f"Data height ({display_data.shape[0]}) exceeds OpenGL limit ({self.max_texture_size})")
-                    logger.warning(f"Downsampling by {downsample_factor_y}x in frequency to fit texture")
-                    display_data = display_data[::downsample_factor_y, :]
-                
-                if downsample_factor_x > 1 or downsample_factor_y > 1:
-                    logger.info(f"Downsampled: {original_shape} -> {display_data.shape}")
-                
-                # Normalize data for proper VisPy display
-                # Spectrogram data is typically in dB (e.g., -120 to 0 dB)
-                # Normalize to 0-1 range for proper colormap visualization
-                data_min = np.min(display_data)
-                data_max = np.max(display_data)
-                
-                if data_max > data_min:  # Avoid division by zero
-                    display_data = (display_data - data_min) / (data_max - data_min)
+    def get_camera_ranges(self) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
+        try:
+            x_range, y_range = self.view.camera.get_range()
+        except Exception:
+            return None, None
+        return x_range, y_range
+
+    def render_data(self, data: np.ndarray, extent: Tuple[float, float, float, float],
+                    normalize: bool = True, complete: bool = True):
+        """Render data onto the canvas with provided world-space extent."""
+        if data is None or data.size == 0:
+            self.image_visual.set_data(np.zeros((1, 1), dtype=np.float32))
+            self.image_visual.transform = scene.STTransform()
+            return
+
+        display_data = data.astype(np.float32)
+
+        if normalize:
+            finite_mask = np.isfinite(display_data)
+            if finite_mask.any():
+                vmin = float(np.nanmin(display_data))
+                vmax = float(np.nanmax(display_data))
+                if vmax - vmin > 1e-6:
+                    display_data = (display_data - vmin) / (vmax - vmin)
                 else:
                     display_data = np.zeros_like(display_data)
-                
-                logger.debug(f"Data normalized: {data_min:.1f} to {data_max:.1f}")
-                logger.debug(f"Display shape: {display_data.shape}")
+                self.image_visual.clim = (0.0, 1.0)
             else:
-                display_data = data.astype(np.float32)
-            
-            if extent:
-                # extent = (time_start, time_end, freq_start, freq_end)
-                time_start, time_end, freq_start, freq_end = extent
-                time_width = time_end - time_start
-                freq_height = freq_end - freq_start
-                
-                logger.debug(f"Transform: time [{time_start}, {time_end}], freq [{freq_start}, {freq_end}]")
-                logger.debug(f"Data pixels: {display_data.shape[1]} x {display_data.shape[0]}")
-                
-                # Set data with proper clim for color mapping
-                self.image_visual.set_data(display_data)
-                self.image_visual.clim = (0, 1)  # Data is normalized to 0-1
-                
-                # Calculate transform to map pixel coordinates to world coordinates
-                # VisPy Image: pixel (j, i) where j=column (X), i=row (Y)
-                # display_data[i, j] where i=row (Y/freq), j=column (X/time)
-                
-                # We want to map:
-                # - pixel column 0 -> time_start
-                # - pixel column (shape[1]-1) -> time_end
-                # - pixel row 0 -> freq_start  
-                # - pixel row (shape[0]-1) -> freq_end
-                
-                # Scale factor: world_units per pixel
-                x_scale = time_width / display_data.shape[1]
-                y_scale = freq_height / display_data.shape[0]
-                
-                # Translate: position of pixel (0, 0) in world coords
-                # Pixel (0,0) is bottom-left, should map to (time_start, freq_start)
-                x_translate = time_start
-                y_translate = freq_start
-                
-                transform = scene.STTransform(
-                    scale=(x_scale, y_scale),
-                    translate=(x_translate, y_translate)
-                )
-                self.image_visual.transform = transform
-                
-                logger.debug(f"Transform scale: ({x_scale:.6f}, {y_scale:.2f})")
-                
-                # Store data bounds for camera constraints
-                self.data_bounds = (time_start, time_end, freq_start, freq_end)
-                
-                # Update camera to show the full data range
-                self.view.camera.set_range(
-                    x=(time_start, time_end),
-                    y=(freq_start, freq_end),
-                    margin=0
-                )
-                
-                # Update axis labels
-                self.update_axis_labels()
-                
-                logger.debug(f"Camera range: X=[{time_start}, {time_end}], Y=[{freq_start}, {freq_end}]")
-            else:
-                self.image_visual.set_data(display_data)
-                self.image_visual.clim = (0, 1)
+                display_data = np.zeros_like(display_data)
+                self.image_visual.clim = (0.0, 1.0)
+        else:
+            vmin = float(np.nanmin(display_data))
+            vmax = float(np.nanmax(display_data))
+            self.image_visual.clim = (vmin, vmax)
+
+        self.image_visual.set_data(display_data)
+
+        time_start, time_end, freq_start, freq_end = extent
+        if time_end <= time_start or freq_end <= freq_start:
+            return
+
+        width = max(display_data.shape[1], 1)
+        height = max(display_data.shape[0], 1)
+        x_scale = (time_end - time_start) / width
+        y_scale = (freq_end - freq_start) / height
+
+        transform = scene.STTransform(
+            scale=(x_scale, y_scale),
+            translate=(time_start, freq_start)
+        )
+        self.image_visual.transform = transform
+
+        self.data_extent = {
+            'time': (time_start, time_end),
+            'freq': (freq_start, freq_end)
+        }
+
+        self.view.camera.set_limits(x=(time_start, time_end), y=(freq_start, freq_end))
+        self.view.camera.set_range(x=(time_start, time_end), y=(freq_start, freq_end), margin=0)
+
+        self._grid_dirty = True
+        self.update_axis_labels()
+        self.update_grid_and_ticks()
+
+    def update_image(self, data: np.ndarray, extent: tuple = None):
+        """Backward-compatible wrapper to render data."""
+        if extent is None:
+            extent = (0.0, float(data.shape[1]), 0.0, float(data.shape[0]))
+        self.render_data(data, extent)
     
     def set_crosshair(self, enabled: bool, pos: tuple = None):
         """Enable/disable crosshair display."""
@@ -410,6 +382,173 @@ class VisPyCanvas(scene.SceneCanvas):
                 # Update readout text
                 readout = f"Time: {world_pos[0]:.3f}s, Freq: {world_pos[1]:.0f}Hz"
                 self.update_text_readout(readout, (10, 30))
+
+    def set_view_change_callback(self, callback):
+        self._view_change_callback = callback
+
+    def _on_camera_changed(self, event):
+        self._grid_dirty = True
+        self.update_axis_labels()
+        self.update_grid_and_ticks()
+        self._notify_view_change()
+
+    def _notify_view_change(self):
+        if self._view_change_callback is None:
+            return
+        time_range, freq_range = self.get_camera_ranges()
+        if time_range is None or freq_range is None:
+            return
+        self._view_change_callback(time_range, freq_range)
+
+    def update_grid_and_ticks(self):
+        if not self._grid_dirty or self.data_extent is None:
+            return
+        self._grid_dirty = False
+
+        try:
+            x_range, y_range = self.view.camera.get_range()
+        except Exception:
+            return
+        if x_range is None or y_range is None:
+            return
+
+        time_ticks = self._compute_ticks(x_range[0], x_range[1])
+        freq_ticks = self._compute_ticks(y_range[0], y_range[1])
+
+        # Update vertical grid lines
+        if time_ticks:
+            positions = []
+            connections = []
+            idx = 0
+            for tick in time_ticks:
+                positions.append([tick, y_range[0]])
+                positions.append([tick, y_range[1]])
+                connections.append([idx, idx + 1])
+                idx += 2
+            self.grid_v.set_data(pos=np.array(positions, dtype=np.float32),
+                                 connect=np.array(connections, dtype=np.uint32))
+            self.grid_v.visible = True
+        else:
+            self.grid_v.visible = False
+
+        # Update horizontal grid lines
+        if freq_ticks:
+            positions = []
+            connections = []
+            idx = 0
+            for tick in freq_ticks:
+                positions.append([x_range[0], tick])
+                positions.append([x_range[1], tick])
+                connections.append([idx, idx + 1])
+                idx += 2
+            self.grid_h.set_data(pos=np.array(positions, dtype=np.float32),
+                                 connect=np.array(connections, dtype=np.uint32))
+            self.grid_h.visible = True
+        else:
+            self.grid_h.visible = False
+
+        # Update tick labels
+        self._update_tick_labels(time_ticks, axis='x', range_pair=(x_range, y_range))
+        self._update_tick_labels(freq_ticks, axis='y', range_pair=(x_range, y_range))
+
+    def _update_tick_labels(self, ticks: List[float], axis: str,
+                            range_pair: Tuple[Tuple[float, float], Tuple[float, float]]):
+        x_range, y_range = range_pair
+        if axis == 'x':
+            texts = self._ensure_tick_texts(axis, len(ticks))
+            y_offset = max((y_range[1] - y_range[0]) * 0.02, 1e-6)
+            for idx, tick in enumerate(ticks):
+                texts[idx].text = self._format_time_tick(tick)
+                texts[idx].pos = (tick, y_range[0] - y_offset)
+                texts[idx].visible = True
+            for idx in range(len(ticks), len(texts)):
+                texts[idx].visible = False
+        else:
+            texts = self._ensure_tick_texts(axis, len(ticks))
+            x_offset = max((x_range[1] - x_range[0]) * 0.02, 1e-6)
+            for idx, tick in enumerate(ticks):
+                texts[idx].text = self._format_freq_tick(tick)
+                texts[idx].pos = (x_range[0] - x_offset, tick)
+                texts[idx].visible = True
+            for idx in range(len(ticks), len(texts)):
+                texts[idx].visible = False
+
+    def _ensure_tick_texts(self, axis: str, count: int) -> List[scene.visuals.Text]:
+        if axis == 'x':
+            text_list = self._tick_texts_x
+            anchor = ('center', 'top')
+        else:
+            text_list = self._tick_texts_y
+            anchor = ('right', 'center')
+
+        while len(text_list) < count:
+            text = scene.visuals.Text('', color=(0.75, 0.75, 0.75, 1.0), font_size=11,
+                                       parent=self.view.scene,
+                                       anchor_x=anchor[0], anchor_y=anchor[1])
+            text.visible = False
+            text_list.append(text)
+
+        return text_list
+
+    def _compute_ticks(self, start: float, end: float, max_ticks: int = 6) -> List[float]:
+        span = end - start
+        if span <= 0 or not np.isfinite(span):
+            return []
+
+        raw_step = span / max(max_ticks, 1)
+        magnitude = 10 ** math.floor(math.log10(abs(raw_step)))
+        normalized = raw_step / magnitude
+        if normalized < 1.5:
+            step = 1
+        elif normalized < 3.5:
+            step = 2
+        elif normalized < 7.5:
+            step = 5
+        else:
+            step = 10
+        step *= magnitude
+
+        first_tick = math.ceil(start / step) * step
+        ticks = []
+        value = first_tick
+        for _ in range(max_ticks * 4):
+            if value > end + step * 0.5:
+                break
+            ticks.append(value)
+            value += step
+        return ticks
+
+    def _format_time_axis_label(self, span: float) -> str:
+        if span < 1.0:
+            return "TIME (ms)"
+        if span < 60.0:
+            return "TIME (s)"
+        if span < 3600.0:
+            return "TIME (min)"
+        return "TIME (hr)"
+
+    def _format_freq_axis_label(self, span: float) -> str:
+        if span < 1000.0:
+            return "FREQ (Hz)"
+        return "FREQ (kHz)"
+
+    def _format_time_tick(self, value: float) -> str:
+        abs_val = abs(value)
+        if abs_val < 1e-3:
+            return f"{value * 1000:.1f} ms"
+        if abs_val < 1:
+            return f"{value * 1000:.0f} ms"
+        if abs_val < 60:
+            return f"{value:.2f} s"
+        if abs_val < 3600:
+            return f"{value/60:.2f} m"
+        return f"{value/3600:.2f} h"
+
+    def _format_freq_tick(self, value: float) -> str:
+        abs_val = abs(value)
+        if abs_val < 1000:
+            return f"{value:.0f} Hz"
+        return f"{value/1000:.2f} kHz"
 
 class StatusWidget(QWidget):
     """Status widget showing performance metrics."""
@@ -629,6 +768,16 @@ class MainWindow(QMainWindow):
         self.perf_timer = QTimer()
         self.perf_timer.timeout.connect(self.update_performance_stats)
         self.perf_timer.start(1000)  # Update every second
+
+        if HAS_VISPY:
+            self.tile_update_timer = QTimer()
+            self.tile_update_timer.timeout.connect(self.process_tile_updates)
+            self.tile_update_timer.start(150)
+        else:
+            self.tile_update_timer = None
+
+        self._last_spectrogram_extent: Optional[Tuple[float, float, float, float]] = None
+        self._last_spectrogram_shape: Optional[Tuple[int, int]] = None
         
         # Auto-load file if specified
         initial_file = os.environ.get('AUDIO_VISUALIZER_INITIAL_FILE')
@@ -659,6 +808,16 @@ class MainWindow(QMainWindow):
             self.tab_widget.addTab(self.spectrogram_canvas.native, "Spectrogram")
             self.tab_widget.addTab(self.cepstrogram_canvas.native, "Cepstrogram")
             self.tab_widget.addTab(self.fk_canvas.native, "F-K Transform")
+
+            self.spectrogram_canvas.set_view_change_callback(
+                lambda time_range, freq_range: self.on_canvas_view_change('spectrogram', time_range, freq_range)
+            )
+            self.cepstrogram_canvas.set_view_change_callback(
+                lambda time_range, freq_range: self.on_canvas_view_change('cepstrogram', time_range, freq_range)
+            )
+            self.fk_canvas.set_view_change_callback(
+                lambda time_range, freq_range: self.on_canvas_view_change('fk_transform', time_range, freq_range)
+            )
         else:
             # Fallback widgets when VisPy not available
             self.tab_widget.addTab(QLabel("VisPy not available"), "Spectrogram")
@@ -730,6 +889,9 @@ class MainWindow(QMainWindow):
             
             # Update spectrogram engine parameters
             self.spectrogram_engine.set_parameters(sample_rate=sample_rate)
+            self.tile_manager.clear('spectrogram')
+            self.tile_manager.set_audio_loader(self.audio_loader)
+            self.tile_manager.refresh_view_config('spectrogram')
             
             self.statusBar().showMessage(
                 f"Loaded: {os.path.basename(file_path)} "
@@ -760,6 +922,8 @@ class MainWindow(QMainWindow):
         # Clear cache for affected views
         self.cache_manager.clear_view_cache('spectrogram')
         self.cache_manager.clear_view_cache('cepstrogram')
+        self.tile_manager.clear('spectrogram')
+        self.tile_manager.refresh_view_config('spectrogram')
         
         self.refresh_current_view()
     
@@ -790,26 +954,25 @@ class MainWindow(QMainWindow):
         
         self.statusBar().showMessage(f"Computing {view_type}...")
         
-        # Get audio data for current time range
+        if view_type == 'spectrogram' and HAS_VISPY:
+            self.update_spectrogram_view()
+            return
+
+        # Fallback to direct computation for other views
         time_range = self.current_view_range[0]
         start_sample = int(time_range[0] * self.spectrogram_engine.sample_rate)
         end_sample = int(time_range[1] * self.spectrogram_engine.sample_rate)
-        
-        # Clamp to available samples
+
         total_samples = self.audio_loader.total_samples
-        num_samples = min(end_sample - start_sample, total_samples - start_sample)
-        
+        num_samples = min(max(end_sample - start_sample, 0), max(total_samples - start_sample, 0))
+
         try:
             audio_data = self.audio_loader.get_chunk(start_sample, num_samples)
-            
-            # Use direct computation for now (tile system integration ongoing)
-            if view_type == 'spectrogram':
-                self.load_spectrogram_data(audio_data)
-            elif view_type == 'cepstrogram':
+
+            if view_type == 'cepstrogram':
                 self.load_cepstrogram_data(audio_data)
             elif view_type == 'fk_transform':
                 self.load_fk_data(audio_data)
-                
         except Exception as e:
             logger.error(f"Error loading {view_type}: {e}")
             self.statusBar().showMessage(f"Error: {str(e)}")
@@ -828,6 +991,92 @@ class MainWindow(QMainWindow):
         # This ensures we show actual data instead of empty atlas
         pass  # Will be handled by old load_spectrogram_data methods
     
+    def update_spectrogram_view(self, time_range: Optional[Tuple[float, float]] = None,
+                                 freq_range: Optional[Tuple[float, float]] = None):
+        if not HAS_VISPY:
+            return
+
+        if time_range is None:
+            time_range = self.current_view_range[0]
+        if freq_range is None:
+            freq_range = self.current_view_range[1]
+
+        # Initialize canvas extent to ensure camera constraints are applied immediately
+        placeholder = np.zeros((64, 64), dtype=np.float32)
+        extent = (time_range[0], time_range[1], freq_range[0], freq_range[1])
+        self.spectrogram_canvas.render_data(placeholder, extent)
+
+        total_time_span = self.current_view_range[0][1] - self.current_view_range[0][0]
+        visible_time_span = max(time_range[1] - time_range[0], 1e-6)
+        zoom_level = total_time_span / visible_time_span if total_time_span > 0 else 1.0
+        viewport_width = max(int(self.spectrogram_canvas.size[0]), 640)
+
+        self.tile_manager.update_visible_region(
+            'spectrogram', time_range, freq_range,
+            zoom_level=zoom_level,
+            viewport_width=viewport_width
+        )
+
+        self._last_spectrogram_extent = None
+        self._last_spectrogram_shape = None
+
+    def on_canvas_view_change(self, view_type: str, time_range: Tuple[float, float],
+                               freq_range: Tuple[float, float]):
+        if self.current_file is None:
+            return
+        if view_type != 'spectrogram' or not HAS_VISPY:
+            return
+
+        overall_time = self.current_view_range[0]
+        overall_freq = self.current_view_range[1]
+
+        clamped_time = (
+            max(overall_time[0], time_range[0]),
+            min(overall_time[1], time_range[1])
+        )
+        clamped_freq = (
+            max(overall_freq[0], freq_range[0]),
+            min(overall_freq[1], freq_range[1])
+        )
+
+        total_time_span = overall_time[1] - overall_time[0]
+        visible_time_span = max(clamped_time[1] - clamped_time[0], 1e-6)
+        zoom_level = total_time_span / visible_time_span if total_time_span > 0 else 1.0
+        viewport_width = max(int(self.spectrogram_canvas.size[0]), 640)
+
+        self.tile_manager.update_visible_region(
+            'spectrogram', clamped_time, clamped_freq,
+            zoom_level=zoom_level,
+            viewport_width=viewport_width
+        )
+
+    def process_tile_updates(self):
+        if not HAS_VISPY or self.spectrogram_canvas is None:
+            return
+        if self.tab_widget.currentIndex() != 0:
+            return
+
+        self.tile_manager.process_pending_requests(max_tiles=2)
+
+        data, extent, complete = self.tile_manager.assemble_visible_region('spectrogram')
+        if data.size == 0:
+            return
+
+        if (self._last_spectrogram_extent == extent and
+                self._last_spectrogram_shape == data.shape and complete):
+            return
+
+        self.spectrogram_canvas.render_data(data, extent, complete=complete)
+        self._last_spectrogram_extent = extent
+        self._last_spectrogram_shape = data.shape
+
+        if not complete:
+            self.statusBar().showMessage("Spectrogram loading…")
+        else:
+            lod = self.tile_manager.visible_tiles.get('spectrogram', {}).get('lod', 0)
+            frames = data.shape[1]
+            self.statusBar().showMessage(f"Spectrogram ready ({frames} frames, LOD {lod})")
+
     def load_spectrogram_data(self, audio_data: np.ndarray):
         """Load spectrogram data using batched FFT."""
         try:
@@ -941,6 +1190,9 @@ class MainWindow(QMainWindow):
         # Stop performance timer first
         if hasattr(self, 'perf_timer'):
             self.perf_timer.stop()
+
+        if hasattr(self, 'tile_update_timer') and self.tile_update_timer:
+            self.tile_update_timer.stop()
         
         # Shutdown task manager and wait for threads to finish
         if hasattr(self, 'task_manager'):

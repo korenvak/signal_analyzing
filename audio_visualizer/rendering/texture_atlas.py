@@ -29,6 +29,7 @@ class TileSlot:
         self.occupied = False
         self.tile_id = None
         self.last_used = 0.0
+        self.world_bounds: Optional[Tuple[float, float, float, float]] = None
     
     def contains_point(self, x: int, y: int) -> bool:
         """Check if point is inside this slot."""
@@ -44,7 +45,8 @@ class TextureAtlas:
     tiles into it dynamically based on what's visible.
     """
     
-    def __init__(self, atlas_size: int = 4096, tile_size: Tuple[int, int] = (512, 256)):
+    def __init__(self, atlas_size: int = 4096, tile_size: Tuple[int, int] = (512, 256),
+                 tile_world_size: Tuple[float, float] = (1.0, 1.0)):
         """Initialize texture atlas.
         
         Args:
@@ -56,6 +58,7 @@ class TextureAtlas:
         
         self.atlas_size = atlas_size
         self.tile_width, self.tile_height = tile_size
+        self.tile_world_width, self.tile_world_height = tile_world_size
         
         # Calculate grid dimensions
         self.grid_cols = atlas_size // self.tile_width
@@ -93,8 +96,10 @@ class TextureAtlas:
     def get_tile_id(self, time_center: float, freq_center: float, lod: int = 0) -> Tuple:
         """Generate tile ID from world coordinates."""
         # Quantize to tile grid
-        tile_time = int(time_center / self.tile_width)
-        tile_freq = int(freq_center / self.tile_height)
+        if self.tile_world_width <= 0 or self.tile_world_height <= 0:
+            raise ValueError("Tile world dimensions must be positive to compute tile ids")
+        tile_time = int(np.floor(time_center / self.tile_world_width))
+        tile_freq = int(np.floor(freq_center / self.tile_world_height))
         return (tile_time, tile_freq, lod)
     
     def get_visible_tiles(self, time_range: Tuple[float, float],
@@ -114,10 +119,13 @@ class TextureAtlas:
         lod = self._select_lod(zoom_level)
         
         # Calculate tile grid coordinates
-        time_start_tile = int(time_range[0] / self.tile_width)
-        time_end_tile = int(time_range[1] / self.tile_width) + 1
-        freq_start_tile = int(freq_range[0] / self.tile_height)
-        freq_end_tile = int(freq_range[1] / self.tile_height) + 1
+        if self.tile_world_width <= 0 or self.tile_world_height <= 0:
+            raise ValueError("Tile world dimensions must be positive to compute visible tiles")
+
+        time_start_tile = int(np.floor(time_range[0] / self.tile_world_width))
+        time_end_tile = int(np.ceil(time_range[1] / self.tile_world_width))
+        freq_start_tile = int(np.floor(freq_range[0] / self.tile_world_height))
+        freq_end_tile = int(np.ceil(freq_range[1] / self.tile_world_height))
         
         # Generate list of visible tiles
         visible_tiles = []
@@ -133,7 +141,8 @@ class TextureAtlas:
         # For now, always use LOD 0 (full resolution)
         return 0
     
-    def load_tile(self, tile_id: Tuple, tile_data: np.ndarray) -> bool:
+    def load_tile(self, tile_id: Tuple, tile_data: np.ndarray,
+                  world_bounds: Optional[Tuple[float, float, float, float]] = None) -> bool:
         """Load a tile into the atlas.
         
         Args:
@@ -186,6 +195,7 @@ class TextureAtlas:
         slot.occupied = True
         slot.tile_id = tile_id
         slot.last_used = time_module.time()
+        slot.world_bounds = world_bounds
         
         # Update mappings
         self.tile_map[tile_id] = slot_idx
@@ -231,7 +241,7 @@ class TextureAtlas:
         """Get the current atlas texture data."""
         return self.atlas_data
     
-    def get_tile_mapping(self) -> Dict[Tuple, Tuple[int, int, int, int]]:
+    def get_tile_mapping(self) -> Dict[Tuple, Dict[str, Tuple]]:
         """Get mapping from tile IDs to atlas positions.
         
         Returns:
@@ -240,7 +250,10 @@ class TextureAtlas:
         mapping = {}
         for tile_id, slot_idx in self.tile_map.items():
             slot = self.slots[slot_idx]
-            mapping[tile_id] = (slot.x, slot.y, slot.width, slot.height)
+            mapping[tile_id] = {
+                'atlas_rect': (slot.x, slot.y, slot.width, slot.height),
+                'world_bounds': slot.world_bounds
+            }
         return mapping
     
     def clear(self):
@@ -252,6 +265,10 @@ class TextureAtlas:
         self.tile_map.clear()
         self.lru_order.clear()
         self.stats['slots_used'] = 0
+
+    def set_tile_world_size(self, tile_world_size: Tuple[float, float]):
+        """Update the world-space dimensions covered by a single tile."""
+        self.tile_world_width, self.tile_world_height = tile_world_size
     
     def get_stats(self) -> Dict:
         """Get atlas statistics."""
