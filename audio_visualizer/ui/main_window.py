@@ -1014,6 +1014,20 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.status_widget)
         self.statusBar().showMessage("Ready")
     
+    def open_audio_file(self):
+        """Open file dialog to select audio file."""
+        from PySide6.QtWidgets import QFileDialog
+        
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Audio File",
+            "",
+            "Audio Files (*.wav *.mp3 *.flac *.ogg *.m4a);;All Files (*.*)"
+        )
+        
+        if file_path:
+            self.load_audio_file(file_path)
+    
     def load_audio_file(self, file_path: str):
         """Load an audio file for analysis."""
         try:
