@@ -1354,6 +1354,7 @@ class MainWindow(QMainWindow):
                     continue
                 
                 # Cache the computed tile
+                logger.debug(f"Storing tile: view={view_type}, time={tile_time_range}, freq={tile_freq_range}, shape={tile_data.shape}")
                 self.tile_cache.put(
                     view_type, tile_time_range, tile_freq_range, tile_data, resolution_level=0
                 )
@@ -1419,41 +1420,58 @@ class MainWindow(QMainWindow):
             freq_start, freq_end = freq_range
             
             # Get all tile data by reconstructing the grid
-            tile_data_list = []
+            # This MUST match the grid structure in ensure_tiles_exist
+            tile_data_rows = []  # Each row is a list of tiles at different frequencies
             current_time = time_start
             
             while current_time < time_end:
                 tile_time_end = min(current_time + tile_time_duration, time_end)
                 current_freq = freq_start
                 
-                # For now, only handle first frequency band (full spectrum)
-                # Multi-band rendering can be added later
-                tile_freq_end = freq_end
+                # Collect tiles for this time slice across all frequency bands
+                freq_tiles = []
+                while current_freq < freq_end:
+                    tile_freq_end = min(current_freq + tile_freq_bandwidth, freq_end)
+                    
+                    # Get tile from cache
+                    tile_key = (current_time, tile_time_end)
+                    freq_key = (current_freq, tile_freq_end)
+                    logger.debug(f"Retrieving tile: view={view_type}, time={tile_key}, freq={freq_key}")
+                    
+                    tile_data = self.tile_cache.get(
+                        view_type,
+                        tile_key,
+                        freq_key,
+                        resolution_level=0
+                    )
+                    
+                    if tile_data is not None and tile_data.size > 0:
+                        logger.debug(f"Found tile: shape={tile_data.shape}")
+                        freq_tiles.append(tile_data)
+                    else:
+                        logger.warning(f"Missing tile data for time={current_time:.1f}-{tile_time_end:.1f}, freq={current_freq:.1f}-{tile_freq_end:.1f}")
+                    
+                    current_freq = tile_freq_end
                 
-                # Get tile from cache
-                tile_data = self.tile_cache.get(
-                    view_type,
-                    (current_time, tile_time_end),
-                    (current_freq, tile_freq_end),
-                    resolution_level=0
-                )
-                
-                if tile_data is not None and tile_data.size > 0:
-                    tile_data_list.append(tile_data)
-                else:
-                    logger.warning(f"Missing tile data for time={current_time:.1f}-{tile_time_end:.1f}")
+                # Stack frequency tiles vertically for this time slice
+                if freq_tiles:
+                    if len(freq_tiles) > 1:
+                        time_slice = np.concatenate(freq_tiles, axis=0)  # Stack vertically (freq axis)
+                    else:
+                        time_slice = freq_tiles[0]
+                    tile_data_rows.append(time_slice)
                 
                 current_time = tile_time_end
             
-            if not tile_data_list:
+            if not tile_data_rows:
                 logger.warning("No tile data available for rendering")
                 return False
             
             # Stitch tiles horizontally (time axis)
-            # This is a simplified approach - full implementation would use texture atlas
-            stitched_data = np.concatenate(tile_data_list, axis=1)
+            # Each row is already stitched vertically (frequency axis)
+            stitched_data = np.concatenate(tile_data_rows, axis=1)
             
-            logger.info(f"Stitched {len(tile_data_list)} tiles into shape {stitched_data.shape}")
+            logger.info(f"Stitched {len(tile_data_rows)} time slices into shape {stitched_data.shape}")
             
             # Update the display with stitched data
             if view_type == 'spectrogram':
