@@ -35,6 +35,140 @@ from ..rendering.texture_atlas import TextureAtlas
 logger = logging.getLogger(__name__)
 
 
+class TiledImageRenderer:
+    """Manages multiple VisPy Image visuals for tile-based rendering without downsampling."""
+    
+    def __init__(self, parent_view):
+        """
+        Initialize tiled renderer.
+        
+        Args:
+            parent_view: The VisPy ViewBox to render tiles into
+        """
+        self.view = parent_view
+        self.tiles = []  # List of {'visual': Image, 'bounds': (t0, t1, f0, f1), 'data_shape': (h, w)}
+        self.enabled = False
+        
+    def clear_tiles(self):
+        """Remove all tile visuals from the scene."""
+        for tile_info in self.tiles:
+            if tile_info['visual'].parent:
+                tile_info['visual'].parent = None  # Remove from scene graph
+        self.tiles.clear()
+        logger.debug("Cleared all tile visuals")
+    
+    def render_tiles(self, tile_data_list: list, time_range: tuple, freq_range: tuple, 
+                     tile_time_duration: float) -> bool:
+        """
+        Render multiple tiles as separate Image visuals positioned in the scene.
+        
+        Args:
+            tile_data_list: List of numpy arrays, each representing a tile
+            time_range: (start, end) time range in seconds
+            freq_range: (start, end) frequency range in Hz
+            tile_time_duration: Duration of each tile in seconds
+            
+        Returns:
+            True if successful
+        """
+        try:
+            self.clear_tiles()
+            
+            if not tile_data_list:
+                logger.warning("No tiles to render")
+                return False
+            
+            time_start, time_end = time_range
+            freq_start, freq_end = freq_range
+            
+            logger.info(f"Rendering {len(tile_data_list)} tiles as separate visuals (zero downsampling)")
+            
+            current_time = time_start
+            for i, tile_data in enumerate(tile_data_list):
+                if tile_data is None or tile_data.size == 0:
+                    logger.warning(f"Skipping empty tile {i}")
+                    continue
+                
+                # Calculate this tile's time bounds
+                tile_time_end = min(current_time + tile_time_duration, time_end)
+                tile_time_width = tile_time_end - current_time
+                
+                # Normalize tile data for display
+                if tile_data.min() < tile_data.max():
+                    display_data = (tile_data - tile_data.min()) / (tile_data.max() - tile_data.min())
+                else:
+                    display_data = np.zeros_like(tile_data)
+                
+                display_data = display_data.astype(np.float32)
+                
+                # Create Image visual for this tile
+                tile_visual = scene.visuals.Image(
+                    display_data,
+                    parent=self.view.scene,
+                    interpolation='nearest',
+                    cmap='viridis'
+                )
+                tile_visual.clim = (0, 1)
+                
+                # Calculate transform to position tile correctly
+                # tile_data shape: (freq_bins, time_frames)
+                freq_height = freq_end - freq_start
+                
+                x_scale = tile_time_width / tile_data.shape[1]  # seconds per pixel
+                y_scale = freq_height / tile_data.shape[0]      # Hz per pixel
+                
+                transform = scene.STTransform(
+                    scale=(x_scale, y_scale),
+                    translate=(current_time, freq_start)
+                )
+                tile_visual.transform = transform
+                
+                # Store tile info for later management
+                self.tiles.append({
+                    'visual': tile_visual,
+                    'bounds': (current_time, tile_time_end, freq_start, freq_end),
+                    'data_shape': tile_data.shape
+                })
+                
+                logger.debug(f"Tile {i}: shape={tile_data.shape}, time=[{current_time:.1f}, {tile_time_end:.1f}], "
+                           f"transform=scale({x_scale:.6f}, {y_scale:.2f}), translate({current_time:.1f}, {freq_start:.1f})")
+                
+                current_time = tile_time_end
+            
+            self.enabled = True
+            logger.info(f"Successfully rendered {len(self.tiles)} tiles at full resolution")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error rendering tiles: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def cull_tiles(self, viewport_time: tuple, viewport_freq: tuple):
+        """
+        Show/hide tiles based on viewport visibility.
+        
+        Args:
+            viewport_time: (start, end) visible time range
+            viewport_freq: (start, end) visible frequency range
+        """
+        if not self.enabled:
+            return
+        
+        for tile_info in self.tiles:
+            t0, t1, f0, f1 = tile_info['bounds']
+            vt0, vt1 = viewport_time
+            vf0, vf1 = viewport_freq
+            
+            # Check if tile overlaps with viewport
+            time_overlap = not (t1 < vt0 or t0 > vt1)
+            freq_overlap = not (f1 < vf0 or f0 > vf1)
+            
+            # Set visibility
+            tile_info['visual'].visible = time_overlap and freq_overlap
+
+
 class VisPyCanvas(scene.SceneCanvas):
     """Custom VisPy canvas for audio visualization with proper axes."""
     
@@ -108,8 +242,11 @@ class VisPyCanvas(scene.SceneCanvas):
         # Store data bounds for camera constraints
         self.data_bounds = None  # Will be set when data is loaded
         
-        # Image visual for spectrogram data in the ViewBox
+        # Image visual for spectrogram data in the ViewBox (for single-image mode)
         self.image_visual = scene.visuals.Image(parent=self.view.scene, interpolation='nearest')
+        
+        # Tiled image renderer for multi-tile mode (eliminates downsampling)
+        self.tiled_renderer = TiledImageRenderer(self.view)
         
         # Initialize mouse tracking and crosshair variables
         self.mouse_pos = (0, 0)
@@ -1432,42 +1569,44 @@ class MainWindow(QMainWindow):
                 logger.warning("No tile data available for rendering")
                 return False
             
-            # Check if stitched size would exceed OpenGL limits
-            total_width = sum(tile.shape[1] for tile in tile_data_list)
-            max_texture_size = 16384  # OpenGL limit
-            
-            if total_width > max_texture_size:
-                # Instead of stitching, downsample each tile proportionally
-                # Calculate required downsampling factor
-                downsample_factor = int(np.ceil(total_width / max_texture_size))
-                logger.info(f"Total width ({total_width}) exceeds limit, downsampling each tile by {downsample_factor}x")
-                
-                downsampled_tiles = []
-                for tile in tile_data_list:
-                    if tile.shape[1] > downsample_factor:
-                        # Downsample this tile
-                        downsampled = tile[:, ::downsample_factor]
-                        downsampled_tiles.append(downsampled)
-                    else:
-                        downsampled_tiles.append(tile)
-                
-                # Now stitch the downsampled tiles
-                stitched_data = np.concatenate(downsampled_tiles, axis=1)
-                logger.info(f"Downsampled and stitched {len(tile_data_list)} tiles into shape {stitched_data.shape}")
-            else:
-                # Stitch tiles horizontally (time axis) - no downsampling needed
-                stitched_data = np.concatenate(tile_data_list, axis=1)
-                logger.info(f"Stitched {len(tile_data_list)} tiles into shape {stitched_data.shape} (no downsampling)")
-            
-            # Update the display with stitched data
+            # Use multi-tile rendering to eliminate downsampling!
             if view_type == 'spectrogram':
-                self.update_spectrogram_display(stitched_data, time_range, freq_range)
-            elif view_type == 'cepstrogram':
-                self.update_cepstrogram_display(stitched_data, time_range, freq_range)
-            else:
-                return False
+                success = self.spectrogram_canvas.tiled_renderer.render_tiles(
+                    tile_data_list, time_range, freq_range, tile_time_duration
+                )
+                
+                if success:
+                    # Hide the single-image visual since we're using tiles
+                    self.spectrogram_canvas.image_visual.visible = False
+                    
+                    # Set data bounds and reset camera
+                    sample_rate = self.spectrogram_engine.sample_rate
+                    self.spectrogram_canvas.set_data_bounds(
+                        time_range[0], time_range[1], 0, sample_rate / 2
+                    )
+                    self.spectrogram_canvas.view.camera.set_range(
+                        x=time_range,
+                        y=(0, sample_rate / 2)
+                    )
+                    self.spectrogram_canvas.update()
+                    
+                return success
             
-            return True
+            elif view_type == 'cepstrogram':
+                success = self.cepstrogram_canvas.tiled_renderer.render_tiles(
+                    tile_data_list, time_range, freq_range, tile_time_duration
+                )
+                
+                if success:
+                    self.cepstrogram_canvas.image_visual.visible = False
+                    self.cepstrogram_canvas.set_data_bounds(
+                        time_range[0], time_range[1], 0, tile_data_list[0].shape[0]
+                    )
+                    self.cepstrogram_canvas.update()
+                    
+                return success
+            
+            return False
             
         except Exception as e:
             logger.error(f"Error rendering tiles: {e}")
