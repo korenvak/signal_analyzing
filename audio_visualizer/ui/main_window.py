@@ -1554,46 +1554,42 @@ class MainWindow(QMainWindow):
         pass  # Will be handled by old load_spectrogram_data methods
     
     def load_spectrogram_data(self, audio_data: np.ndarray):
-        """Load spectrogram data using batched FFT with optional downsampling for large files."""
+        """Load spectrogram data using batched FFT - NO DOWNSAMPLING (use tile system instead)."""
         try:
-            # Check if audio is very large and needs downsampling for display
-            max_samples_for_full_resolution = 10 * 60 * 44100  # 10 minutes at 44.1kHz
+            # NOTE: We removed the downsampling logic here!
+            # Large files should use the tile system (load_view_data_tiled) instead
+            # This method is only called for files that fit in OpenGL texture limits
             
-            if len(audio_data) > max_samples_for_full_resolution:
-                # For very large files, downsample for initial display
-                # Full resolution will be computed tile-by-tile on demand (Phase 3)
-                logger.info(f"Large file detected ({len(audio_data)} samples), computing downsampled preview...")
-                
-                # Downsample factor to bring under limit
-                downsample_factor = max(1, int(np.ceil(len(audio_data) / max_samples_for_full_resolution)))
-                audio_preview = audio_data[::downsample_factor]
-                
-                logger.info(f"Downsampled by {downsample_factor}x: {len(audio_preview)} samples")
-            else:
-                audio_preview = audio_data
-                downsample_factor = 1
+            # Compute STFT using optimized batched FFT at FULL RESOLUTION
+            magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_data)
             
-            # Compute STFT using optimized batched FFT
-            magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_preview)
-            
-            # Adjust times if downsampled
-            if downsample_factor > 1:
-                times = times * downsample_factor
-            
-            logger.info(f"Computed spectrogram: {magnitude_db.shape} (downsample: {downsample_factor}x)")
+            logger.info(f"Computed spectrogram: {magnitude_db.shape} (no downsampling)")
             
             if HAS_VISPY and magnitude_db.size > 0:
+                # Check if result exceeds OpenGL texture limits
+                max_texture_size = 16384
+                
+                if magnitude_db.shape[1] > max_texture_size:
+                    # Data exceeds OpenGL limit - need to downsample for display
+                    # (This should rarely happen since tile system should catch large files first)
+                    logger.warning(f"Data width ({magnitude_db.shape[1]}) exceeds OpenGL limit ({max_texture_size})")
+                    
+                    downsample_factor = int(np.ceil(magnitude_db.shape[1] / max_texture_size))
+                    logger.warning(f"Downsampling by {downsample_factor}x in time to fit texture")
+                    
+                    # Downsample in time axis
+                    magnitude_db = magnitude_db[:, ::downsample_factor]
+                    times = times[::downsample_factor]
+                    
+                    logger.info(f"Downsampled: {magnitude_db.shape[1]} frames")
+                
                 # Update display
                 extent = (self.current_view_range[0][0], self.current_view_range[0][1],
                          self.current_view_range[1][0], self.current_view_range[1][1])
                 self.spectrogram_canvas.update_image(magnitude_db, extent)
                 frames = magnitude_db.shape[1]
                 
-                if downsample_factor > 1:
-                    self.statusBar().showMessage(
-                        f"Spectrogram preview ready ({frames} frames, {downsample_factor}x downsampled)")
-                else:
-                    self.statusBar().showMessage(f"Spectrogram ready ({frames} frames)")
+                self.statusBar().showMessage(f"Spectrogram ready ({frames} frames)")
         except Exception as e:
             logger.error(f"Spectrogram computation error: {e}")
             import traceback
