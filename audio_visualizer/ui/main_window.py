@@ -83,6 +83,11 @@ class TiledImageRenderer:
             
             logger.info(f"Rendering {len(tile_data_list)} tiles as separate visuals (zero downsampling)")
             
+            # Calculate global min/max across ALL tiles for consistent normalization
+            global_min = min(tile.min() for tile in tile_data_list if tile is not None and tile.size > 0)
+            global_max = max(tile.max() for tile in tile_data_list if tile is not None and tile.size > 0)
+            logger.debug(f"Global normalization range: [{global_min:.2f}, {global_max:.2f}]")
+            
             current_time = time_start
             for i, tile_data in enumerate(tile_data_list):
                 if tile_data is None or tile_data.size == 0:
@@ -93,9 +98,9 @@ class TiledImageRenderer:
                 tile_time_end = min(current_time + tile_time_duration, time_end)
                 tile_time_width = tile_time_end - current_time
                 
-                # Normalize tile data for display
-                if tile_data.min() < tile_data.max():
-                    display_data = (tile_data - tile_data.min()) / (tile_data.max() - tile_data.min())
+                # Normalize tile data using GLOBAL min/max for consistent colors across tiles
+                if global_max > global_min:
+                    display_data = (tile_data - global_min) / (global_max - global_min)
                 else:
                     display_data = np.zeros_like(tile_data)
                 
@@ -1216,7 +1221,8 @@ class MainWindow(QMainWindow):
         # This prevents shape mismatches when FFT size changes
         if 'fft_size' in params or 'hop_length' in params or 'window' in params:
             logger.info("FFT parameters changed, clearing tile cache")
-            self.tile_cache.clear(view_types=['spectrogram', 'cepstrogram'])
+            self.tile_cache.clear()  # Clear all tiles
+            self.cache_manager.clear_all()  # Also clear memory cache
         
         self.refresh_current_view()
     
