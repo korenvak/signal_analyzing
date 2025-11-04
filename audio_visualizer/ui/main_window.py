@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 class VisPyCanvas(scene.SceneCanvas):
-    """Custom VisPy canvas for audio visualization."""
+    """Custom VisPy canvas for audio visualization with proper axes."""
     
     def __init__(self, view_type: str, parent=None):
         if not HAS_VISPY:
@@ -47,215 +47,383 @@ class VisPyCanvas(scene.SceneCanvas):
         self.unfreeze()
         self.view_type = view_type
         
-        # Create main view with grid
-        self.view = self.central_widget.add_view()
+        # Minimal grid layout to get axes at window borders - NO MARGINS!
+        self.grid = self.central_widget.add_grid(margin=0)
+        self.grid.spacing = 0
         
-        # Use PanZoomCamera with independent axis control
-        self.view.camera = scene.PanZoomCamera(aspect=None)  # aspect=None allows independent zoom
-        self.view.camera.set_range(x=(-1, 1), y=(-1, 1))
+        # Create minimal axis widgets with proper tick configuration
+        self.y_axis = scene.AxisWidget(orientation='left', axis_label='Frequency (Hz)', 
+                                     axis_font_size=6, axis_label_margin=30,
+                                     tick_label_margin=5)
+        self.y_axis.width_max = 60  # Wider to accommodate labels properly
+        self.y_axis.width_min = 55
+        
+        self.x_axis = scene.AxisWidget(orientation='bottom', axis_label='Time (s)',
+                                     axis_font_size=6, axis_label_margin=20,
+                                     tick_label_margin=5) 
+        self.x_axis.height_max = 40  # Taller for proper label spacing
+        self.x_axis.height_min = 35
+        
+        # Create ViewBox for the main plot area - NO PADDING!
+        self.view = scene.ViewBox(camera='panzoom', parent=None)
+        
+        # Simple 2x2 grid layout like the working example:
+        # [ y_axis ] [ plot_area ]
+        # [ empty  ] [ x_axis   ]
+        self.grid.add_widget(self.y_axis, row=0, col=0)
+        self.grid.add_widget(self.view, row=0, col=1)  
+        self.grid.add_widget(self.x_axis, row=1, col=1)
+        
+        # Link axes to the ViewBox so they update together
+        self.y_axis.link_view(self.view)
+        self.x_axis.link_view(self.view)
+        
+        # Configure axis ticks for proper label spacing and alignment
+        # Reduce number of ticks to prevent overlap
+        self.y_axis.axis.tick_font_size = 6
+        self.x_axis.axis.tick_font_size = 6
+        
+        # Set reasonable tick density (fewer ticks = less overlap)
+        try:
+            # These help control tick density in VisPy
+            self.y_axis.axis.tick_label_format = '%.0f'  # No decimals for frequency
+            self.x_axis.axis.tick_label_format = '%.1f'  # One decimal for time
+        except AttributeError:
+            pass  # Some VisPy versions may not support this
+        
+        # Configure camera for custom zoom control
+        self.view.camera.aspect = None  # Allows independent zoom on X and Y axes
+        self.view.camera.rect = (-1, -1, 2, 2)  # Initial range: x=(-1,1), y=(-1,1)
+        
+        # Disable interactive controls to prevent conflicts with our custom zoom
+        self.view.camera.interactive = False
+        
+        # Set proper axis orientation for spectrograms
+        # (False, False, False) = no flipping, frequency increases upward naturally
+        self.view.camera.flip = (False, False, False)
+        
+        # Set zoom limits to prevent zooming too far out or in
+        self.view.camera.zoom_factor = 2.0  # Ultra sensitive zoom for instant navigation
         
         # Store data bounds for camera constraints
         self.data_bounds = None  # Will be set when data is loaded
         
-        # Image visual for spectrogram data
-        # Use 'nearest' interpolation to avoid blurring
+        # Image visual for spectrogram data in the ViewBox
         self.image_visual = scene.visuals.Image(parent=self.view.scene, interpolation='nearest')
         
-        # OpenGL texture size limit (will be detected)
-        self.max_texture_size = 16384  # Conservative default
-        
-        # Axis labels
-        self.x_axis_label = scene.visuals.Text('', color='white', font_size=14,
-                                               parent=self.view.scene, anchor_x='center', anchor_y='top')
-        self.y_axis_label = scene.visuals.Text('', color='white', font_size=14,
-                                               parent=self.view.scene, anchor_x='right', anchor_y='center')
-        
-        # Crosshair visuals
-        self.crosshair_v = scene.visuals.Line(parent=self.view.scene, color='white', width=2)
-        self.crosshair_h = scene.visuals.Line(parent=self.view.scene, color='white', width=2)
-        
-        # Text for readouts
-        self.text_visual = scene.visuals.Text('', parent=self.view.scene, color='white', 
-                                            font_size=12, anchor_x='left', anchor_y='top')
-        
-        # Mouse interaction
+        # Initialize mouse tracking and crosshair variables
         self.mouse_pos = (0, 0)
         self.crosshair_enabled = False
         
-        # Timer for updating camera constraints and labels
-        self.update_timer = app.Timer(interval=0.1, connect=self.on_timer, start=True)
+        # Create crosshair visuals (but keep them invisible initially)
+        self.crosshair_v = scene.visuals.Line(color=(0.5, 0.3, 0.9, 0.8), width=1.5, parent=self.view.scene)
+        self.crosshair_h = scene.visuals.Line(color=(0.5, 0.3, 0.9, 0.8), width=1.5, parent=self.view.scene)
+        self.crosshair_v.visible = False
+        self.crosshair_h.visible = False
         
-        # Connect events for zoom control
-        self.events.mouse_wheel.connect(self.on_mouse_wheel)
+        # Create text visual for readouts
+        self.text_visual = scene.visuals.Text('', color='white', font_size=11, 
+                                            pos=(10, 30), parent=self.view.scene)
+        
+        # OpenGL texture size limit
+        self.max_texture_size = 16384
+        
+        # Mouse navigation state
+        self.is_panning = False
+        self.last_mouse_pos = None
+        self.pan_speed = 1.0  # Pan speed factor (matching PyQtGraph)
+        
+        # Connect events for independent axis zoom and mouse tracking
+        self.view.events.mouse_wheel.connect(self.on_mouse_wheel)
+        self.events.key_press.connect(self.on_key_press)
+        self.events.mouse_move.connect(self.on_mouse_move)
+        self.events.mouse_press.connect(self.on_mouse_press)
+        self.events.mouse_release.connect(self.on_mouse_release)
+        
+        # Timer for camera constraints (disabled to prevent interference with zoom)
+        # self.update_timer = app.Timer(interval=0.1, connect=self.on_timer, start=True)
         
         self.freeze()
     
     def on_timer(self, event):
-        """Timer callback to update camera constraints and labels."""
-        # Constrain camera to data bounds
-        self.constrain_camera_to_bounds()
-        # Update axis labels
-        self.update_axis_labels()
+        """Timer callback to update camera constraints - DISABLED."""
+        # Disabled to prevent interference with zoom
+        # self.constrain_camera_to_bounds()
+        # self.update_axis_labels()
     
     def on_mouse_wheel(self, event):
-        """Handle mouse wheel for axis-specific zoom.
+        """Handle mouse wheel for axis-specific zoom - ALWAYS handle to prevent crashes.
         
-        - Shift + Wheel: Zoom time axis (X) only
+        - Shift + Wheel: Zoom time axis (X) only  
         - Ctrl + Wheel: Zoom frequency axis (Y) only
-        - Wheel alone: Zoom both (default)
+        - Wheel alone: Zoom both axes
         """
-        logger.debug(f"Mouse wheel: delta={event.delta}, modifiers={event.modifiers}")
+        # ALWAYS handle the event to prevent VisPy's problematic default zoom
+        event.handled = True
         
-        if event.modifiers:
-            # Prevent default zoom
-            event.handled = True
+        # Get modifier state with more robust detection
+        modifiers = []
+        try:
+            # Try multiple ways to get modifiers
+            if hasattr(event, 'modifiers') and event.modifiers:
+                modifiers = event.modifiers
+            elif hasattr(event, 'mouse_event') and hasattr(event.mouse_event, 'modifiers'):
+                modifiers = event.mouse_event.modifiers or []
+        except AttributeError:
+            modifiers = []
+        
+        # Convert modifiers to strings for easier detection
+        mod_strings = [str(mod).lower() for mod in modifiers]
+        shift_pressed = any('shift' in s for s in mod_strings)
+        ctrl_pressed = any('ctrl' in s or 'control' in s for s in mod_strings)
+        
+        logger.info(f"Mouse wheel: delta={event.delta}, mods={mod_strings}, shift={shift_pressed}, ctrl={ctrl_pressed}")
+        
+        # Ultra sensitive zoom factor for instant navigation
+        zoom_base = 2.5  # Extremely high sensitivity for fastest zoom response
+        factor = zoom_base ** (event.delta[1] / 120.0)
+        
+        # Determine zoom behavior
+        if shift_pressed:
+            # X-axis only (time) - more sensitive
+            scale_factors = [factor, 1.0]
+            logger.info(f"TIME axis zoom: factor={factor:.3f}")
+        elif ctrl_pressed:
+            # Y-axis only (frequency)
+            scale_factors = [1.0, factor]
+            logger.info(f"FREQUENCY axis zoom: factor={factor:.3f}")
+        else:
+            # Both axes
+            scale_factors = [factor, factor]
+            logger.debug(f"Both axes zoom: factor={factor:.3f}")
+        
+        # Perform the zoom
+        self.zoom_with_center(scale_factors, event.pos)
+        
+    def zoom_with_center(self, scale_factors, mouse_pos):
+        """Zoom with center-based scaling around mouse position."""
+        try:
+            # Get current camera rect
+            rect = self.view.camera.rect
+            if rect is None:
+                logger.warning("Camera rect is None, skipping zoom")
+                return
+                
+            # Current view dimensions
+            current_width = float(rect.width)
+            current_height = float(rect.height)
+            current_x = float(rect.left)
+            current_y = float(rect.bottom)
             
-            # Determine zoom factor
-            factor = 0.9 if event.delta[1] > 0 else 1.1
+            # Validate current state
+            if current_width <= 0 or current_height <= 0:
+                logger.warning("Invalid camera dimensions, skipping zoom")
+                return
             
-            logger.info(f"Zoom with modifiers: {event.modifiers}, factor={factor}")
+            # Calculate new dimensions
+            new_width = current_width / scale_factors[0]
+            new_height = current_height / scale_factors[1]
             
-            if 'Shift' in event.modifiers:
-                # Zoom time axis only
-                logger.info("Zooming TIME axis only")
-                self.zoom_axis('x', factor)
-            elif 'Control' in event.modifiers:
-                # Zoom frequency axis only
-                logger.info("Zooming FREQUENCY axis only")
-                self.zoom_axis('y', factor)
+            # Apply boundary constraints early to prevent invalid states
+            if self.data_bounds:
+                time_min, time_max, freq_min, freq_max = self.data_bounds
+                
+                # Constrain width (time axis)
+                max_width = time_max - time_min
+                min_width = max_width / 100  # Allow 100x zoom in
+                new_width = max(min_width, min(new_width, max_width * 1.1))
+                
+                # Constrain height (frequency axis)  
+                max_height = freq_max - freq_min
+                min_height = max_height / 100  # Allow 100x zoom in
+                new_height = max(min_height, min(new_height, max_height * 1.1))
+            
+            # Use view center for zoom (simpler and more reliable)
+            center_x = current_x + current_width / 2
+            center_y = current_y + current_height / 2
+            
+            # Calculate new position (zoom around center)
+            new_x = center_x - new_width / 2
+            new_y = center_y - new_height / 2
+            
+            # Apply boundary constraints for position
+            if self.data_bounds:
+                time_min, time_max, freq_min, freq_max = self.data_bounds
+                
+                # Add small margins
+                margin_x = (time_max - time_min) * 0.02
+                margin_y = (freq_max - freq_min) * 0.02
+                
+                # Constrain X position
+                min_x = time_min - margin_x
+                max_x = time_max + margin_x - new_width
+                new_x = max(min_x, min(new_x, max_x))
+                    
+                # Constrain Y position
+                min_y = freq_min - margin_y  
+                max_y = freq_max + margin_y - new_height
+                new_y = max(min_y, min(new_y, max_y))
+            
+            # Validate final values before applying
+            if new_width > 0 and new_height > 0:
+                self.view.camera.rect = (new_x, new_y, new_width, new_height)
+                logger.debug(f"Zoom applied: rect=({new_x:.2f}, {new_y:.2f}, {new_width:.2f}, {new_height:.2f})")
+            else:
+                logger.warning("Invalid zoom dimensions calculated, skipping")
+            
+        except Exception as e:
+            logger.error(f"Error in zoom_with_center: {e}")
+            # Silently ignore zoom errors to prevent crashes
+    
+    def on_key_press(self, event):
+        """Handle key press events for additional zoom controls."""
+        logger.info(f"Key pressed: {event.key}")
+        
+        if event.key == 'X':
+            # Zoom out on time axis
+            logger.info("Key X: Zooming out TIME axis")
+            self.zoom_with_center([0.8, 1.0], None)  # X-axis zoom out
+        elif event.key == 'x':
+            # Zoom in on time axis  
+            logger.info("Key x: Zooming in TIME axis")
+            self.zoom_with_center([1.2, 1.0], None)  # X-axis zoom in
+        elif event.key == 'Y':
+            # Zoom out on frequency axis
+            logger.info("Key Y: Zooming out FREQUENCY axis")
+            self.zoom_with_center([1.0, 0.8], None)  # Y-axis zoom out
+        elif event.key == 'y':
+            # Zoom in on frequency axis
+            logger.info("Key y: Zooming in FREQUENCY axis")
+            self.zoom_with_center([1.0, 1.2], None)  # Y-axis zoom in
+        elif event.key == 'R' or event.key == 'r':
+            # Reset zoom to show all data
+            logger.info("Key R: Resetting zoom")
+            self.reset_camera_to_data_bounds()
     
     def constrain_camera_to_bounds(self):
-        """Constrain camera to data bounds - prevent panning to empty areas."""
+        """Constrain camera to data bounds - prevent invalid states."""
         if self.data_bounds is None:
             return
         
-        # Get current camera range
         try:
-            x_range, y_range = self.view.camera.get_range()
-        except:
-            return
-        
-        # Extract bounds
-        time_min, freq_min, time_max, freq_max = self.data_bounds
-        
-        x_min, x_max = x_range
-        y_min, y_max = y_range
-        
-        # Check if we're outside bounds
-        constrained = False
-        
-        # Constrain X (time)
-        if x_min < time_min:
-            x_max += (time_min - x_min)
-            x_min = time_min
-            constrained = True
-        if x_max > time_max:
-            x_min -= (x_max - time_max)
-            x_max = time_max
-            constrained = True
-        
-        # Constrain Y (frequency)
-        if y_min < freq_min:
-            y_max += (freq_min - y_min)
-            y_min = freq_min
-            constrained = True
-        if y_max > freq_max:
-            y_min -= (y_max - freq_max)
-            y_max = freq_max
-            constrained = True
-        
-        # Update camera if needed
-        if constrained:
-            logger.info(f"Constraining camera: X=[{x_min:.1f}, {x_max:.1f}], Y=[{y_min:.1f}, {y_max:.1f}]")
-            self.view.camera.set_range(x=(x_min, x_max), y=(y_min, y_max), margin=0)
+            rect = self.view.camera.rect
+            if rect is None:
+                return
+            
+            # Get current rect properties safely
+            current_x = float(rect.left)
+            current_y = float(rect.bottom)
+            current_width = float(rect.width)
+            current_height = float(rect.height)
+            
+            # Validate current dimensions
+            if current_width <= 0 or current_height <= 0:
+                logger.warning("Invalid camera dimensions - resetting to data bounds")
+                self.reset_camera_to_data_bounds()
+                return
+                
+            # Extract bounds
+            time_min, time_max, freq_min, freq_max = self.data_bounds
+            data_width = time_max - time_min
+            data_height = freq_max - freq_min
+            
+            # Prevent extreme zoom levels
+            min_width = data_width / 1000  # Max 1000x zoom
+            max_width = data_width * 2     # Allow slight overzoom
+            min_height = data_height / 1000
+            max_height = data_height * 2
+            
+            # Constrain dimensions
+            new_width = max(min_width, min(current_width, max_width))
+            new_height = max(min_height, min(current_height, max_height))
+            
+            # Constrain position with small margin
+            margin_x = data_width * 0.05
+            margin_y = data_height * 0.05
+            
+            new_x = max(time_min - margin_x, 
+                       min(current_x, time_max + margin_x - new_width))
+            new_y = max(freq_min - margin_y,
+                       min(current_y, freq_max + margin_y - new_height))
+            
+            # Only update if values changed significantly
+            if (abs(new_x - current_x) > 1e-6 or abs(new_y - current_y) > 1e-6 or
+                abs(new_width - current_width) > 1e-6 or abs(new_height - current_height) > 1e-6):
+                
+                # Validate the new rect before applying
+                if new_width > 0 and new_height > 0:
+                    self.view.camera.rect = (new_x, new_y, new_width, new_height)
+                    
+        except Exception as e:
+            logger.debug(f"Error in camera constraints: {e}")
+            # Don't crash - camera constraints are not critical
+            
+    def reset_camera_to_data_bounds(self):
+        """Reset camera to show all data."""
+        if self.data_bounds:
+            time_min, time_max, freq_min, freq_max = self.data_bounds
+            self.view.camera.rect = (time_min, freq_min, 
+                                   time_max - time_min, freq_max - freq_min)
     
     def update_axis_labels(self):
-        """Update axis labels with appropriate units based on zoom level."""
+        """Update axis labels with appropriate units based on zoom level.
+        
+        With AxisWidget, the labels are automatically managed, but we can
+        update the axis label text to show appropriate units.
+        """
         if self.data_bounds is None:
             return
         
-        # Get camera range instead of rect
         try:
-            x_range, y_range = self.view.camera.get_range()
-            if x_range is None or y_range is None:
+            rect = self.view.camera.rect
+            if rect is None:
                 return
+            
+            x_min = rect.left
+            x_max = rect.right  
+            y_min = rect.bottom
+            y_max = rect.top
         except Exception as e:
-            logger.debug(f"Cannot get camera range: {e}")
+            logger.debug(f"Cannot get camera rect: {e}")
             return
         
         time_min, freq_min, time_max, freq_max = self.data_bounds
-        x_min, x_max = x_range
-        y_min, y_max = y_range
         w = x_max - x_min
         h = y_max - y_min
         
         # Format time axis label (X-axis)
         time_span = w
         if time_span < 1.0:
-            time_unit = "TIME (ms)"
+            time_unit = "Time (ms)"
         elif time_span < 60.0:
-            time_unit = "TIME (s)"
+            time_unit = "Time (s)"
         elif time_span < 3600.0:
-            time_unit = "TIME (min)"
+            time_unit = "Time (min)"
         else:
-            time_unit = "TIME (hr)"
+            time_unit = "Time (hr)"
         
         # Format frequency axis label (Y-axis)
         freq_span = h
         if freq_span < 1000.0:
-            freq_unit = "FREQ (Hz)"
+            freq_unit = "Frequency (Hz)"
         else:
-            freq_unit = "FREQ (kHz)"
+            freq_unit = "Frequency (kHz)"
         
-        # Position labels at visible locations
-        # Bottom right for time axis label
-        self.x_axis_label.text = time_unit
-        self.x_axis_label.pos = (x_max - w * 0.15, y_min + h * 0.05)
-        self.x_axis_label.font_size = 18
-        self.x_axis_label.color = (1, 1, 0, 1)  # Bright yellow
+        # Update AxisWidget labels (need to unfreeze first)
+        self.x_axis.unfreeze()
+        self.x_axis.axis_label = time_unit
+        self.x_axis.freeze()
         
-        # Top left for frequency axis label  
-        self.y_axis_label.text = freq_unit
-        self.y_axis_label.pos = (x_min + w * 0.1, y_max - h * 0.05)
-        self.y_axis_label.font_size = 18
-        self.y_axis_label.color = (1, 1, 0, 1)  # Bright yellow
+        self.y_axis.unfreeze()
+        self.y_axis.axis_label = freq_unit
+        self.y_axis.freeze()
         
-        logger.debug(f"Labels updated: {time_unit} at {self.x_axis_label.pos}, {freq_unit} at {self.y_axis_label.pos}")
+        logger.debug(f"Axis labels updated: {time_unit}, {freq_unit}")
     
-    def zoom_axis(self, axis: str, factor: float):
-        """Zoom on a specific axis only.
-        
-        Args:
-            axis: 'x' for time, 'y' for frequency
-            factor: Zoom factor (<1 zoom in, >1 zoom out)
-        """
-        if self.data_bounds is None:
-            return
-        
-        try:
-            x_range, y_range = self.view.camera.get_range()
-        except:
-            return
-        
-        x_min, x_max = x_range
-        y_min, y_max = y_range
-        
-        if axis == 'x':
-            # Zoom time axis (X) only
-            w = x_max - x_min
-            new_w = w * factor
-            center_x = (x_min + x_max) / 2
-            new_x_min = center_x - new_w / 2
-            new_x_max = center_x + new_w / 2
-            self.view.camera.set_range(x=(new_x_min, new_x_max), y=y_range, margin=0)
-        elif axis == 'y':
-            # Zoom frequency axis (Y) only
-            h = y_max - y_min
-            new_h = h * factor
-            center_y = (y_min + y_max) / 2
-            new_y_min = center_y - new_h / 2
-            new_y_max = center_y + new_h / 2
-            self.view.camera.set_range(x=x_range, y=(new_y_min, new_y_max), margin=0)
+    def set_data_bounds(self, time_min, time_max, freq_min, freq_max):
+        """Set data bounds for zoom and pan constraints."""
+        self.data_bounds = (time_min, time_max, freq_min, freq_max)
+        logger.info(f"Data bounds set: time=[{time_min:.3f}, {time_max:.3f}], freq=[{freq_min:.1f}, {freq_max:.1f}]")
     
     def update_image(self, data: np.ndarray, extent: tuple = None):
         """Update the displayed image data."""
@@ -347,14 +515,13 @@ class VisPyCanvas(scene.SceneCanvas):
                 
                 logger.debug(f"Transform scale: ({x_scale:.6f}, {y_scale:.2f})")
                 
-                # Store data bounds for camera constraints
-                self.data_bounds = (time_start, time_end, freq_start, freq_end)
+                # Set data bounds for proper zoom/pan constraints
+                self.set_data_bounds(time_start, time_end, freq_start, freq_end)
                 
                 # Update camera to show the full data range
-                self.view.camera.set_range(
-                    x=(time_start, time_end),
-                    y=(freq_start, freq_end),
-                    margin=0
+                self.view.camera.rect = (
+                    time_start, freq_start, 
+                    time_end - time_start, freq_end - freq_start
                 )
                 
                 # Update axis labels
@@ -373,9 +540,9 @@ class VisPyCanvas(scene.SceneCanvas):
             x, y = pos
             
             # Update crosshair lines
-            view_bounds = self.view.camera.get_range()
-            x_range = view_bounds[0]
-            y_range = view_bounds[1]
+            rect = self.view.camera.rect
+            x_range = (rect.left, rect.right)
+            y_range = (rect.bottom, rect.top)
             
             # Vertical line
             self.crosshair_v.set_data(np.array([[x, y_range[0]], [x, y_range[1]]]))
@@ -395,21 +562,92 @@ class VisPyCanvas(scene.SceneCanvas):
         if pos:
             self.text_visual.pos = pos
     
+    def on_mouse_press(self, event):
+        """Handle mouse press for starting pan navigation."""
+        if event.button == 1:  # Left button
+            self.is_panning = True
+            self.last_mouse_pos = event.pos
+            event.handled = True
+    
+    def on_mouse_release(self, event):
+        """Handle mouse release for ending pan navigation."""
+        if event.button == 1:  # Left button
+            self.is_panning = False
+            self.last_mouse_pos = None
+            event.handled = True
+    
     def on_mouse_move(self, event):
-        """Handle mouse movement for crosshair updates."""
+        """Handle mouse movement for pan navigation and crosshair updates."""
         if event.pos is not None:
-            # Convert screen coordinates to world coordinates
-            tr = self.scene.node_transform(self.view.scene)
-            world_pos = tr.map(event.pos)
+            # Handle panning if left mouse button is pressed
+            if self.is_panning and self.last_mouse_pos is not None:
+                try:
+                    # Calculate delta in screen space
+                    delta_screen = event.pos - self.last_mouse_pos
+                    
+                    # Get current camera rect
+                    rect = self.view.camera.rect
+                    if rect is None:
+                        return
+                    
+                    # Get canvas size to convert screen delta to world delta
+                    canvas_size = self.size
+                    if canvas_size[0] <= 0 or canvas_size[1] <= 0:
+                        return
+                    
+                    # Convert screen delta to world delta (with pan speed)
+                    delta_x = -(delta_screen[0] / canvas_size[0]) * rect.width * self.pan_speed
+                    delta_y = (delta_screen[1] / canvas_size[1]) * rect.height * self.pan_speed
+                    
+                    # Calculate new position
+                    new_left = rect.left + delta_x
+                    new_bottom = rect.bottom + delta_y
+                    
+                    # Apply boundary constraints
+                    if self.data_bounds:
+                        time_min, time_max, freq_min, freq_max = self.data_bounds
+                        
+                        # Constrain X (time)
+                        if new_left < time_min:
+                            new_left = time_min
+                        if new_left + rect.width > time_max:
+                            new_left = time_max - rect.width
+                        
+                        # Constrain Y (frequency)
+                        if new_bottom < freq_min:
+                            new_bottom = freq_min
+                        if new_bottom + rect.height > freq_max:
+                            new_bottom = freq_max - rect.height
+                    
+                    # Apply the pan
+                    self.view.camera.rect = (new_left, new_bottom, rect.width, rect.height)
+                    
+                    # Update last position
+                    self.last_mouse_pos = event.pos
+                    
+                    logger.debug(f"Panning: new rect=({new_left:.1f}, {new_bottom:.1f}, {rect.width:.1f}, {rect.height:.1f})")
+                    
+                except Exception as e:
+                    logger.debug(f"Pan error: {e}")
             
-            self.mouse_pos = (world_pos[0], world_pos[1])
-            
-            if self.crosshair_enabled:
-                self.set_crosshair(True, self.mouse_pos)
-                
-                # Update readout text
-                readout = f"Time: {world_pos[0]:.3f}s, Freq: {world_pos[1]:.0f}Hz"
-                self.update_text_readout(readout, (10, 30))
+            # Handle crosshair updates (only when not panning)
+            elif not self.is_panning:
+                try:
+                    # Convert screen coordinates to world coordinates using ViewBox transform
+                    tr = self.view.scene.node_transform(self.view.scene)
+                    if tr is not None:
+                        world_pos = tr.map(event.pos)
+                        self.mouse_pos = (world_pos[0], world_pos[1])
+                        
+                        if self.crosshair_enabled:
+                            self.set_crosshair(True, self.mouse_pos)
+                            
+                            # Update readout text
+                            readout = f"Time: {world_pos[0]:.3f}s, Freq: {world_pos[1]:.0f}Hz"
+                            self.update_text_readout(readout, (10, 30))
+                except Exception as e:
+                    # Silently handle coordinate transform errors during mouse movement
+                    pass
 
 class StatusWidget(QWidget):
     """Status widget showing performance metrics."""
@@ -582,6 +820,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("GPU-Accelerated Audio Visualizer")
         self.setMinimumSize(1200, 800)
         
+        # Apply modern glassmorphic theme
+        self.apply_modern_theme()
+        
         # Core components
         self.cache_manager = CacheManager(max_memory_mb=2048, max_gpu_memory_mb=1024)
         self.task_manager = TaskManager()
@@ -636,36 +877,75 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1000, lambda: self.load_audio_file(initial_file))
         
     def setup_ui(self):
-        """Setup the main user interface."""
+        """Setup the main user interface with improved layout and containers."""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
+        # Main layout with NO padding to maximize canvas space
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
         
-        # Controls
+        # Controls at the top
         self.controls_widget = ControlsWidget()
         main_layout.addWidget(self.controls_widget)
         
-        # Tab widget for different views
-        self.tab_widget = QTabWidget()
+        # Container for visualization - glassmorphic card style
+        viz_container = QFrame()
+        viz_container.setObjectName("viz_container")
+        viz_container.setFrameShape(QFrame.NoFrame)
+        viz_layout = QVBoxLayout(viz_container)
+        viz_layout.setContentsMargins(0, 0, 0, 0)  # NO MARGINS!
+        viz_layout.setSpacing(0)
         
-        # Create tabs
+        # Tab widget for different views - NO PADDING
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setContentsMargins(0, 0, 0, 0)
+        
+        # Create tabs with proper containers
         if HAS_VISPY:
-            self.spectrogram_canvas = VisPyCanvas('spectrogram')
-            self.cepstrogram_canvas = VisPyCanvas('cepstrogram')  
-            self.fk_canvas = VisPyCanvas('fk_transform')
+            # Spectrogram tab
+            spec_container = QFrame()
+            spec_container.setFrameShape(QFrame.NoFrame)
+            spec_layout = QVBoxLayout(spec_container)
+            spec_layout.setContentsMargins(0, 0, 0, 0)  # NO MARGINS!
+            spec_layout.setSpacing(0)
             
-            self.tab_widget.addTab(self.spectrogram_canvas.native, "Spectrogram")
-            self.tab_widget.addTab(self.cepstrogram_canvas.native, "Cepstrogram")
-            self.tab_widget.addTab(self.fk_canvas.native, "F-K Transform")
+            self.spectrogram_canvas = VisPyCanvas('spectrogram')
+            spec_layout.addWidget(self.spectrogram_canvas.native)
+            
+            # Cepstrogram tab
+            cepstro_container = QFrame()
+            cepstro_container.setFrameShape(QFrame.NoFrame)
+            cepstro_layout = QVBoxLayout(cepstro_container)
+            cepstro_layout.setContentsMargins(0, 0, 0, 0)  # NO MARGINS!
+            cepstro_layout.setSpacing(0)
+            
+            self.cepstrogram_canvas = VisPyCanvas('cepstrogram')
+            cepstro_layout.addWidget(self.cepstrogram_canvas.native)
+            
+            # F-K tab
+            fk_container = QFrame()
+            fk_container.setFrameShape(QFrame.NoFrame)
+            fk_layout = QVBoxLayout(fk_container)
+            fk_layout.setContentsMargins(0, 0, 0, 0)  # NO MARGINS!
+            fk_layout.setSpacing(0)
+            
+            self.fk_canvas = VisPyCanvas('fk_transform')
+            fk_layout.addWidget(self.fk_canvas.native)
+            
+            # Add tabs
+            self.tab_widget.addTab(spec_container, "Spectrogram")
+            self.tab_widget.addTab(cepstro_container, "Cepstrogram")
+            self.tab_widget.addTab(fk_container, "F-K Transform")
         else:
             # Fallback widgets when VisPy not available
             self.tab_widget.addTab(QLabel("VisPy not available"), "Spectrogram")
             self.tab_widget.addTab(QLabel("VisPy not available"), "Cepstrogram")
             self.tab_widget.addTab(QLabel("VisPy not available"), "F-K Transform")
         
-        main_layout.addWidget(self.tab_widget)
+        viz_layout.addWidget(self.tab_widget)
+        main_layout.addWidget(viz_container)
         
         # Connect signals
         self.controls_widget.parameters_changed.connect(self.on_parameters_changed)
@@ -686,6 +966,24 @@ class MainWindow(QMainWindow):
         open_action.setShortcut(QKeySequence.Open)
         open_action.triggered.connect(self.open_audio_file)
         file_menu.addAction(open_action)
+        
+        file_menu.addSeparator()
+        
+        # Export menu
+        export_menu = file_menu.addMenu("Export")
+        
+        export_image_action = QAction("Export Current View as Image...", self)
+        export_image_action.setShortcut("Ctrl+E")
+        export_image_action.triggered.connect(self.export_current_view_as_image)
+        export_menu.addAction(export_image_action)
+        
+        export_data_action = QAction("Export Data as NPY...", self)
+        export_data_action.triggered.connect(self.export_data_as_npy)
+        export_menu.addAction(export_data_action)
+        
+        export_csv_action = QAction("Export Data as CSV...", self)
+        export_csv_action.triggered.connect(self.export_data_as_csv)
+        export_menu.addAction(export_csv_action)
         
         file_menu.addSeparator()
         
@@ -765,13 +1063,65 @@ class MainWindow(QMainWindow):
     
     def on_colormap_changed(self, colormap: str):
         """Handle colormap changes."""
-        # Update render manager when available
-        pass
+        logger.info(f"Colormap changed to: {colormap}")
+        
+        try:
+            # Update all canvas image visuals with new colormap
+            if HAS_VISPY:
+                if hasattr(self, 'spectrogram_canvas') and self.spectrogram_canvas.image_visual:
+                    self.spectrogram_canvas.image_visual.cmap = colormap
+                    logger.debug(f"Updated spectrogram colormap to {colormap}")
+                
+                if hasattr(self, 'cepstrogram_canvas') and self.cepstrogram_canvas.image_visual:
+                    self.cepstrogram_canvas.image_visual.cmap = colormap
+                    logger.debug(f"Updated cepstrogram colormap to {colormap}")
+                
+                if hasattr(self, 'fk_canvas') and self.fk_canvas.image_visual:
+                    self.fk_canvas.image_visual.cmap = colormap
+                    logger.debug(f"Updated F-K transform colormap to {colormap}")
+                
+                # Trigger a visual update
+                self.update_displays()
+                
+        except Exception as e:
+            logger.error(f"Error updating colormap: {e}")
+    
+    def update_displays(self):
+        """Force update of all displays."""
+        try:
+            if HAS_VISPY:
+                if hasattr(self, 'spectrogram_canvas'):
+                    self.spectrogram_canvas.update()
+                if hasattr(self, 'cepstrogram_canvas'):
+                    self.cepstrogram_canvas.update()
+                if hasattr(self, 'fk_canvas'):
+                    self.fk_canvas.update()
+        except Exception as e:
+            logger.debug(f"Error updating displays: {e}")
     
     def on_db_range_changed(self, db_min: float, db_max: float):
         """Handle dB range changes."""
-        # Update render manager when available
-        pass
+        logger.info(f"dB range changed to: [{db_min:.1f}, {db_max:.1f}] dB")
+        
+        try:
+            # Update all canvas image visuals with new dB range for color limits
+            if HAS_VISPY:
+                # Convert dB range to normalized range (spectrogram data is normalized 0-1)
+                # This affects the color mapping range
+                if hasattr(self, 'spectrogram_canvas') and self.spectrogram_canvas.image_visual:
+                    # Store dB range for use during data normalization
+                    self.spectrogram_canvas.db_range = (db_min, db_max)
+                    logger.debug(f"Updated spectrogram dB range to [{db_min:.1f}, {db_max:.1f}]")
+                
+                if hasattr(self, 'cepstrogram_canvas') and self.cepstrogram_canvas.image_visual:
+                    self.cepstrogram_canvas.db_range = (db_min, db_max)
+                    logger.debug(f"Updated cepstrogram dB range to [{db_min:.1f}, {db_max:.1f}]")
+                
+                # Refresh current view to apply new dB range
+                self.refresh_current_view()
+                
+        except Exception as e:
+            logger.error(f"Error updating dB range: {e}")
     
     def on_tab_changed(self, index: int):
         """Handle tab changes - lazy loading trigger."""
@@ -784,14 +1134,71 @@ class MainWindow(QMainWindow):
             self.load_view_data(view_type)
     
     def load_view_data(self, view_type: str):
-        """Load data for specified view type."""
+        """Load data for specified view type using tile system."""
         if not self.current_file:
             return
         
-        self.statusBar().showMessage(f"Computing {view_type}...")
+        self.statusBar().showMessage(f"Loading {view_type} tiles...")
+        
+        # Get current view range
+        time_range = self.current_view_range[0]
+        freq_range = self.current_view_range[1]
+        
+        logger.info(f"Loading {view_type} for time range {time_range}, freq range {freq_range}")
+        
+        try:
+            # Try tile-based rendering first
+            if self.load_view_data_tiled(view_type, time_range, freq_range):
+                return
+            
+            # Fallback to direct computation if tile system fails
+            logger.warning(f"Tile system failed for {view_type}, falling back to direct computation")
+            self.load_view_data_direct(view_type, time_range)
+                
+        except Exception as e:
+            logger.error(f"Error loading {view_type}: {e}")
+            self.statusBar().showMessage(f"Error: {str(e)}")
+    
+    def load_view_data_tiled(self, view_type: str, time_range: tuple, freq_range: tuple) -> bool:
+        """Load data using tile system. Returns True if successful."""
+        try:
+            # Update tile manager with current visible region
+            zoom_level = self.estimate_zoom_level(time_range, freq_range)
+            self.tile_manager.update_visible_region(view_type, time_range, freq_range, zoom_level)
+            
+            # Get visible tiles for this region
+            visible_tiles = self.tile_manager.get_visible_tiles(view_type, time_range, freq_range, zoom_level)
+            
+            if not visible_tiles:
+                logger.warning(f"No visible tiles found for {view_type}")
+                return False
+            
+            # Check if we have cached tiles for this region
+            atlas = self.tile_manager.atlases.get(view_type)
+            if not atlas:
+                logger.warning(f"No atlas found for {view_type}")
+                return False
+            
+            # For now, use a simplified approach: request the most important tiles
+            # and display what we have while computing missing ones
+            self.request_tiles_for_region(view_type, time_range, freq_range, zoom_level)
+            
+            # Try to display available atlas data
+            if self.update_atlas_display_improved(view_type, time_range, freq_range):
+                self.statusBar().showMessage(f"{view_type.title()} tiles loaded")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Tile-based loading failed for {view_type}: {e}")
+            return False
+    
+    def load_view_data_direct(self, view_type: str, time_range: tuple):
+        """Fallback to direct computation."""
+        logger.info(f"Using direct computation for {view_type}")
         
         # Get audio data for current time range
-        time_range = self.current_view_range[0]
         start_sample = int(time_range[0] * self.spectrogram_engine.sample_rate)
         end_sample = int(time_range[1] * self.spectrogram_engine.sample_rate)
         
@@ -799,20 +1206,71 @@ class MainWindow(QMainWindow):
         total_samples = self.audio_loader.total_samples
         num_samples = min(end_sample - start_sample, total_samples - start_sample)
         
+        audio_data = self.audio_loader.get_chunk(start_sample, num_samples)
+        
+        # Use original direct computation methods
+        if view_type == 'spectrogram':
+            self.load_spectrogram_data(audio_data)
+        elif view_type == 'cepstrogram':
+            self.load_cepstrogram_data(audio_data)
+        elif view_type == 'fk_transform':
+            self.load_fk_data(audio_data)
+    
+    def estimate_zoom_level(self, time_range: tuple, freq_range: tuple) -> float:
+        """Estimate zoom level based on visible range."""
+        if not self.current_file:
+            return 1.0
+        
+        # Get total duration and sample rate
+        total_duration = self.audio_loader.duration
+        sample_rate = self.spectrogram_engine.sample_rate
+        
+        # Calculate what fraction of total range is visible
+        time_span = time_range[1] - time_range[0]
+        freq_span = freq_range[1] - freq_range[0]
+        
+        time_zoom = total_duration / time_span if time_span > 0 else 1.0
+        freq_zoom = (sample_rate / 2) / freq_span if freq_span > 0 else 1.0
+        
+        # Use average zoom level
+        zoom_level = (time_zoom + freq_zoom) / 2
+        logger.debug(f"Estimated zoom level: {zoom_level:.2f} (time: {time_zoom:.2f}, freq: {freq_zoom:.2f})")
+        
+        return max(1.0, zoom_level)
+    
+    def request_tiles_for_region(self, view_type: str, time_range: tuple, freq_range: tuple, zoom_level: float):
+        """Request tiles for the specified region."""
         try:
-            audio_data = self.audio_loader.get_chunk(start_sample, num_samples)
+            # Submit tile requests to tile manager
+            logger.info(f"Requesting tiles for {view_type}: time={time_range}, freq={freq_range}, zoom={zoom_level:.2f}")
             
-            # Use direct computation for now (tile system integration ongoing)
-            if view_type == 'spectrogram':
-                self.load_spectrogram_data(audio_data)
-            elif view_type == 'cepstrogram':
-                self.load_cepstrogram_data(audio_data)
-            elif view_type == 'fk_transform':
-                self.load_fk_data(audio_data)
-                
+            # The tile manager should handle this automatically when we call update_visible_region
+            # This is a placeholder for more sophisticated tile request logic
+            
         except Exception as e:
-            logger.error(f"Error loading {view_type}: {e}")
-            self.statusBar().showMessage(f"Error: {str(e)}")
+            logger.error(f"Error requesting tiles for {view_type}: {e}")
+    
+    def update_atlas_display_improved(self, view_type: str, time_range: tuple, freq_range: tuple) -> bool:
+        """Update display with available atlas data."""
+        try:
+            atlas = self.tile_manager.atlases.get(view_type)
+            if not atlas:
+                return False
+            
+            # Get atlas statistics to see if we have useful data
+            stats = atlas.stats
+            if stats['slots_used'] == 0:
+                logger.debug(f"No tiles loaded in {view_type} atlas")
+                return False
+            
+            # For now, fall back to direct computation since the atlas rendering
+            # integration needs more work. This ensures we show data instead of empty view.
+            logger.info(f"Atlas has {stats['slots_used']} tiles, but falling back to direct computation")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error updating atlas display for {view_type}: {e}")
+            return False
     
     def update_atlas_display(self, view_type: str):
         """Update the display with computed data.
@@ -933,6 +1391,455 @@ class MainWindow(QMainWindow):
             self.status_widget.update_stats(progress=avg_progress)
         else:
             self.status_widget.update_stats(progress=1.0)
+    
+    def export_current_view_as_image(self):
+        """Export the current view as an image file."""
+        if not self.current_file:
+            QMessageBox.warning(self, "Export Warning", "No audio file loaded to export.")
+            return
+        
+        try:
+            # Get current tab
+            current_index = self.tab_widget.currentIndex()
+            tab_names = ['spectrogram', 'cepstrogram', 'fk_transform']
+            view_type = tab_names[current_index] if 0 <= current_index < len(tab_names) else 'spectrogram'
+            
+            # Get canvas
+            canvas = None
+            if view_type == 'spectrogram' and hasattr(self, 'spectrogram_canvas'):
+                canvas = self.spectrogram_canvas
+            elif view_type == 'cepstrogram' and hasattr(self, 'cepstrogram_canvas'):
+                canvas = self.cepstrogram_canvas
+            elif view_type == 'fk_transform' and hasattr(self, 'fk_canvas'):
+                canvas = self.fk_canvas
+            
+            if not canvas or not HAS_VISPY:
+                QMessageBox.warning(self, "Export Warning", "No valid view to export.")
+                return
+            
+            # File dialog
+            filename, _ = QFileDialog.getSaveFileName(
+                self, f"Export {view_type.title()} Image",
+                f"{view_type}_{os.path.splitext(os.path.basename(self.current_file))[0]}.png",
+                "PNG Images (*.png);;JPEG Images (*.jpg);;All Files (*)"
+            )
+            
+            if filename:
+                # Use VisPy's render method
+                image = canvas.render()
+                if hasattr(image, 'save'):
+                    image.save(filename)
+                    self.statusBar().showMessage(f"Exported {view_type} image to {filename}")
+                    logger.info(f"Exported {view_type} image to {filename}")
+                else:
+                    # Fallback: save as numpy array converted to image
+                    import imageio
+                    imageio.imwrite(filename, image)
+                    self.statusBar().showMessage(f"Exported {view_type} image to {filename}")
+                    logger.info(f"Exported {view_type} image to {filename}")
+                    
+        except Exception as e:
+            logger.error(f"Error exporting image: {e}")
+            QMessageBox.critical(self, "Export Error", f"Failed to export image:\n{str(e)}")
+    
+    def export_data_as_npy(self):
+        """Export the current view data as a NumPy array."""
+        if not self.current_file:
+            QMessageBox.warning(self, "Export Warning", "No audio file loaded to export.")
+            return
+        
+        try:
+            # Get current tab and data
+            current_index = self.tab_widget.currentIndex()
+            tab_names = ['spectrogram', 'cepstrogram', 'fk_transform']
+            view_type = tab_names[current_index] if 0 <= current_index < len(tab_names) else 'spectrogram'
+            
+            # Get the last computed data for this view
+            data = self.get_current_view_data(view_type)
+            
+            if data is None:
+                QMessageBox.warning(self, "Export Warning", f"No {view_type} data available to export.")
+                return
+            
+            # File dialog
+            filename, _ = QFileDialog.getSaveFileName(
+                self, f"Export {view_type.title()} Data",
+                f"{view_type}_{os.path.splitext(os.path.basename(self.current_file))[0]}.npy",
+                "NumPy Arrays (*.npy);;All Files (*)"
+            )
+            
+            if filename:
+                np.save(filename, data)
+                self.statusBar().showMessage(f"Exported {view_type} data to {filename}")
+                logger.info(f"Exported {view_type} data to {filename} (shape: {data.shape})")
+                
+        except Exception as e:
+            logger.error(f"Error exporting NPY data: {e}")
+            QMessageBox.critical(self, "Export Error", f"Failed to export data:\n{str(e)}")
+    
+    def export_data_as_csv(self):
+        """Export the current view data as CSV."""
+        if not self.current_file:
+            QMessageBox.warning(self, "Export Warning", "No audio file loaded to export.")
+            return
+        
+        try:
+            # Get current tab and data
+            current_index = self.tab_widget.currentIndex()
+            tab_names = ['spectrogram', 'cepstrogram', 'fk_transform']
+            view_type = tab_names[current_index] if 0 <= current_index < len(tab_names) else 'spectrogram'
+            
+            data = self.get_current_view_data(view_type)
+            
+            if data is None:
+                QMessageBox.warning(self, "Export Warning", f"No {view_type} data available to export.")
+                return
+            
+            # File dialog
+            filename, _ = QFileDialog.getSaveFileName(
+                self, f"Export {view_type.title()} Data",
+                f"{view_type}_{os.path.splitext(os.path.basename(self.current_file))[0]}.csv",
+                "CSV Files (*.csv);;All Files (*)"
+            )
+            
+            if filename:
+                import pandas as pd
+                
+                # Convert 2D array to DataFrame
+                if data.ndim == 2:
+                    df = pd.DataFrame(data)
+                    df.index.name = 'frequency_bin' if view_type == 'spectrogram' else 'coefficient'
+                    df.columns.name = 'time_frame'
+                else:
+                    df = pd.DataFrame(data.flatten(), columns=[view_type])
+                
+                df.to_csv(filename)
+                self.statusBar().showMessage(f"Exported {view_type} data to {filename}")
+                logger.info(f"Exported {view_type} data to {filename} (shape: {data.shape})")
+                
+        except ImportError:
+            QMessageBox.critical(self, "Export Error", "pandas library not available for CSV export.")
+        except Exception as e:
+            logger.error(f"Error exporting CSV data: {e}")
+            QMessageBox.critical(self, "Export Error", f"Failed to export data:\n{str(e)}")
+    
+    def get_current_view_data(self, view_type: str):
+        """Get the current view's data for export."""
+        try:
+            # For now, recompute the data for the current view range
+            # In a full implementation, this could cache the last computed result
+            
+            if not self.current_file:
+                return None
+            
+            # Get audio data for current view range
+            time_range = self.current_view_range[0]
+            start_sample = int(time_range[0] * self.spectrogram_engine.sample_rate)
+            end_sample = int(time_range[1] * self.spectrogram_engine.sample_rate)
+            
+            total_samples = self.audio_loader.total_samples
+            num_samples = min(end_sample - start_sample, total_samples - start_sample)
+            
+            if num_samples <= 0:
+                return None
+            
+            audio_data = self.audio_loader.get_chunk(start_sample, num_samples)
+            
+            if view_type == 'spectrogram':
+                magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_data)
+                return magnitude_db
+            elif view_type == 'cepstrogram':
+                magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_data)
+                # Clear cache to rebuild with correct dimensions
+                self.cepstrogram_engine._mel_filterbank = None
+                cepstral = self.cepstrogram_engine.compute_cepstrogram_from_spectrogram(magnitude_db, frequencies)
+                return cepstral
+            elif view_type == 'fk_transform':
+                # F-K transform disabled for now
+                return None
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting view data for {view_type}: {e}")
+            return None
+    
+    def apply_modern_theme(self):
+        """Apply modern glassmorphic dark theme inspired by PyQtGraph example."""
+        self.setStyleSheet("""
+            /* Main Window - Darker gradient background */
+            QMainWindow {
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #0A0A15,
+                    stop: 0.5 #12121F,
+                    stop: 1 #0E1628
+                );
+            }
+            
+            /* Central Widget */
+            QWidget {
+                background: transparent;
+                color: rgba(255, 255, 255, 0.9);
+                font-size: 10pt;
+            }
+            
+            /* Visualization Container - Distinct darker tone */
+            QFrame#viz_container {
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 rgba(20, 20, 35, 0.95),
+                    stop: 1 rgba(15, 15, 30, 0.95)
+                );
+                border: 1px solid rgba(100, 100, 150, 0.2);
+                border-radius: 0px;
+            }
+            
+            /* Tab Widget - Modern style */
+            QTabWidget::pane {
+                border: none;
+                background: transparent;
+            }
+            
+            QTabBar::tab {
+                background: rgba(255, 255, 255, 0.05);
+                color: rgba(255, 255, 255, 0.7);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-bottom: none;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                padding: 8px 20px;
+                margin-right: 4px;
+                font-weight: 500;
+            }
+            
+            QTabBar::tab:selected {
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 rgba(99, 102, 241, 0.3),
+                    stop: 1 rgba(139, 92, 246, 0.3)
+                );
+                color: rgba(255, 255, 255, 0.95);
+                border: 1px solid rgba(139, 92, 246, 0.5);
+                border-bottom: none;
+            }
+            
+            QTabBar::tab:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+            
+            /* Control Frames */
+            QFrame {
+                background: rgba(255, 255, 255, 0.03);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            
+            /* Labels */
+            QLabel {
+                color: rgba(255, 255, 255, 0.85);
+                background: transparent;
+                border: none;
+                font-size: 10pt;
+            }
+            
+            /* ComboBox - Dropdown */
+            QComboBox {
+                background: rgba(255, 255, 255, 0.05);
+                color: rgba(255, 255, 255, 0.9);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 6px;
+                padding: 5px 10px;
+                min-width: 80px;
+            }
+            
+            QComboBox:hover {
+                background: rgba(255, 255, 255, 0.08);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+            }
+            
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid rgba(255, 255, 255, 0.7);
+                margin-right: 5px;
+            }
+            
+            QComboBox QAbstractItemView {
+                background: rgba(20, 20, 30, 0.95);
+                color: rgba(255, 255, 255, 0.9);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 6px;
+                selection-background-color: rgba(99, 102, 241, 0.3);
+                padding: 4px;
+            }
+            
+            /* Sliders - Modern style */
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 3px;
+            }
+            
+            QSlider::handle:horizontal {
+                width: 16px;
+                height: 16px;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #8B5CF6,
+                    stop: 1 #6366F1
+                );
+                border-radius: 8px;
+                margin: -5px 0;
+            }
+            
+            QSlider::handle:horizontal:hover {
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #9F6FFF,
+                    stop: 1 #7C7FFF
+                );
+            }
+            
+            QSlider::sub-page:horizontal {
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #6366F1,
+                    stop: 1 #8B5CF6
+                );
+                border-radius: 3px;
+            }
+            
+            /* Buttons - Modern pill style */
+            QPushButton {
+                background: rgba(255, 255, 255, 0.05);
+                color: rgba(255, 255, 255, 0.9);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 6px;
+                padding: 6px 16px;
+                font-weight: 500;
+                font-size: 10pt;
+            }
+            
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.1);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+            }
+            
+            QPushButton:pressed {
+                background: rgba(255, 255, 255, 0.03);
+            }
+            
+            /* Progress Bar */
+            QProgressBar {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 6px;
+                text-align: center;
+                color: rgba(255, 255, 255, 0.9);
+                height: 20px;
+            }
+            
+            QProgressBar::chunk {
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #6366F1,
+                    stop: 1 #8B5CF6
+                );
+                border-radius: 5px;
+            }
+            
+            /* Status Bar */
+            QStatusBar {
+                background: rgba(0, 0, 0, 0.3);
+                color: rgba(255, 255, 255, 0.7);
+                border-top: 1px solid rgba(255, 255, 255, 0.05);
+                font-size: 9pt;
+            }
+            
+            /* Menu Bar */
+            QMenuBar {
+                background: rgba(0, 0, 0, 0.3);
+                color: rgba(255, 255, 255, 0.9);
+                border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+                padding: 4px;
+            }
+            
+            QMenuBar::item {
+                background: transparent;
+                padding: 6px 12px;
+                border-radius: 4px;
+            }
+            
+            QMenuBar::item:selected {
+                background: rgba(255, 255, 255, 0.1);
+            }
+            
+            QMenu {
+                background: rgba(20, 20, 30, 0.95);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            
+            QMenu::item {
+                color: rgba(255, 255, 255, 0.9);
+                padding: 8px 20px;
+                border-radius: 4px;
+            }
+            
+            QMenu::item:selected {
+                background: rgba(99, 102, 241, 0.3);
+            }
+            
+            /* Scrollbars - Sleek modern style */
+            QScrollBar:vertical {
+                background: rgba(255, 255, 255, 0.02);
+                width: 12px;
+                border-radius: 6px;
+            }
+            
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 6px;
+                min-height: 30px;
+            }
+            
+            QScrollBar::handle:vertical:hover {
+                background: rgba(255, 255, 255, 0.15);
+            }
+            
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            
+            QScrollBar:horizontal {
+                background: rgba(255, 255, 255, 0.02);
+                height: 12px;
+                border-radius: 6px;
+            }
+            
+            QScrollBar::handle:horizontal {
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 6px;
+                min-width: 30px;
+            }
+            
+            QScrollBar::handle:horizontal:hover {
+                background: rgba(255, 255, 255, 0.15);
+            }
+            
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+        """)
     
     def closeEvent(self, event):
         """Handle application close."""

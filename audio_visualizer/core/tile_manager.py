@@ -349,6 +349,20 @@ class TileManager:
         
         return stats
     
+    def get_visible_tiles(self, view_type: str, time_range: Tuple[float, float], 
+                          freq_range: Tuple[float, float], zoom_level: float = 1.0) -> List[Tuple]:
+        """Get list of tile IDs that are visible in the given range."""
+        atlas = self.atlases.get(view_type)
+        if not atlas:
+            return []
+        
+        try:
+            # Delegate to the TextureAtlas which has this method
+            return atlas.get_visible_tiles(time_range, freq_range, zoom_level)
+        except Exception as e:
+            logger.error(f"Error getting visible tiles for {view_type}: {e}")
+            return []
+    
     def clear(self, view_type: Optional[str] = None):
         """Clear tiles for a view type or all views."""
         if view_type:
