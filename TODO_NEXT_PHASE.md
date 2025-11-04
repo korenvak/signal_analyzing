@@ -54,12 +54,12 @@
 **Benefit**: 50% fewer allocations, better cache locality  
 **Files**: memory_pools.py, batched_fft_engine.py
 
-#### 2.2 ⏳ Lazy GPU Synchronization with Streams
-**Status**: NEXT UP  
-**Current**: Implicit sync after every operation  
-**Needed**: Batch operations with CUDA streams, single sync point  
+#### 2.2 ✅ Lazy GPU Synchronization with Streams
+**Status**: COMPLETED  
+**Implementation**: Non-blocking CUDA stream batches all GPU ops  
+**Details**: Transfer→FFT→magnitude chain with single sync point  
 **Benefit**: 20-30% throughput improvement, hide GPU latency  
-**Effort**: 5 hours
+**Files**: batched_fft_engine.py
 
 #### 2.3 ⏳ Batch CPU→GPU Transfers
 **Status**: PLANNED  
