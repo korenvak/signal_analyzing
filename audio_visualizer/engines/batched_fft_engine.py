@@ -273,7 +273,10 @@ class BatchedFFTEngine:
                 stft_gpu = plan.execute(gpu_frames)
                 
                 # Compute magnitude using fused kernel (2-3x faster than separate ops!)
-                if self._fused_kernels is not None:
+                # TEMPORARY: Disable fused kernels for debugging
+                use_fused = False  # self._fused_kernels is not None
+                
+                if use_fused:
                     # FUSED: abs + maximum + log10 + multiply in ONE kernel
                     magnitude = self._fused_kernels.magnitude_to_db_fused(stft_gpu, min_val=1e-10, scale=20.0)
                 else:

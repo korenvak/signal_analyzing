@@ -465,13 +465,19 @@ class VisPyCanvas(scene.SceneCanvas):
                 data_min = np.min(display_data)
                 data_max = np.max(display_data)
                 
+                logger.info(f"Data range BEFORE normalization: min={data_min:.1f}, max={data_max:.1f}")
+                
                 if data_max > data_min:  # Avoid division by zero
                     display_data = (display_data - data_min) / (data_max - data_min)
                 else:
                     display_data = np.zeros_like(display_data)
+                    logger.warning("Data has no variation! Setting to zeros")
                 
-                logger.debug(f"Data normalized: {data_min:.1f} to {data_max:.1f}")
-                logger.debug(f"Display shape: {display_data.shape}")
+                # Verify normalization worked
+                norm_min = np.min(display_data)
+                norm_max = np.max(display_data)
+                logger.info(f"Data range AFTER normalization: min={norm_min:.3f}, max={norm_max:.3f}")
+                logger.info(f"Display shape: {display_data.shape}, dtype: {display_data.dtype}")
             else:
                 display_data = data.astype(np.float32)
             
@@ -485,8 +491,10 @@ class VisPyCanvas(scene.SceneCanvas):
                 logger.debug(f"Data pixels: {display_data.shape[1]} x {display_data.shape[0]}")
                 
                 # Set data with proper clim for color mapping
+                logger.info(f"Setting image data: shape={display_data.shape}, min={np.min(display_data):.3f}, max={np.max(display_data):.3f}")
                 self.image_visual.set_data(display_data)
                 self.image_visual.clim = (0, 1)  # Data is normalized to 0-1
+                logger.info(f"Image visual updated successfully, clim={self.image_visual.clim}")
                 
                 # Calculate transform to map pixel coordinates to world coordinates
                 # VisPy Image: pixel (j, i) where j=column (X), i=row (Y)
