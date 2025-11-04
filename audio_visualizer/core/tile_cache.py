@@ -13,6 +13,9 @@ from collections import OrderedDict
 import numpy as np
 import logging
 
+# Import compressed storage
+from .compressed_tile_storage import get_compressed_tile_storage
+
 try:
     import zarr
     HAS_ZARR = True
@@ -64,22 +67,31 @@ class TileKey:
 
 
 class TileCache:
-    """Disk-backed tile cache with LRU eviction and memory mapping."""
+    """Disk-backed tile cache with LRU eviction, memory mapping, and compression."""
     
     def __init__(self, cache_dir: str = None, max_memory_tiles: int = 100,
-                 max_disk_gb: float = 10.0):
+                 max_disk_gb: float = 10.0, enable_compression: bool = True,
+                 compression_level: int = 3):
         """Initialize tile cache.
         
         Args:
             cache_dir: Directory for cache storage (default: ./tile_cache)
             max_memory_tiles: Maximum tiles to keep in RAM
             max_disk_gb: Maximum disk space to use (GB)
+            enable_compression: Enable tile compression (3-4x more capacity)
+            compression_level: Compression level (1=fast, 3=balanced, 9=best)
         """
         # Setup cache directory
         if cache_dir is None:
             cache_dir = Path.cwd() / "tile_cache"
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Compression settings
+        self.enable_compression = enable_compression
+        self.compression_level = compression_level
+        self.compressed_storage = get_compressed_tile_storage(
+            compression_level, enable_compression)
         
         # Cache limits
         self.max_memory_tiles = max_memory_tiles
@@ -99,7 +111,9 @@ class TileCache:
             'disk_hits': 0,
             'misses': 0,
             'writes': 0,
-            'evictions': 0
+            'evictions': 0,
+            'compression_ratio': 1.0,
+            'bytes_saved_mb': 0.0
         }
         
         # Initialize disk index

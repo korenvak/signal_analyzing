@@ -135,137 +135,143 @@ class CepstrogramEngine:
         
         return self._mel_filterbank
     
-    def compute_mfcc_gpu(self, magnitude_spectrum: cp.ndarray, 
-                        frequencies: np.ndarray,
-                        progress_callback: Optional[Callable] = None) -> cp.ndarray:
-        """Compute MFCCs using GPU acceleration with pinned memory transfers."""
+    def compute_real_cepstrum_gpu(self, log_magnitude: cp.ndarray, 
+                                 progress_callback: Optional[Callable] = None) -> cp.ndarray:
+        """Compute real cepstrum using GPU acceleration.
+        
+        Real cepstrum = IFFT(log(|FFT(signal)|))
+        This reveals periodicities in the frequency domain.
+        """
         if not HAS_CUPY:
             raise RuntimeError("CuPy not available for GPU acceleration")
         
         if progress_callback:
-            progress_callback(0.1, "Creating mel filterbank")
+            progress_callback(0.2, "Computing IFFT of log spectrum")
         
-        # Create mel filterbank on CPU then move to GPU using pinned memory
-        mel_filterbank = self._create_mel_filterbank(frequencies, 
-                                                   self.spectrogram_engine.sample_rate)
-        gpu_filterbank = self.memory_optimizer.copy_to_gpu_pinned(mel_filterbank)
-        
-        if progress_callback:
-            progress_callback(0.3, "Applying mel filterbank")
-        
-        # Apply mel filterbank to magnitude spectrum
-        # magnitude_spectrum shape: (freq_bins, time_frames)
-        # filterbank shape: (mel_filters, freq_bins)
-        mel_spectrum = cp.dot(gpu_filterbank, magnitude_spectrum)
-        
-        # Convert to log scale (avoiding log(0))
-        log_mel_spectrum = cp.log(cp.maximum(mel_spectrum, 1e-10))
+        # Compute IFFT of log magnitude spectrum
+        # log_magnitude shape: (freq_bins, time_frames)
+        cepstrum = cp_fft.ifft(log_magnitude, axis=0)
         
         if progress_callback:
-            progress_callback(0.6, "Computing DCT")
+            progress_callback(0.6, "Taking real part and normalizing")
         
-        # Apply DCT to get cepstral coefficients
-        # Using DCT Type-II (most common for MFCC)
-        cepstral_coeffs = cp_fft.dct(log_mel_spectrum, type=2, axis=0, norm='ortho')
+        # Take real part (cepstrum is real-valued)
+        real_cepstrum = cp.real(cepstrum)
         
-        if progress_callback:
-            progress_callback(0.8, "Applying liftering")
-        
-        # Apply liftering (cepstral filtering)
-        if self.lifter_cutoff > 0:
-            lifter = cp.ones(cepstral_coeffs.shape[0])
-            lifter[self.lifter_cutoff:] = 0
-            cepstral_coeffs = cepstral_coeffs * lifter[:, cp.newaxis]
+        # Keep only first half (symmetric property) and limit to meaningful quefrencies
+        # For practical audio analysis, we keep first ~50-100 samples
+        max_quefrency_samples = min(real_cepstrum.shape[0] // 2, 100)
+        real_cepstrum = real_cepstrum[:max_quefrency_samples, :]
         
         if progress_callback:
-            progress_callback(0.9, "Applying cepstral mean normalization")
+            progress_callback(0.8, "Applying windowing")
         
-        # Cepstral mean normalization
+        # Apply liftering (rectangular window to emphasize lower quefrencies)
+        if self.lifter_cutoff > 0 and self.lifter_cutoff < real_cepstrum.shape[0]:
+            lifter = cp.ones(real_cepstrum.shape[0])
+            lifter[self.lifter_cutoff:] = 0.1  # Attenuate rather than zero
+            real_cepstrum = real_cepstrum * lifter[:, cp.newaxis]
+        
+        if progress_callback:
+            progress_callback(0.9, "Final normalization")
+        
+        # Normalize for better visualization
         if self.cepstral_mean_norm:
-            cepstral_mean = cp.mean(cepstral_coeffs, axis=1, keepdims=True)
-            cepstral_coeffs = cepstral_coeffs - cepstral_mean
+            cepstral_mean = cp.mean(real_cepstrum, axis=1, keepdims=True)
+            real_cepstrum = real_cepstrum - cepstral_mean
         
-        if progress_callback:
-            progress_callback(1.0, "Cepstrogram computation complete")
+        # Scale for better dynamic range in visualization
+        real_cepstrum = real_cepstrum * 20.0  # Amplify for visibility
         
-        return cepstral_coeffs
+        return real_cepstrum
     
-    def compute_mfcc_cpu(self, magnitude_spectrum: np.ndarray,
-                        frequencies: np.ndarray,
-                        progress_callback: Optional[Callable] = None) -> np.ndarray:
-        """Compute MFCCs using CPU."""
+    def compute_real_cepstrum_cpu(self, log_magnitude: np.ndarray,
+                                 progress_callback: Optional[Callable] = None) -> np.ndarray:
+        """Compute real cepstrum using CPU.
+        
+        Real cepstrum = IFFT(log(|FFT(signal)|))
+        This reveals periodicities in the frequency domain.
+        """
         if progress_callback:
-            progress_callback(0.1, "Creating mel filterbank")
+            progress_callback(0.2, "Computing IFFT of log spectrum")
         
-        mel_filterbank = self._create_mel_filterbank(frequencies, 
-                                                   self.spectrogram_engine.sample_rate)
-        
-        if progress_callback:
-            progress_callback(0.3, "Applying mel filterbank")
-        
-        # Apply mel filterbank
-        mel_spectrum = np.dot(mel_filterbank, magnitude_spectrum)
-        
-        # Convert to log scale
-        log_mel_spectrum = np.log(np.maximum(mel_spectrum, 1e-10))
+        # Compute IFFT of log magnitude spectrum
+        cepstrum = scipy.fft.ifft(log_magnitude, axis=0)
         
         if progress_callback:
-            progress_callback(0.6, "Computing DCT")
+            progress_callback(0.6, "Taking real part and normalizing")
         
-        # Apply DCT
-        cepstral_coeffs = scipy.fft.dct(log_mel_spectrum, type=2, axis=0, norm='ortho')
+        # Take real part (cepstrum is real-valued)
+        real_cepstrum = np.real(cepstrum)
+        
+        # Keep only first half and limit to meaningful quefrencies
+        max_quefrency_samples = min(real_cepstrum.shape[0] // 2, 100)
+        real_cepstrum = real_cepstrum[:max_quefrency_samples, :]
         
         if progress_callback:
-            progress_callback(0.8, "Applying liftering")
+            progress_callback(0.8, "Applying windowing")
         
         # Apply liftering
-        if self.lifter_cutoff > 0:
-            lifter = np.ones(cepstral_coeffs.shape[0])
-            lifter[self.lifter_cutoff:] = 0
-            cepstral_coeffs = cepstral_coeffs * lifter[:, np.newaxis]
+        if self.lifter_cutoff > 0 and self.lifter_cutoff < real_cepstrum.shape[0]:
+            lifter = np.ones(real_cepstrum.shape[0])
+            lifter[self.lifter_cutoff:] = 0.1  # Attenuate rather than zero
+            real_cepstrum = real_cepstrum * lifter[:, np.newaxis]
         
         if progress_callback:
-            progress_callback(0.9, "Applying cepstral mean normalization")
+            progress_callback(0.9, "Final normalization")
         
-        # Cepstral mean normalization
+        # Normalize for better visualization
         if self.cepstral_mean_norm:
-            cepstral_mean = np.mean(cepstral_coeffs, axis=1, keepdims=True)
-            cepstral_coeffs = cepstral_coeffs - cepstral_mean
+            cepstral_mean = np.mean(real_cepstrum, axis=1, keepdims=True)
+            real_cepstrum = real_cepstrum - cepstral_mean
         
-        if progress_callback:
-            progress_callback(1.0, "Cepstrogram computation complete")
+        # Scale for better dynamic range in visualization
+        real_cepstrum = real_cepstrum * 20.0  # Amplify for visibility
         
-        return cepstral_coeffs
+        return real_cepstrum
     
     def compute_cepstrogram_from_spectrogram(self, magnitude_db: np.ndarray,
                                            frequencies: np.ndarray,
                                            progress_callback: Optional[Callable] = None) -> np.ndarray:
-        """Compute cepstrogram from existing spectrogram data."""
+        """Compute cepstrogram from existing spectrogram data.
         
-        # Convert dB back to linear magnitude
-        magnitude_linear = 10**(magnitude_db / 20)
+        This computes the real cepstrum (IFFT of log spectrum) which shows
+        periodicity in the frequency domain. The result has:
+        - X-axis: Time (same as input spectrogram)
+        - Y-axis: Quefrency (τ) in seconds, representing period detection
+        """
         
         if progress_callback:
-            progress_callback(0.05, "Converting magnitude spectrum")
+            progress_callback(0.1, "Preparing log magnitude spectrum")
         
-        # Compute MFCCs
-        if self.use_gpu and magnitude_linear.size > 50000:
+        # For true cepstrum, work with log magnitude (already in dB)
+        # Convert dB to natural log scale for proper cepstral analysis
+        log_magnitude = magnitude_db * np.log(10) / 20  # Convert dB to natural log
+        
+        if progress_callback:
+            progress_callback(0.3, "Computing real cepstrum")
+        
+        # Compute real cepstrum using IFFT of log spectrum
+        if self.use_gpu and log_magnitude.size > 50000:
             try:
                 # Use pinned memory for 2-3x faster transfer
-                gpu_magnitude = self.memory_optimizer.copy_to_gpu_pinned(magnitude_linear)
-                cepstral_coeffs = self.compute_mfcc_gpu(
-                    gpu_magnitude, frequencies, progress_callback)
+                gpu_log_mag = self.memory_optimizer.copy_to_gpu_pinned(log_magnitude)
+                cepstral_coeffs = self.compute_real_cepstrum_gpu(
+                    gpu_log_mag, progress_callback)
                 
                 # Move result back to CPU
                 cepstral_coeffs = cp.asnumpy(cepstral_coeffs)
                 
             except Exception as e:
                 print(f"GPU cepstral computation failed, falling back to CPU: {e}")
-                cepstral_coeffs = self.compute_mfcc_cpu(
-                    magnitude_linear, frequencies, progress_callback)
+                cepstral_coeffs = self.compute_real_cepstrum_cpu(
+                    log_magnitude, progress_callback)
         else:
-            cepstral_coeffs = self.compute_mfcc_cpu(
-                magnitude_linear, frequencies, progress_callback)
+            cepstral_coeffs = self.compute_real_cepstrum_cpu(
+                log_magnitude, progress_callback)
+        
+        if progress_callback:
+            progress_callback(1.0, "Cepstrogram computation complete")
         
         return cepstral_coeffs
     
@@ -371,10 +377,29 @@ class CepstrogramEngine:
         return task_id
     
     def get_quefrency_range(self) -> Tuple[float, float]:
-        """Get the quefrency range for current parameters."""
-        # Quefrency range depends on mel filters and sample rate
-        max_quefrency = self.mel_filters / self.spectrogram_engine.sample_rate
-        return (0.0, max_quefrency)
+        """Get the quefrency range for current parameters.
+        
+        Quefrency is measured in seconds (time units) representing the 'time' 
+        of periodicity in the frequency domain.
+        """
+        # For true cepstrum, quefrency range is related to fundamental period detection
+        # Max quefrency should correspond to lowest detectable F0 (around 50-80 Hz)
+        min_f0 = 50.0  # Hz - lowest fundamental frequency we care about
+        max_quefrency = 1.0 / min_f0  # seconds - maximum quefrency
+        
+        # For MFCC-style analysis, we limit to first N coefficients
+        # Each coefficient represents a different quefrency 'bin'
+        sample_rate = self.spectrogram_engine.sample_rate
+        fft_size = self.spectrogram_engine.fft_size
+        
+        # Quefrency resolution (time per bin)
+        quefrency_resolution = 1.0 / sample_rate
+        
+        # Practical quefrency range for speech/audio analysis
+        # From 0 to about 20ms (50 Hz fundamental period)
+        max_practical_quefrency = min(max_quefrency, 0.02)  # 20ms max
+        
+        return (0.0, max_practical_quefrency)
     
     def cancel_computation(self, task_id: str) -> bool:
         """Cancel ongoing cepstrogram computation."""

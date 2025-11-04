@@ -26,6 +26,8 @@ from ..core.task_manager import TaskManager
 from ..core.tile_cache import TileCache
 from ..core.tile_manager import TileManager as TileMgr
 from ..core.gpu_memory_manager import get_gpu_memory_manager
+from ..core.file_switch_manager import get_file_switch_manager
+from ..core.smart_cache_invalidation import get_smart_cache_invalidator
 from ..engines.spectrogram_engine import SpectrogramEngine
 from ..engines.cepstrogram_engine import CepstrogramEngine
 from ..engines.fk_engine import FKEngine
@@ -544,12 +546,27 @@ class VisPyCanvas(scene.SceneCanvas):
         else:
             time_unit = "Time (hr)"
         
-        # Format frequency axis label (Y-axis)
-        freq_span = h
-        if freq_span < 1000.0:
-            freq_unit = "Frequency (Hz)"
+        # Format Y-axis label based on view type
+        current_tab = self.tab_widget.currentIndex()
+        tab_names = ['spectrogram', 'cepstrogram', 'fk_transform']
+        view_type = tab_names[current_tab] if 0 <= current_tab < len(tab_names) else 'spectrogram'
+        
+        if view_type == 'cepstrogram':
+            # For cepstrogram: Y-axis is quefrency (τ) in milliseconds or seconds
+            quefrency_span = h
+            if quefrency_span < 0.001:  # Less than 1ms
+                freq_unit = "Quefrency (μs)"
+            elif quefrency_span < 1.0:  # Less than 1 second
+                freq_unit = "Quefrency (ms)"
+            else:
+                freq_unit = "Quefrency (s)"
         else:
-            freq_unit = "Frequency (kHz)"
+            # For spectrogram and F-K: Y-axis is frequency in Hz
+            freq_span = h
+            if freq_span < 1000.0:
+                freq_unit = "Frequency (Hz)"
+            else:
+                freq_unit = "Frequency (kHz)"
         
         # Update AxisWidget labels (need to unfreeze first)
         self.x_axis.unfreeze()
@@ -793,7 +810,19 @@ class VisPyCanvas(scene.SceneCanvas):
                             self.set_crosshair(True, self.mouse_pos)
                             
                             # Update readout text
-                            readout = f"Time: {world_pos[0]:.3f}s, Freq: {world_pos[1]:.0f}Hz"
+                            # Format readout based on current view type
+                            current_tab = self.tab_widget.currentIndex()
+                            tab_names = ['spectrogram', 'cepstrogram', 'fk_transform']
+                            view_type = tab_names[current_tab] if 0 <= current_tab < len(tab_names) else 'spectrogram'
+                            
+                            if view_type == 'cepstrogram':
+                                # For cepstrogram: show time and quefrency
+                                quefrency_ms = world_pos[1] * 1000  # Convert to milliseconds
+                                readout = f"Time: {world_pos[0]:.3f}s, Quefrency: {quefrency_ms:.1f}ms"
+                            else:
+                                # For spectrogram and F-K: show time and frequency
+                                readout = f"Time: {world_pos[0]:.3f}s, Freq: {world_pos[1]:.0f}Hz"
+                            
                             self.update_text_readout(readout, (10, 30))
                 except Exception as e:
                     # Silently handle coordinate transform errors during mouse movement
@@ -980,6 +1009,12 @@ class MainWindow(QMainWindow):
         
         # GPU Memory Management
         self.gpu_memory_manager = get_gpu_memory_manager()
+        
+        # File Switch Manager for optimized cleanup
+        self.file_switch_manager = get_file_switch_manager()
+        
+        # Smart Cache Invalidation
+        self.smart_invalidator = get_smart_cache_invalidator()
         
         # Tile-based caching and rendering
         self.tile_cache = TileCache(max_memory_tiles=100, max_disk_gb=10.0)
@@ -1182,9 +1217,20 @@ class MainWindow(QMainWindow):
             self.load_audio_file(file_path)
     
     def load_audio_file(self, file_path: str):
-        """Load an audio file for analysis."""
+        """Load an audio file for analysis with optimized cleanup."""
         try:
             self.statusBar().showMessage("Loading audio file...")
+            
+            # PERFORMANCE: Aggressive cleanup before loading new file
+            if hasattr(self, 'current_file') and self.current_file is not None:
+                logger.info(f"Switching from {os.path.basename(self.current_file)} to {os.path.basename(file_path)}")
+                self.file_switch_manager.cleanup_for_new_file(
+                    cache_manager=self.cache_manager,
+                    gpu_memory_manager=self.gpu_memory_manager,
+                    memory_pools=getattr(self.spectrogram_engine, 'memory_optimizer', None),
+                    tile_cache=self.tile_cache,
+                    engines=self.engines
+                )
             
             sample_rate, duration = self.audio_loader.load_file(file_path)
             
@@ -1210,23 +1256,45 @@ class MainWindow(QMainWindow):
     
     
     def on_parameters_changed(self, params: dict):
-        """Handle parameter changes."""
+        """Handle parameter changes with smart cache invalidation."""
+        
+        # Get current parameters before updating
+        old_params = {
+            'fft_size': getattr(self.spectrogram_engine, 'fft_size', 2048),
+            'hop_length': getattr(self.spectrogram_engine, 'hop_length', 512),
+            'window': getattr(self.spectrogram_engine, 'window', 'hann'),
+            'sample_rate': getattr(self.spectrogram_engine, 'sample_rate', 44100)
+        }
+        
+        # Update engine parameters
         self.spectrogram_engine.set_parameters(**params)
         
-        # Clear cache for affected views
-        self.cache_manager.clear_view_cache('spectrogram')
-        self.cache_manager.clear_view_cache('cepstrogram')
+        # Get new parameters after updating  
+        new_params = dict(old_params)
+        new_params.update(params)
         
-        # CRITICAL: Clear tile cache when FFT parameters change
-        # This prevents shape mismatches when FFT size changes
-        if 'fft_size' in params or 'hop_length' in params or 'window' in params:
-            logger.info("FFT parameters changed, clearing tile cache")
-            self.tile_cache.clear()  # Clear all tiles
-            # Also clear tiled renderer visuals to force recomputation
-            if hasattr(self.spectrogram_canvas, 'tiled_renderer'):
+        # PERFORMANCE: Smart cache invalidation - only clear what's affected
+        invalidation_actions = self.smart_invalidator.invalidate_affected_caches(
+            old_params=old_params,
+            new_params=new_params,
+            cache_manager=self.cache_manager,
+            tile_cache=self.tile_cache,
+            engines=self.engines
+        )
+        
+        # Clear tiled renderer visuals for affected views
+        for view_type in invalidation_actions.keys():
+            if view_type == 'spectrogram' and hasattr(self.spectrogram_canvas, 'tiled_renderer'):
                 self.spectrogram_canvas.tiled_renderer.clear_tiles()
-            if hasattr(self.cepstrogram_canvas, 'tiled_renderer'):
+            elif view_type == 'cepstrogram' and hasattr(self.cepstrogram_canvas, 'tiled_renderer'):
                 self.cepstrogram_canvas.tiled_renderer.clear_tiles()
+        
+        # Log invalidation summary
+        if invalidation_actions:
+            affected_views = list(invalidation_actions.keys())
+            logger.info(f"Smart invalidation completed: {len(affected_views)} views affected")
+        else:
+            logger.info("No cache invalidation needed - all caches preserved")
         
         self.refresh_current_view()
     
@@ -1522,14 +1590,26 @@ class MainWindow(QMainWindow):
             logger.error(f"Error computing spectrogram tile: {e}")
             return None
     
-    def _compute_cepstrogram_tile_data(self, audio_chunk: np.ndarray, freq_range: tuple) -> np.ndarray:
-        """Compute cepstrogram data for a tile."""
+    def _compute_cepstrogram_tile_data(self, audio_chunk: np.ndarray, quefrency_range: tuple) -> np.ndarray:
+        """Compute cepstrogram data for a tile.
+        
+        Args:
+            audio_chunk: Audio data for this tile
+            quefrency_range: Range of quefrencies (in seconds) - currently ignored but could be used for filtering
+        """
         try:
             # First get spectrogram
             magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_chunk)
             
-            # Then compute cepstrogram
+            logger.debug(f"Computing cepstrogram tile: spectrogram shape={magnitude_db.shape}")
+            
+            # Then compute cepstrogram (real cepstrum)
             cepstral = self.cepstrogram_engine.compute_cepstrogram_from_spectrogram(magnitude_db, frequencies)
+            
+            logger.debug(f"Computed cepstrogram tile: shape={cepstral.shape}")
+            
+            # Ensure proper data type and handle any NaN/Inf values
+            cepstral = np.nan_to_num(cepstral, nan=0.0, posinf=0.0, neginf=0.0)
             
             return cepstral.astype(np.float32)
             
