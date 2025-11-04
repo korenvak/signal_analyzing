@@ -14,6 +14,11 @@ except ImportError:
     cp_signal = None
     HAS_CUPY = False
 
+if HAS_CUPY:
+    CupyArray = cp.ndarray  # type: ignore[attr-defined]
+else:
+    CupyArray = Any
+
 from ..core.cache_manager import CacheManager
 from ..core.task_manager import TaskManager, TaskPriority
 from .batched_fft_engine import get_batched_fft_engine
@@ -78,7 +83,7 @@ class SpectrogramEngine:
             self.cache_manager.clear_view_cache('spectrogram')
     
     def compute_stft_gpu(self, audio_data: np.ndarray, 
-                        progress_callback: Optional[Callable] = None) -> cp.ndarray:
+                        progress_callback: Optional[Callable] = None) -> CupyArray:
         """Compute STFT using GPU acceleration."""
         if not HAS_CUPY:
             raise RuntimeError("CuPy not available for GPU acceleration")
