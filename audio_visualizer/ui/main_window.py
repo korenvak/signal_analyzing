@@ -1075,6 +1075,12 @@ class MainWindow(QMainWindow):
         self.cache_manager.clear_view_cache('spectrogram')
         self.cache_manager.clear_view_cache('cepstrogram')
         
+        # CRITICAL: Clear tile cache when FFT parameters change
+        # This prevents shape mismatches when FFT size changes
+        if 'fft_size' in params or 'hop_length' in params or 'window' in params:
+            logger.info("FFT parameters changed, clearing tile cache")
+            self.tile_cache.clear(view_types=['spectrogram', 'cepstrogram'])
+        
         self.refresh_current_view()
     
     def on_colormap_changed(self, colormap: str):
