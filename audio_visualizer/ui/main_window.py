@@ -1222,7 +1222,11 @@ class MainWindow(QMainWindow):
         if 'fft_size' in params or 'hop_length' in params or 'window' in params:
             logger.info("FFT parameters changed, clearing tile cache")
             self.tile_cache.clear()  # Clear all tiles
-            self.cache_manager.clear_all()  # Also clear memory cache
+            # Also clear tiled renderer visuals to force recomputation
+            if hasattr(self.spectrogram_canvas, 'tiled_renderer'):
+                self.spectrogram_canvas.tiled_renderer.clear_tiles()
+            if hasattr(self.cepstrogram_canvas, 'tiled_renderer'):
+                self.cepstrogram_canvas.tiled_renderer.clear_tiles()
         
         self.refresh_current_view()
     
