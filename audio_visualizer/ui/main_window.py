@@ -177,7 +177,7 @@ class VisPyCanvas(scene.SceneCanvas):
         shift_pressed = any('shift' in s for s in mod_strings)
         ctrl_pressed = any('ctrl' in s or 'control' in s for s in mod_strings)
         
-        logger.info(f"Mouse wheel: delta={event.delta}, mods={mod_strings}, shift={shift_pressed}, ctrl={ctrl_pressed}")
+        # logger.debug(f"Mouse wheel: delta={event.delta}, mods={mod_strings}, shift={shift_pressed}, ctrl={ctrl_pressed}")
         
         # Ultra sensitive zoom factor for instant navigation
         zoom_base = 2.5  # Extremely high sensitivity for fastest zoom response
@@ -1439,11 +1439,32 @@ class MainWindow(QMainWindow):
                 logger.warning("No tile data available for rendering")
                 return False
             
-            # Stitch tiles horizontally (time axis)
-            # Each tile already covers the full frequency spectrum
-            stitched_data = np.concatenate(tile_data_list, axis=1)
+            # Check if stitched size would exceed OpenGL limits
+            total_width = sum(tile.shape[1] for tile in tile_data_list)
+            max_texture_size = 16384  # OpenGL limit
             
-            logger.info(f"Stitched {len(tile_data_list)} tiles into shape {stitched_data.shape}")
+            if total_width > max_texture_size:
+                # Instead of stitching, downsample each tile proportionally
+                # Calculate required downsampling factor
+                downsample_factor = int(np.ceil(total_width / max_texture_size))
+                logger.info(f"Total width ({total_width}) exceeds limit, downsampling each tile by {downsample_factor}x")
+                
+                downsampled_tiles = []
+                for tile in tile_data_list:
+                    if tile.shape[1] > downsample_factor:
+                        # Downsample this tile
+                        downsampled = tile[:, ::downsample_factor]
+                        downsampled_tiles.append(downsampled)
+                    else:
+                        downsampled_tiles.append(tile)
+                
+                # Now stitch the downsampled tiles
+                stitched_data = np.concatenate(downsampled_tiles, axis=1)
+                logger.info(f"Downsampled and stitched {len(tile_data_list)} tiles into shape {stitched_data.shape}")
+            else:
+                # Stitch tiles horizontally (time axis) - no downsampling needed
+                stitched_data = np.concatenate(tile_data_list, axis=1)
+                logger.info(f"Stitched {len(tile_data_list)} tiles into shape {stitched_data.shape} (no downsampling)")
             
             # Update the display with stitched data
             if view_type == 'spectrogram':
