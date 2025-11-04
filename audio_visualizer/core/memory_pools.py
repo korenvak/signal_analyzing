@@ -100,7 +100,13 @@ class WorkspacePool:
             self.stats['total_bytes'] = 0
             
             if self.use_gpu and HAS_CUPY:
-                cp.get_default_memory_pool().free_all_blocks()
+                try:
+                    # Only free GPU memory if CUDA device is available
+                    cp.cuda.Device().compute_capability  # Check if GPU is accessible
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    # GPU not available or accessible, skip cleanup
+                    pass
         
         logger.info("WorkspacePool cleared")
     
