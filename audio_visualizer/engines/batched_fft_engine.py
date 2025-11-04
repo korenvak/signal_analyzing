@@ -273,8 +273,7 @@ class BatchedFFTEngine:
                 stft_gpu = plan.execute(gpu_frames)
                 
                 # Compute magnitude using fused kernel (2-3x faster than separate ops!)
-                # TEMPORARY: Disable fused kernels for debugging
-                use_fused = False  # self._fused_kernels is not None
+                use_fused = self._fused_kernels is not None
                 
                 if use_fused:
                     # FUSED: abs + maximum + log10 + multiply in ONE kernel

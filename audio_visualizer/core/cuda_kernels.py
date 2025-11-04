@@ -130,6 +130,10 @@ class FusedCUDAKernels:
             magnitude = cp.maximum(magnitude, min_val)
             return scale * cp.log10(magnitude)
         
+        # Ensure input is complex64
+        if stft_result.dtype != cp.complex64:
+            stft_result = stft_result.astype(cp.complex64)
+        
         # Prepare output
         output = cp.empty(stft_result.shape, dtype=cp.float32)
         
@@ -138,9 +142,10 @@ class FusedCUDAKernels:
         threads_per_block = 256
         blocks = (n + threads_per_block - 1) // threads_per_block
         
+        # Pass arrays as kernel arguments (CuPy handles pointer extraction)
         self._magnitude_db_kernel(
             (blocks,), (threads_per_block,),
-            (stft_result, output, n, min_val, scale)
+            (stft_result, output, cp.int32(n), cp.float32(min_val), cp.float32(scale))
         )
         
         return output
