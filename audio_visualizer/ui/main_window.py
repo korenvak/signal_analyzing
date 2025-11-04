@@ -1312,7 +1312,7 @@ class MainWindow(QMainWindow):
                 tile_freq_range = tile_info['freq_range']
                 
                 # Check if tile already exists in cache
-                cached_tile = self.tile_cache.get_tile(
+                cached_tile = self.tile_cache.get(
                     view_type, tile_time_range, tile_freq_range, resolution_level=0
                 )
                 
@@ -1354,8 +1354,8 @@ class MainWindow(QMainWindow):
                     continue
                 
                 # Cache the computed tile
-                self.tile_cache.store_tile(
-                    view_type, tile_time_range, tile_freq_range, tile_data
+                self.tile_cache.put(
+                    view_type, tile_time_range, tile_freq_range, tile_data, resolution_level=0
                 )
                 
                 computed_tiles.append(tile_data)
@@ -1415,7 +1415,7 @@ class MainWindow(QMainWindow):
             tile_data_list = []
             for tile_info in tiles:
                 # Get tile from cache
-                tile_data = self.tile_cache.get_tile(
+                tile_data = self.tile_cache.get(
                     view_type,
                     tile_info.get('time_range', time_range),
                     tile_info.get('freq_range', freq_range),
