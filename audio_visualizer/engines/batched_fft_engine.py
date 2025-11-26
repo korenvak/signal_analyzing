@@ -217,7 +217,8 @@ class BatchedFFTEngine:
         
         Args:
             size: Window size
-            window_type: Window type ('hann', 'hamming', 'blackman', etc.)
+            window_type: Window type ('hann', 'hamming', 'blackman', 'blackmanharris',
+                         'kaiser', 'flattop', 'rectangular', etc.)
             
         Returns:
             Window array (float32)
@@ -225,14 +226,35 @@ class BatchedFFTEngine:
         key = (size, window_type)
         if key not in self._window_cache:
             # Create window (always float32)
+            import scipy.signal as sig
+            
             if window_type == 'hann':
                 window = np.hanning(size).astype(np.float32)
             elif window_type == 'hamming':
                 window = np.hamming(size).astype(np.float32)
             elif window_type == 'blackman':
                 window = np.blackman(size).astype(np.float32)
-            else:
+            elif window_type == 'blackmanharris':
+                # Blackman-Harris: excellent side-lobe suppression (-92 dB)
+                window = sig.windows.blackmanharris(size).astype(np.float32)
+            elif window_type == 'kaiser':
+                # Kaiser with beta=9 for good frequency analysis
+                window = np.kaiser(size, beta=9.0).astype(np.float32)
+            elif window_type == 'flattop':
+                # Flat-top window for accurate amplitude measurements
+                window = sig.windows.flattop(size).astype(np.float32)
+            elif window_type == 'rectangular' or window_type == 'boxcar':
+                # No window (rectangular) - best time resolution, worst spectral leakage
                 window = np.ones(size, dtype=np.float32)
+            elif window_type == 'bartlett':
+                window = np.bartlett(size).astype(np.float32)
+            elif window_type == 'tukey':
+                # Tukey (tapered cosine) window
+                window = sig.windows.tukey(size, alpha=0.5).astype(np.float32)
+            else:
+                # Default to Hann if unknown
+                logger.warning(f"Unknown window type '{window_type}', using 'hann'")
+                window = np.hanning(size).astype(np.float32)
             
             self._window_cache[key] = window
             logger.debug(f"Cached window: {window_type}({size})")

@@ -27,10 +27,10 @@ class SpectrogramEngine:
         self.cache_manager = cache_manager
         self.task_manager = task_manager
         
-        # Default parameters
-        self.fft_size = 2048
-        self.hop_length = 512
-        self.window_type = 'hann'
+        # Default parameters - optimized for quality
+        self.fft_size = 4096
+        self.hop_length = 512  # 87.5% overlap with 4096 FFT
+        self.window_type = 'blackman'
         self.sample_rate = 44100
         
         # Tile parameters

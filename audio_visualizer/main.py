@@ -10,9 +10,14 @@ import argparse
 import logging
 from pathlib import Path
 
-# Add the project root to Python path
-project_root = Path(__file__).parent
-sys.path.insert(0, str(project_root))
+# Ensure both the project root and package directory are on sys.path
+module_dir = Path(__file__).resolve().parent
+project_root = module_dir.parent
+
+for path in (project_root, module_dir):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 # Configure logging
 logging.basicConfig(

@@ -10,6 +10,7 @@ import logging
 
 from .tile_cache import TileCache
 from .mipmap_pyramid import MipmapPyramid
+from .progressive_tile_loader import ProgressiveTileLoader, get_progressive_tile_loader
 from ..rendering.texture_atlas import TextureAtlas
 
 logger = logging.getLogger(__name__)
@@ -56,26 +57,35 @@ class TileManager:
         # Multi-resolution mipmap pyramid
         self.mipmap_pyramid = MipmapPyramid(tile_cache, max_levels=6)
         
-        # Texture atlases per view type
-        self.atlases = {
-            'spectrogram': TextureAtlas(atlas_size=4096, tile_size=(2048, 256)),
-            'cepstrogram': TextureAtlas(atlas_size=4096, tile_size=(2048, 256)),
-            'fk_transform': TextureAtlas(atlas_size=4096, tile_size=(512, 512))
+        # Texture atlases per view type (configured dynamically)
+        atlas_configs = {
+            'spectrogram': (4096, (2048, 256)),
+            'cepstrogram': (4096, (2048, 256)),
+            'fk_transform': (4096, (512, 512))
         }
+        self.atlases = {}
+        for view_type in engines.keys():
+            atlas_size, tile_size = atlas_configs.get(view_type, (4096, (2048, 256)))
+            self.atlases[view_type] = TextureAtlas(atlas_size=atlas_size, tile_size=tile_size)
         
-        # Request management
+        # Progressive tile loader for background computation and LOD
+        self.progressive_loader = get_progressive_tile_loader(tile_cache, engines)
+        if self.progressive_loader is None:
+            self.progressive_loader = ProgressiveTileLoader(tile_cache, engines, max_workers=3)
+            self.progressive_loader.start()
+        
+        # Request management (legacy - now handled by progressive loader)
         self.pending_requests: List[TileRequest] = []
         self.active_requests: Dict[Tuple, TileRequest] = {}
         self.request_lock = threading.RLock()
         
         # Current visible region
-        self.visible_region = {
-            'spectrogram': {'time': (0, 10), 'freq': (0, 22050), 'zoom': 1.0},
-            'cepstrogram': {'time': (0, 10), 'freq': (0, 4000), 'zoom': 1.0},
-            'fk_transform': {'time': (0, 10), 'freq': (0, 22050), 'zoom': 1.0}
-        }
+        self.visible_region = {}
+        for view_type in self.atlases.keys():
+            freq_max = 22050 if view_type != 'cepstrogram' else 4000
+            self.visible_region[view_type] = {'time': (0, 10), 'freq': (0, freq_max), 'zoom': 1.0}
         
-        logger.info("TileManager initialized with atlases for 3 view types")
+        logger.info(f"TileManager initialized with progressive loader and atlases for {len(self.atlases)} view(s)")
     
     def update_visible_region(self, view_type: str, time_range: Tuple[float, float],
                               freq_range: Tuple[float, float], zoom_level: float = 1.0):
@@ -102,14 +112,49 @@ class TileManager:
             logger.error(f"No atlas for view type: {view_type}")
             return
         
-        # Calculate which tiles should be visible
-        visible_tiles = atlas.get_visible_tiles(time_range, freq_range, zoom_level)
+        logger.debug(f"Visible region updated for {view_type}: time={time_range}, freq={freq_range}, zoom={zoom_level}")
         
-        logger.debug(f"Visible region updated: {len(visible_tiles)} tiles needed for {view_type}")
+        # Use progressive loader for viewport-based tile requests
+        tile_requests = self.progressive_loader.request_tiles_for_viewport(
+            view_type=view_type,
+            time_range=time_range,
+            freq_range=freq_range,
+            zoom_level=zoom_level,
+            callback=lambda request, data, error: self._on_progressive_tile_ready(request, data, error)
+        )
         
-        # Request visible tiles
-        for tile_id in visible_tiles:
-            self._request_tile(view_type, tile_id, priority=5)
+        logger.debug(f"Submitted {len(tile_requests)} progressive tile requests for {view_type}")
+    
+    def _on_progressive_tile_ready(self, request, data: Optional[np.ndarray], error: Optional[str]):
+        """Callback when a progressive tile is ready."""
+        if error:
+            logger.error(f"Progressive tile error: {error}")
+            return
+        
+        if data is None:
+            logger.warning("Progressive tile returned None data")
+            return
+        
+        # Get tile ID from request
+        view_type = request.view_type
+        atlas = self.atlases.get(view_type)
+        if not atlas:
+            logger.error(f"No atlas for view type: {view_type}")
+            return
+        
+        # Convert time/freq range to tile ID
+        tile_id = atlas.get_tile_id(
+            request.time_range[0] + (request.time_range[1] - request.time_range[0]) / 2,
+            request.freq_range[0] + (request.freq_range[1] - request.freq_range[0]) / 2,
+            request.resolution_level
+        )
+        
+        # Load into atlas
+        success = atlas.load_tile(tile_id, data)
+        if success:
+            logger.debug(f"Progressive tile loaded into atlas: {view_type} {tile_id}")
+        else:
+            logger.warning(f"Failed to load progressive tile into atlas: {view_type} {tile_id}")
     
     def _request_tile(self, view_type: str, tile_id: Tuple, priority: int = 5):
         """Request a tile to be loaded.
@@ -241,12 +286,6 @@ class TileManager:
                 if request.view_type == 'spectrogram':
                     data = self._compute_spectrogram_tile(
                         engine, audio_data, request.time_range, request.freq_range)
-                elif request.view_type == 'cepstrogram':
-                    data = self._compute_cepstrogram_tile(
-                        engine, audio_data, request.time_range, request.freq_range)
-                elif request.view_type == 'fk_transform':
-                    data = self._compute_fk_tile(
-                        engine, audio_data, request.time_range, request.freq_range)
                 else:
                     logger.error(f"Unknown view type: {request.view_type}")
                     continue
@@ -341,8 +380,13 @@ class TileManager:
             'pending_requests': len(self.pending_requests),
             'active_requests': len(self.active_requests),
             'cache_stats': self.tile_cache.get_stats(),
+            'progressive_loader': {},
             'atlases': {}
         }
+        
+        # Get progressive loader stats
+        if hasattr(self, 'progressive_loader') and self.progressive_loader:
+            stats['progressive_loader'] = self.progressive_loader.get_statistics()
         
         for view_type, atlas in self.atlases.items():
             stats['atlases'][view_type] = atlas.get_stats()
@@ -375,4 +419,12 @@ class TileManager:
             self.tile_cache.clear()
         
         logger.info(f"Cleared tiles: {view_type or 'all'}")
+    
+    def shutdown(self):
+        """Shutdown the tile manager and all workers."""
+        if hasattr(self, 'progressive_loader') and self.progressive_loader:
+            self.progressive_loader.stop()
+            self.progressive_loader = None
+        
+        logger.info("TileManager shutdown complete")
 

@@ -212,8 +212,8 @@ class LRUCache:
                 try:
                     if os.path.exists(filepath):
                         os.remove(filepath)
-                except:
-                    pass
+                except OSError:
+                    pass  # Ignore file removal errors during cleanup
             self._disk_arrays.clear()
             
             gc.collect()
@@ -226,8 +226,8 @@ class LRUCache:
         try:
             if os.path.exists(self._temp_dir):
                 os.rmdir(self._temp_dir)
-        except:
-            pass
+        except OSError:
+            pass  # Ignore directory removal errors during cleanup
 
 class CacheManager:
     """High-level cache manager for multiple view types."""

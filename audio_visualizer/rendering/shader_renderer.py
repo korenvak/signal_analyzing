@@ -102,19 +102,28 @@ class ShaderRenderer:
             # Create shader program
             self.program = Program(vertex_shader, COLORMAP_FRAGMENT_SHADER)
             
-            # Create quad vertices
-            vertices = np.array([
-                [-1, -1, 0, 0],  # bottom-left
-                [ 1, -1, 1, 0],  # bottom-right
-                [-1,  1, 0, 1],  # top-left
-                [ 1,  1, 1, 1],  # top-right
+            # Create quad vertices - separate buffers for each attribute
+            positions = np.array([
+                [-1, -1],  # bottom-left
+                [ 1, -1],  # bottom-right
+                [-1,  1],  # top-left
+                [ 1,  1],  # top-right
             ], dtype=np.float32)
             
-            self.vertices = gloo.VertexBuffer(vertices)
+            texcoords = np.array([
+                [0, 0],  # bottom-left
+                [1, 0],  # bottom-right
+                [0, 1],  # top-left
+                [1, 1],  # top-right
+            ], dtype=np.float32)
+            
+            # Create vertex buffers
+            self.pos_buffer = gloo.VertexBuffer(positions)
+            self.tex_buffer = gloo.VertexBuffer(texcoords)
             
             # Set vertex attributes
-            self.program['a_position'] = self.vertices[:, :2]
-            self.program['a_texcoord'] = self.vertices[:, 2:]
+            self.program['a_position'] = self.pos_buffer
+            self.program['a_texcoord'] = self.tex_buffer
             
             # Initialize uniforms
             self._update_all_uniforms()

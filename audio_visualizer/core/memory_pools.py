@@ -227,16 +227,22 @@ class MemoryOptimizer:
         if not cpu_array.flags['C_CONTIGUOUS']:
             cpu_array = np.ascontiguousarray(cpu_array)
         
-        # Allocate pinned memory and copy data
-        pinned_mem = cp.cuda.alloc_pinned_memory(cpu_array.nbytes)
-        pinned_array = np.frombuffer(pinned_mem, dtype=cpu_array.dtype, count=cpu_array.size)
-        pinned_array = pinned_array.reshape(cpu_array.shape)
-        np.copyto(pinned_array, cpu_array)
-        
-        # Transfer from pinned memory (2-3x faster than regular memory)
-        gpu_array = cp.asarray(pinned_array)
-        
-        return gpu_array
+        try:
+            # Allocate pinned memory and copy data
+            pinned_mem = cp.cuda.alloc_pinned_memory(cpu_array.nbytes)
+            pinned_array = np.frombuffer(pinned_mem, dtype=cpu_array.dtype, count=cpu_array.size)
+            pinned_array = pinned_array.reshape(cpu_array.shape)
+            np.copyto(pinned_array, cpu_array)
+            
+            # Transfer from pinned memory (2-3x faster than regular memory)
+            gpu_array = cp.asarray(pinned_array)
+            
+            return gpu_array
+            
+        except Exception as e:
+            # Fallback to regular memory transfer if pinned memory fails
+            logger.debug(f"Pinned memory transfer failed, using regular: {e}")
+            return cp.asarray(cpu_array)
     
     def copy_to_cpu_zerocopy(self, gpu_array) -> np.ndarray:
         """Copy to CPU using zero-copy when possible.

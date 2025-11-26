@@ -1,23 +1,22 @@
+﻿"""
+Main application window for the audio visualizer.
+"""
 import sys
 import os
 import logging
-from typing import Optional, Dict, Any
 import numpy as np
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
-                              QWidget, QTabWidget, QMenuBar, QStatusBar, QToolBar,
-                              QSlider, QLabel, QComboBox, QPushButton, QProgressBar,
-                              QFileDialog, QMessageBox, QSplitter, QFrame)
-from PySide6.QtCore import Qt, QTimer, Signal, QThread
+                              QWidget, QToolBar, QLabel, QPushButton, QFileDialog, 
+                              QMessageBox, QSplitter, QFrame, QSizePolicy)
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 
 try:
-    import vispy
-    from vispy import scene, app
-    from vispy.scene import visuals
+    from vispy import scene
     HAS_VISPY = True
 except ImportError:
-    vispy = None
     HAS_VISPY = False
 
 from ..core.data_loader import ChunkedAudioLoader
@@ -28,1003 +27,29 @@ from ..core.tile_manager import TileManager as TileMgr
 from ..core.gpu_memory_manager import get_gpu_memory_manager
 from ..core.file_switch_manager import get_file_switch_manager
 from ..core.smart_cache_invalidation import get_smart_cache_invalidator
+from ..core.adaptive_spectrogram import (
+    get_adaptive_spectrogram_manager, ViewRegion, FFTParameters
+)
 from ..engines.spectrogram_engine import SpectrogramEngine
-from ..engines.cepstrogram_engine import CepstrogramEngine
-from ..engines.fk_engine import FKEngine
-from ..rendering.render_manager import RenderManager
-from ..rendering.texture_atlas import TextureAtlas
+from ..rendering.texture_atlas import AtlasRenderer
 from ..rendering.shader_renderer import get_shader_renderer
+
+# Import UI components from separate modules
+from .vispy_canvas import VisPyCanvas
+from .controls_widget import ControlsWidget
+from .status_widget import StatusWidget
+from .multi_file_manager import PlaylistWidget
 
 logger = logging.getLogger(__name__)
 
 
-class TiledImageRenderer:
-    """Manages multiple VisPy Image visuals for tile-based rendering without downsampling."""
-    
-    def __init__(self, parent_view):
-        """
-        Initialize tiled renderer.
-        
-        Args:
-            parent_view: The VisPy ViewBox to render tiles into
-        """
-        self.view = parent_view
-        self.tiles = []  # List of {'visual': Image, 'bounds': (t0, t1, f0, f1), 'data_shape': (h, w)}
-        self.enabled = False
-        
-    def clear_tiles(self):
-        """Remove all tile visuals from the scene."""
-        for tile_info in self.tiles:
-            if tile_info['visual'].parent:
-                tile_info['visual'].parent = None  # Remove from scene graph
-        self.tiles.clear()
-        logger.debug("Cleared all tile visuals")
-    
-    def render_tiles(self, tile_data_list: list, time_range: tuple, freq_range: tuple, 
-                     tile_time_duration: float) -> bool:
-        """
-        Render multiple tiles as separate Image visuals positioned in the scene.
-        
-        Args:
-            tile_data_list: List of numpy arrays, each representing a tile
-            time_range: (start, end) time range in seconds
-            freq_range: (start, end) frequency range in Hz
-            tile_time_duration: Duration of each tile in seconds
-            
-        Returns:
-            True if successful
-        """
-        try:
-            self.clear_tiles()
-            
-            if not tile_data_list:
-                logger.warning("No tiles to render")
-                return False
-            
-            time_start, time_end = time_range
-            freq_start, freq_end = freq_range
-            
-            logger.info(f"Rendering {len(tile_data_list)} tiles as separate visuals (zero downsampling)")
-            
-            # Calculate global min/max across ALL tiles for consistent normalization
-            global_min = min(tile.min() for tile in tile_data_list if tile is not None and tile.size > 0)
-            global_max = max(tile.max() for tile in tile_data_list if tile is not None and tile.size > 0)
-            logger.debug(f"Global normalization range: [{global_min:.2f}, {global_max:.2f}]")
-            
-            current_time = time_start
-            for i, tile_data in enumerate(tile_data_list):
-                if tile_data is None or tile_data.size == 0:
-                    logger.warning(f"Skipping empty tile {i}")
-                    continue
-                
-                # Calculate this tile's time bounds
-                tile_time_end = min(current_time + tile_time_duration, time_end)
-                tile_time_width = tile_time_end - current_time
-                
-                # Normalize tile data using GLOBAL min/max for consistent colors across tiles
-                if global_max > global_min:
-                    display_data = (tile_data - global_min) / (global_max - global_min)
-                else:
-                    display_data = np.zeros_like(tile_data)
-                
-                display_data = display_data.astype(np.float32)
-                
-                # Create Image visual for this tile
-                tile_visual = scene.visuals.Image(
-                    display_data,
-                    parent=self.view.scene,
-                    interpolation='nearest',
-                    cmap='viridis'
-                )
-                tile_visual.clim = (0, 1)
-                
-                # Calculate transform to position tile correctly
-                # tile_data shape: (freq_bins, time_frames)
-                freq_height = freq_end - freq_start
-                
-                x_scale = tile_time_width / tile_data.shape[1]  # seconds per pixel
-                y_scale = freq_height / tile_data.shape[0]      # Hz per pixel
-                
-                transform = scene.STTransform(
-                    scale=(x_scale, y_scale),
-                    translate=(current_time, freq_start)
-                )
-                tile_visual.transform = transform
-                
-                # Store tile info for later management
-                self.tiles.append({
-                    'visual': tile_visual,
-                    'bounds': (current_time, tile_time_end, freq_start, freq_end),
-                    'data_shape': tile_data.shape
-                })
-                
-                logger.debug(f"Tile {i}: shape={tile_data.shape}, time=[{current_time:.1f}, {tile_time_end:.1f}], "
-                           f"transform=scale({x_scale:.6f}, {y_scale:.2f}), translate({current_time:.1f}, {freq_start:.1f})")
-                
-                current_time = tile_time_end
-            
-            self.enabled = True
-            logger.info(f"Successfully rendered {len(self.tiles)} tiles at full resolution")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error rendering tiles: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def cull_tiles(self, viewport_time: tuple, viewport_freq: tuple):
-        """
-        Show/hide tiles based on viewport visibility.
-        
-        Args:
-            viewport_time: (start, end) visible time range
-            viewport_freq: (start, end) visible frequency range
-        """
-        if not self.enabled:
-            return
-        
-        for tile_info in self.tiles:
-            t0, t1, f0, f1 = tile_info['bounds']
-            vt0, vt1 = viewport_time
-            vf0, vf1 = viewport_freq
-            
-            # Check if tile overlaps with viewport
-            time_overlap = not (t1 < vt0 or t0 > vt1)
-            freq_overlap = not (f1 < vf0 or f0 > vf1)
-            
-            # Set visibility
-            tile_info['visual'].visible = time_overlap and freq_overlap
+# TiledImageRenderer, VisPyCanvas, StatusWidget, ControlsWidget
+# have been moved to separate modules:
+# - vispy_canvas.py
+# - status_widget.py  
+# - controls_widget.py
 
 
-class VisPyCanvas(scene.SceneCanvas):
-    """Custom VisPy canvas for audio visualization with proper axes."""
-    
-    def __init__(self, view_type: str, parent=None):
-        if not HAS_VISPY:
-            raise RuntimeError("VisPy not available")
-        
-        super().__init__(keys='interactive', parent=parent, size=(800, 600))
-        
-        self.unfreeze()
-        self.view_type = view_type
-        
-        # Minimal grid layout to get axes at window borders - NO MARGINS!
-        self.grid = self.central_widget.add_grid(margin=0)
-        self.grid.spacing = 0
-        
-        # Create minimal axis widgets with proper tick configuration
-        self.y_axis = scene.AxisWidget(orientation='left', axis_label='Frequency (Hz)', 
-                                     axis_font_size=6, axis_label_margin=30,
-                                     tick_label_margin=5)
-        self.y_axis.width_max = 60  # Wider to accommodate labels properly
-        self.y_axis.width_min = 55
-        
-        self.x_axis = scene.AxisWidget(orientation='bottom', axis_label='Time (s)',
-                                     axis_font_size=6, axis_label_margin=20,
-                                     tick_label_margin=5) 
-        self.x_axis.height_max = 40  # Taller for proper label spacing
-        self.x_axis.height_min = 35
-        
-        # Create ViewBox for the main plot area - NO PADDING!
-        self.view = scene.ViewBox(camera='panzoom', parent=None)
-        
-        # Simple 2x2 grid layout like the working example:
-        # [ y_axis ] [ plot_area ]
-        # [ empty  ] [ x_axis   ]
-        self.grid.add_widget(self.y_axis, row=0, col=0)
-        self.grid.add_widget(self.view, row=0, col=1)  
-        self.grid.add_widget(self.x_axis, row=1, col=1)
-        
-        # Link axes to the ViewBox so they update together
-        self.y_axis.link_view(self.view)
-        self.x_axis.link_view(self.view)
-        
-        # Configure axis ticks for proper label spacing and alignment
-        # Reduce number of ticks to prevent overlap
-        self.y_axis.axis.tick_font_size = 6
-        self.x_axis.axis.tick_font_size = 6
-        
-        # Set reasonable tick density (fewer ticks = less overlap)
-        try:
-            # These help control tick density in VisPy
-            self.y_axis.axis.tick_label_format = '%.0f'  # No decimals for frequency
-            self.x_axis.axis.tick_label_format = '%.1f'  # One decimal for time
-        except AttributeError:
-            pass  # Some VisPy versions may not support this
-        
-        # Configure camera for custom zoom control
-        self.view.camera.aspect = None  # Allows independent zoom on X and Y axes
-        self.view.camera.rect = (-1, -1, 2, 2)  # Initial range: x=(-1,1), y=(-1,1)
-        
-        # Disable interactive controls to prevent conflicts with our custom zoom
-        self.view.camera.interactive = False
-        
-        # Set proper axis orientation for spectrograms
-        # (False, False, False) = no flipping, frequency increases upward naturally
-        self.view.camera.flip = (False, False, False)
-        
-        # Set zoom limits to prevent zooming too far out or in
-        self.view.camera.zoom_factor = 2.0  # Ultra sensitive zoom for instant navigation
-        
-        # Store data bounds for camera constraints
-        self.data_bounds = None  # Will be set when data is loaded
-        
-        # Image visual for spectrogram data in the ViewBox (for single-image mode)
-        self.image_visual = scene.visuals.Image(parent=self.view.scene, interpolation='nearest')
-        
-        # Tiled image renderer for multi-tile mode (eliminates downsampling)
-        self.tiled_renderer = TiledImageRenderer(self.view)
-        
-        # Initialize mouse tracking and crosshair variables
-        self.mouse_pos = (0, 0)
-        self.crosshair_enabled = False
-        
-        # Create crosshair visuals (but keep them invisible initially)
-        self.crosshair_v = scene.visuals.Line(color=(0.5, 0.3, 0.9, 0.8), width=1.5, parent=self.view.scene)
-        self.crosshair_h = scene.visuals.Line(color=(0.5, 0.3, 0.9, 0.8), width=1.5, parent=self.view.scene)
-        self.crosshair_v.visible = False
-        self.crosshair_h.visible = False
-        
-        # Create text visual for readouts
-        self.text_visual = scene.visuals.Text('', color='white', font_size=11, 
-                                            pos=(10, 30), parent=self.view.scene)
-        
-        # OpenGL texture size limit
-        self.max_texture_size = 16384
-        
-        # Mouse navigation state
-        self.is_panning = False
-        self.last_mouse_pos = None
-        self.pan_speed = 1.0  # Pan speed factor (matching PyQtGraph)
-        
-        # Connect events for independent axis zoom and mouse tracking
-        self.view.events.mouse_wheel.connect(self.on_mouse_wheel)
-        self.events.key_press.connect(self.on_key_press)
-        self.events.mouse_move.connect(self.on_mouse_move)
-        self.events.mouse_press.connect(self.on_mouse_press)
-        self.events.mouse_release.connect(self.on_mouse_release)
-        
-        # Timer for camera constraints (disabled to prevent interference with zoom)
-        # self.update_timer = app.Timer(interval=0.1, connect=self.on_timer, start=True)
-        
-        self.freeze()
-    
-    def on_timer(self, event):
-        """Timer callback to update camera constraints - DISABLED."""
-        # Disabled to prevent interference with zoom
-        # self.constrain_camera_to_bounds()
-        # self.update_axis_labels()
-    
-    def on_mouse_wheel(self, event):
-        """Handle mouse wheel for axis-specific zoom - ALWAYS handle to prevent crashes.
-        
-        - Shift + Wheel: Zoom time axis (X) only  
-        - Ctrl + Wheel: Zoom frequency axis (Y) only
-        - Wheel alone: Zoom both axes
-        """
-        # ALWAYS handle the event to prevent VisPy's problematic default zoom
-        event.handled = True
-        
-        # Get modifier state with more robust detection
-        modifiers = []
-        try:
-            # Try multiple ways to get modifiers
-            if hasattr(event, 'modifiers') and event.modifiers:
-                modifiers = event.modifiers
-            elif hasattr(event, 'mouse_event') and hasattr(event.mouse_event, 'modifiers'):
-                modifiers = event.mouse_event.modifiers or []
-        except AttributeError:
-            modifiers = []
-        
-        # Convert modifiers to strings for easier detection
-        mod_strings = [str(mod).lower() for mod in modifiers]
-        shift_pressed = any('shift' in s for s in mod_strings)
-        ctrl_pressed = any('ctrl' in s or 'control' in s for s in mod_strings)
-        
-        # logger.debug(f"Mouse wheel: delta={event.delta}, mods={mod_strings}, shift={shift_pressed}, ctrl={ctrl_pressed}")
-        
-        # Ultra sensitive zoom factor for instant navigation
-        zoom_base = 2.5  # Extremely high sensitivity for fastest zoom response
-        factor = zoom_base ** (event.delta[1] / 120.0)
-        
-        # Determine zoom behavior
-        if shift_pressed:
-            # X-axis only (time) - more sensitive
-            scale_factors = [factor, 1.0]
-            logger.info(f"TIME axis zoom: factor={factor:.3f}")
-        elif ctrl_pressed:
-            # Y-axis only (frequency)
-            scale_factors = [1.0, factor]
-            logger.info(f"FREQUENCY axis zoom: factor={factor:.3f}")
-        else:
-            # Both axes
-            scale_factors = [factor, factor]
-            logger.debug(f"Both axes zoom: factor={factor:.3f}")
-        
-        # Perform the zoom
-        self.zoom_with_center(scale_factors, event.pos)
-        
-    def zoom_with_center(self, scale_factors, mouse_pos):
-        """Zoom with center-based scaling around mouse position."""
-        try:
-            # Get current camera rect
-            rect = self.view.camera.rect
-            if rect is None:
-                logger.warning("Camera rect is None, skipping zoom")
-                return
-                
-            # Current view dimensions
-            current_width = float(rect.width)
-            current_height = float(rect.height)
-            current_x = float(rect.left)
-            current_y = float(rect.bottom)
-            
-            # Validate current state
-            if current_width <= 0 or current_height <= 0:
-                logger.warning("Invalid camera dimensions, skipping zoom")
-                return
-            
-            # Calculate new dimensions
-            new_width = current_width / scale_factors[0]
-            new_height = current_height / scale_factors[1]
-            
-            # Apply boundary constraints early to prevent invalid states
-            if self.data_bounds:
-                time_min, time_max, freq_min, freq_max = self.data_bounds
-                
-                # Constrain width (time axis)
-                max_width = time_max - time_min
-                min_width = max_width / 100  # Allow 100x zoom in
-                new_width = max(min_width, min(new_width, max_width * 1.1))
-                
-                # Constrain height (frequency axis)  
-                max_height = freq_max - freq_min
-                min_height = max_height / 100  # Allow 100x zoom in
-                new_height = max(min_height, min(new_height, max_height * 1.1))
-            
-            # Use view center for zoom (simpler and more reliable)
-            center_x = current_x + current_width / 2
-            center_y = current_y + current_height / 2
-            
-            # Calculate new position (zoom around center)
-            new_x = center_x - new_width / 2
-            new_y = center_y - new_height / 2
-            
-            # Apply boundary constraints for position
-            if self.data_bounds:
-                time_min, time_max, freq_min, freq_max = self.data_bounds
-                
-                # Add small margins
-                margin_x = (time_max - time_min) * 0.02
-                margin_y = (freq_max - freq_min) * 0.02
-                
-                # Constrain X position
-                min_x = time_min - margin_x
-                max_x = time_max + margin_x - new_width
-                new_x = max(min_x, min(new_x, max_x))
-                    
-                # Constrain Y position
-                min_y = freq_min - margin_y  
-                max_y = freq_max + margin_y - new_height
-                new_y = max(min_y, min(new_y, max_y))
-            
-            # Validate final values before applying
-            if new_width > 0 and new_height > 0:
-                self.view.camera.rect = (new_x, new_y, new_width, new_height)
-                logger.debug(f"Zoom applied: rect=({new_x:.2f}, {new_y:.2f}, {new_width:.2f}, {new_height:.2f})")
-            else:
-                logger.warning("Invalid zoom dimensions calculated, skipping")
-            
-        except Exception as e:
-            logger.error(f"Error in zoom_with_center: {e}")
-            # Silently ignore zoom errors to prevent crashes
-    
-    def on_key_press(self, event):
-        """Handle key press events for additional zoom controls."""
-        logger.info(f"Key pressed: {event.key}")
-        
-        if event.key == 'X':
-            # Zoom out on time axis
-            logger.info("Key X: Zooming out TIME axis")
-            self.zoom_with_center([0.8, 1.0], None)  # X-axis zoom out
-        elif event.key == 'x':
-            # Zoom in on time axis  
-            logger.info("Key x: Zooming in TIME axis")
-            self.zoom_with_center([1.2, 1.0], None)  # X-axis zoom in
-        elif event.key == 'Y':
-            # Zoom out on frequency axis
-            logger.info("Key Y: Zooming out FREQUENCY axis")
-            self.zoom_with_center([1.0, 0.8], None)  # Y-axis zoom out
-        elif event.key == 'y':
-            # Zoom in on frequency axis
-            logger.info("Key y: Zooming in FREQUENCY axis")
-            self.zoom_with_center([1.0, 1.2], None)  # Y-axis zoom in
-        elif event.key == 'R' or event.key == 'r':
-            # Reset zoom to show all data
-            logger.info("Key R: Resetting zoom")
-            self.reset_camera_to_data_bounds()
-    
-    def constrain_camera_to_bounds(self):
-        """Constrain camera to data bounds - prevent invalid states."""
-        if self.data_bounds is None:
-            return
-        
-        try:
-            rect = self.view.camera.rect
-            if rect is None:
-                return
-            
-            # Get current rect properties safely
-            current_x = float(rect.left)
-            current_y = float(rect.bottom)
-            current_width = float(rect.width)
-            current_height = float(rect.height)
-            
-            # Validate current dimensions
-            if current_width <= 0 or current_height <= 0:
-                logger.warning("Invalid camera dimensions - resetting to data bounds")
-                self.reset_camera_to_data_bounds()
-                return
-                
-            # Extract bounds
-            time_min, time_max, freq_min, freq_max = self.data_bounds
-            data_width = time_max - time_min
-            data_height = freq_max - freq_min
-            
-            # Prevent extreme zoom levels
-            min_width = data_width / 1000  # Max 1000x zoom
-            max_width = data_width * 2     # Allow slight overzoom
-            min_height = data_height / 1000
-            max_height = data_height * 2
-            
-            # Constrain dimensions
-            new_width = max(min_width, min(current_width, max_width))
-            new_height = max(min_height, min(current_height, max_height))
-            
-            # Constrain position with small margin
-            margin_x = data_width * 0.05
-            margin_y = data_height * 0.05
-            
-            new_x = max(time_min - margin_x, 
-                       min(current_x, time_max + margin_x - new_width))
-            new_y = max(freq_min - margin_y,
-                       min(current_y, freq_max + margin_y - new_height))
-            
-            # Only update if values changed significantly
-            if (abs(new_x - current_x) > 1e-6 or abs(new_y - current_y) > 1e-6 or
-                abs(new_width - current_width) > 1e-6 or abs(new_height - current_height) > 1e-6):
-                
-                # Validate the new rect before applying
-                if new_width > 0 and new_height > 0:
-                    self.view.camera.rect = (new_x, new_y, new_width, new_height)
-                    
-        except Exception as e:
-            logger.debug(f"Error in camera constraints: {e}")
-            # Don't crash - camera constraints are not critical
-            
-    def reset_camera_to_data_bounds(self):
-        """Reset camera to show all data."""
-        if self.data_bounds:
-            time_min, time_max, freq_min, freq_max = self.data_bounds
-            self.view.camera.rect = (time_min, freq_min, 
-                                   time_max - time_min, freq_max - freq_min)
-    
-    def update_axis_labels(self):
-        """Update axis labels with appropriate units based on zoom level.
-        
-        With AxisWidget, the labels are automatically managed, but we can
-        update the axis label text to show appropriate units.
-        """
-        if self.data_bounds is None:
-            return
-        
-        try:
-            rect = self.view.camera.rect
-            if rect is None:
-                return
-            
-            x_min = rect.left
-            x_max = rect.right  
-            y_min = rect.bottom
-            y_max = rect.top
-        except Exception as e:
-            logger.debug(f"Cannot get camera rect: {e}")
-            return
-        
-        time_min, freq_min, time_max, freq_max = self.data_bounds
-        w = x_max - x_min
-        h = y_max - y_min
-        
-        # Format time axis label (X-axis)
-        time_span = w
-        if time_span < 1.0:
-            time_unit = "Time (ms)"
-        elif time_span < 60.0:
-            time_unit = "Time (s)"
-        elif time_span < 3600.0:
-            time_unit = "Time (min)"
-        else:
-            time_unit = "Time (hr)"
-        
-        # Format Y-axis label based on view type
-        current_tab = self.tab_widget.currentIndex()
-        tab_names = ['spectrogram', 'cepstrogram', 'fk_transform']
-        view_type = tab_names[current_tab] if 0 <= current_tab < len(tab_names) else 'spectrogram'
-        
-        if view_type == 'cepstrogram':
-            # For cepstrogram: Y-axis is quefrency (τ) in milliseconds or seconds
-            quefrency_span = h
-            if quefrency_span < 0.001:  # Less than 1ms
-                freq_unit = "Quefrency (μs)"
-            elif quefrency_span < 1.0:  # Less than 1 second
-                freq_unit = "Quefrency (ms)"
-            else:
-                freq_unit = "Quefrency (s)"
-        else:
-            # For spectrogram and F-K: Y-axis is frequency in Hz
-            freq_span = h
-            if freq_span < 1000.0:
-                freq_unit = "Frequency (Hz)"
-            else:
-                freq_unit = "Frequency (kHz)"
-        
-        # Update AxisWidget labels (need to unfreeze first)
-        self.x_axis.unfreeze()
-        self.x_axis.axis_label = time_unit
-        self.x_axis.freeze()
-        
-        self.y_axis.unfreeze()
-        self.y_axis.axis_label = freq_unit
-        self.y_axis.freeze()
-        
-        logger.debug(f"Axis labels updated: {time_unit}, {freq_unit}")
-    
-    def set_data_bounds(self, time_min, time_max, freq_min, freq_max):
-        """Set data bounds for zoom and pan constraints."""
-        self.data_bounds = (time_min, time_max, freq_min, freq_max)
-        logger.info(f"Data bounds set: time=[{time_min:.3f}, {time_max:.3f}], freq=[{freq_min:.1f}, {freq_max:.1f}]")
-    
-    def update_image(self, data: np.ndarray, extent: tuple = None):
-        """Update the displayed image data."""
-        if data is not None and data.size > 0:
-            # Ensure data is in correct format for VisPy
-            # VisPy Image expects: rows=Y-axis, columns=X-axis
-            # For spectrogram: we want time=X-axis, frequency=Y-axis
-            # Data comes as (frequency_bins, time_frames) which is already correct!
-            if data.ndim == 2:
-                # Data format (freq_bins, time_frames) is correct for VisPy
-                # freq_bins = rows = Y-axis (frequency)
-                # time_frames = columns = X-axis (time)
-                display_data = data.astype(np.float32)
-                
-                # Check OpenGL texture size limits
-                original_shape = display_data.shape
-                downsample_factor_x = 1
-                downsample_factor_y = 1
-                
-                # Check if we exceed texture limits
-                if display_data.shape[1] > self.max_texture_size:
-                    downsample_factor_x = int(np.ceil(display_data.shape[1] / self.max_texture_size))
-                    logger.warning(f"Data width ({display_data.shape[1]}) exceeds OpenGL limit ({self.max_texture_size})")
-                    logger.warning(f"Downsampling by {downsample_factor_x}x in time to fit texture")
-                    display_data = display_data[:, ::downsample_factor_x]
-                
-                if display_data.shape[0] > self.max_texture_size:
-                    downsample_factor_y = int(np.ceil(display_data.shape[0] / self.max_texture_size))
-                    logger.warning(f"Data height ({display_data.shape[0]}) exceeds OpenGL limit ({self.max_texture_size})")
-                    logger.warning(f"Downsampling by {downsample_factor_y}x in frequency to fit texture")
-                    display_data = display_data[::downsample_factor_y, :]
-                
-                if downsample_factor_x > 1 or downsample_factor_y > 1:
-                    logger.info(f"Downsampled: {original_shape} -> {display_data.shape}")
-                
-                # Normalize data for proper VisPy display
-                # Spectrogram data is typically in dB (e.g., -120 to 0 dB)
-                # Normalize to 0-1 range for proper colormap visualization
-                data_min = np.min(display_data)
-                data_max = np.max(display_data)
-                
-                logger.info(f"Data range BEFORE normalization: min={data_min:.1f}, max={data_max:.1f}")
-                
-                if data_max > data_min:  # Avoid division by zero
-                    display_data = (display_data - data_min) / (data_max - data_min)
-                else:
-                    display_data = np.zeros_like(display_data)
-                    logger.warning("Data has no variation! Setting to zeros")
-                
-                # Verify normalization worked
-                norm_min = np.min(display_data)
-                norm_max = np.max(display_data)
-                logger.info(f"Data range AFTER normalization: min={norm_min:.3f}, max={norm_max:.3f}")
-                logger.info(f"Display shape: {display_data.shape}, dtype: {display_data.dtype}")
-            else:
-                display_data = data.astype(np.float32)
-            
-            if extent:
-                # extent = (time_start, time_end, freq_start, freq_end)
-                time_start, time_end, freq_start, freq_end = extent
-                time_width = time_end - time_start
-                freq_height = freq_end - freq_start
-                
-                logger.debug(f"Transform: time [{time_start}, {time_end}], freq [{freq_start}, {freq_end}]")
-                logger.debug(f"Data pixels: {display_data.shape[1]} x {display_data.shape[0]}")
-                
-                # Set data with proper clim for color mapping
-                logger.info(f"Setting image data: shape={display_data.shape}, min={np.min(display_data):.3f}, max={np.max(display_data):.3f}")
-                self.image_visual.set_data(display_data)
-                self.image_visual.clim = (0, 1)  # Data is normalized to 0-1
-                logger.info(f"Image visual updated successfully, clim={self.image_visual.clim}")
-                
-                # Calculate transform to map pixel coordinates to world coordinates
-                # VisPy Image: pixel (j, i) where j=column (X), i=row (Y)
-                # display_data[i, j] where i=row (Y/freq), j=column (X/time)
-                
-                # We want to map:
-                # - pixel column 0 -> time_start
-                # - pixel column (shape[1]-1) -> time_end
-                # - pixel row 0 -> freq_start  
-                # - pixel row (shape[0]-1) -> freq_end
-                
-                # Scale factor: world_units per pixel
-                x_scale = time_width / display_data.shape[1]
-                y_scale = freq_height / display_data.shape[0]
-                
-                # Translate: position of pixel (0, 0) in world coords
-                # Pixel (0,0) is bottom-left, should map to (time_start, freq_start)
-                x_translate = time_start
-                y_translate = freq_start
-                
-                transform = scene.STTransform(
-                    scale=(x_scale, y_scale),
-                    translate=(x_translate, y_translate)
-                )
-                self.image_visual.transform = transform
-                
-                logger.debug(f"Transform scale: ({x_scale:.6f}, {y_scale:.2f})")
-                
-                # Set data bounds for proper zoom/pan constraints
-                self.set_data_bounds(time_start, time_end, freq_start, freq_end)
-                
-                # Update camera to show the full data range
-                self.view.camera.rect = (
-                    time_start, freq_start, 
-                    time_end - time_start, freq_end - freq_start
-                )
-                
-                # Update axis labels
-                self.update_axis_labels()
-                
-                logger.debug(f"Camera range: X=[{time_start}, {time_end}], Y=[{freq_start}, {freq_end}]")
-            else:
-                self.image_visual.set_data(display_data)
-                self.image_visual.clim = (0, 1)
-    
-    def set_crosshair(self, enabled: bool, pos: tuple = None):
-        """Enable/disable crosshair display."""
-        self.crosshair_enabled = enabled
-        
-        if enabled and pos:
-            x, y = pos
-            
-            # Update crosshair lines
-            rect = self.view.camera.rect
-            x_range = (rect.left, rect.right)
-            y_range = (rect.bottom, rect.top)
-            
-            # Vertical line
-            self.crosshair_v.set_data(np.array([[x, y_range[0]], [x, y_range[1]]]))
-            
-            # Horizontal line  
-            self.crosshair_h.set_data(np.array([[x_range[0], y], [x_range[1], y]]))
-            
-            self.crosshair_v.visible = True
-            self.crosshair_h.visible = True
-        else:
-            self.crosshair_v.visible = False
-            self.crosshair_h.visible = False
-    
-    def update_text_readout(self, text: str, pos: tuple = None):
-        """Update text readout display."""
-        self.text_visual.text = text
-        if pos:
-            self.text_visual.pos = pos
-    
-    def on_mouse_press(self, event):
-        """Handle mouse press for starting pan navigation."""
-        if event.button == 1:  # Left button
-            self.is_panning = True
-            self.last_mouse_pos = event.pos
-            event.handled = True
-    
-    def on_mouse_release(self, event):
-        """Handle mouse release for ending pan navigation."""
-        if event.button == 1:  # Left button
-            self.is_panning = False
-            self.last_mouse_pos = None
-            event.handled = True
-    
-    def on_mouse_move(self, event):
-        """Handle mouse movement for pan navigation and crosshair updates."""
-        if event.pos is not None:
-            # Handle panning if left mouse button is pressed
-            if self.is_panning and self.last_mouse_pos is not None:
-                try:
-                    # Calculate delta in screen space
-                    delta_screen = event.pos - self.last_mouse_pos
-                    
-                    # Get current camera rect
-                    rect = self.view.camera.rect
-                    if rect is None:
-                        return
-                    
-                    # Get canvas size to convert screen delta to world delta
-                    canvas_size = self.size
-                    if canvas_size[0] <= 0 or canvas_size[1] <= 0:
-                        return
-                    
-                    # Convert screen delta to world delta (with pan speed)
-                    delta_x = -(delta_screen[0] / canvas_size[0]) * rect.width * self.pan_speed
-                    delta_y = (delta_screen[1] / canvas_size[1]) * rect.height * self.pan_speed
-                    
-                    # Calculate new position
-                    new_left = rect.left + delta_x
-                    new_bottom = rect.bottom + delta_y
-                    
-                    # Apply boundary constraints
-                    if self.data_bounds:
-                        time_min, time_max, freq_min, freq_max = self.data_bounds
-                        
-                        # Constrain X (time)
-                        if new_left < time_min:
-                            new_left = time_min
-                        if new_left + rect.width > time_max:
-                            new_left = time_max - rect.width
-                        
-                        # Constrain Y (frequency)
-                        if new_bottom < freq_min:
-                            new_bottom = freq_min
-                        if new_bottom + rect.height > freq_max:
-                            new_bottom = freq_max - rect.height
-                    
-                    # Apply the pan
-                    self.view.camera.rect = (new_left, new_bottom, rect.width, rect.height)
-                    
-                    # Update last position
-                    self.last_mouse_pos = event.pos
-                    
-                    logger.debug(f"Panning: new rect=({new_left:.1f}, {new_bottom:.1f}, {rect.width:.1f}, {rect.height:.1f})")
-                    
-                except Exception as e:
-                    logger.debug(f"Pan error: {e}")
-            
-            # Handle crosshair updates (only when not panning)
-            elif not self.is_panning:
-                try:
-                    # Convert screen coordinates to world coordinates using ViewBox transform
-                    tr = self.view.scene.node_transform(self.view.scene)
-                    if tr is not None:
-                        world_pos = tr.map(event.pos)
-                        self.mouse_pos = (world_pos[0], world_pos[1])
-                        
-                        if self.crosshair_enabled:
-                            self.set_crosshair(True, self.mouse_pos)
-                            
-                            # Update readout text
-                            # Format readout based on current view type
-                            current_tab = self.tab_widget.currentIndex()
-                            tab_names = ['spectrogram', 'cepstrogram', 'fk_transform']
-                            view_type = tab_names[current_tab] if 0 <= current_tab < len(tab_names) else 'spectrogram'
-                            
-                            if view_type == 'cepstrogram':
-                                # For cepstrogram: show time and quefrency
-                                quefrency_ms = world_pos[1] * 1000  # Convert to milliseconds
-                                readout = f"Time: {world_pos[0]:.3f}s, Quefrency: {quefrency_ms:.1f}ms"
-                            else:
-                                # For spectrogram and F-K: show time and frequency
-                                readout = f"Time: {world_pos[0]:.3f}s, Freq: {world_pos[1]:.0f}Hz"
-                            
-                            self.update_text_readout(readout, (10, 30))
-                except Exception as e:
-                    # Silently handle coordinate transform errors during mouse movement
-                    pass
-
-class StatusWidget(QWidget):
-    """Status widget showing performance metrics."""
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 2, 5, 2)
-        
-        self.fps_label = QLabel("FPS: --")
-        self.memory_label = QLabel("Memory: --")
-        self.gpu_label = QLabel("GPU: --")
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        
-        layout.addWidget(QLabel("Performance:"))
-        layout.addWidget(self.fps_label)
-        layout.addWidget(QLabel("|"))
-        layout.addWidget(self.memory_label)
-        layout.addWidget(QLabel("|"))
-        layout.addWidget(self.gpu_label)
-        layout.addStretch()
-        layout.addWidget(self.progress_bar)
-    
-    def update_stats(self, fps: float = None, memory_mb: float = None, 
-                    gpu_mb: float = None, progress: float = None):
-        """Update status display."""
-        if fps is not None:
-            self.fps_label.setText(f"FPS: {fps:.1f}")
-        
-        if memory_mb is not None:
-            self.memory_label.setText(f"Memory: {memory_mb:.0f}MB")
-        
-        if gpu_mb is not None:
-            self.gpu_label.setText(f"GPU: {gpu_mb:.0f}MB")
-        
-        if progress is not None:
-            if 0 <= progress < 1:
-                self.progress_bar.setVisible(True)
-                self.progress_bar.setValue(int(progress * 100))
-            else:
-                self.progress_bar.setVisible(False)
-
-class ControlsWidget(QWidget):
-    """Widget containing analysis controls."""
-    
-    # Signals
-    parameters_changed = Signal(dict)
-    colormap_changed = Signal(str)
-    db_range_changed = Signal(float, float)
-    refresh_requested = Signal()
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        
-        self.setup_ui()
-        self.connect_signals()
-    
-    def setup_ui(self):
-        """Setup the control interface."""
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        
-        # FFT Parameters
-        fft_frame = QFrame()
-        fft_frame.setFrameStyle(QFrame.StyledPanel)
-        fft_layout = QHBoxLayout(fft_frame)
-        
-        fft_layout.addWidget(QLabel("FFT Size:"))
-        self.fft_size_combo = QComboBox()
-        self.fft_size_combo.addItems(['512', '1024', '2048', '4096', '8192'])
-        self.fft_size_combo.setCurrentText('2048')
-        fft_layout.addWidget(self.fft_size_combo)
-        
-        fft_layout.addWidget(QLabel("Hop:"))
-        self.hop_combo = QComboBox()
-        self.hop_combo.addItems(['128', '256', '512', '1024'])
-        self.hop_combo.setCurrentText('512')
-        fft_layout.addWidget(self.hop_combo)
-        
-        # Colormap
-        colormap_frame = QFrame()
-        colormap_frame.setFrameStyle(QFrame.StyledPanel)
-        colormap_layout = QHBoxLayout(colormap_frame)
-        
-        colormap_layout.addWidget(QLabel("Colormap:"))
-        self.colormap_combo = QComboBox()
-        self.colormap_combo.addItems(['viridis', 'plasma', 'jet', 'magma'])
-        colormap_layout.addWidget(self.colormap_combo)
-        
-        # dB Range
-        db_frame = QFrame()
-        db_frame.setFrameStyle(QFrame.StyledPanel)
-        db_layout = QHBoxLayout(db_frame)
-        
-        db_layout.addWidget(QLabel("dB Range:"))
-        
-        self.db_min_slider = QSlider(Qt.Horizontal)
-        self.db_min_slider.setRange(-120, 0)
-        self.db_min_slider.setValue(-80)
-        self.db_min_label = QLabel("-80")
-        
-        self.db_max_slider = QSlider(Qt.Horizontal)
-        self.db_max_slider.setRange(-80, 20)
-        self.db_max_slider.setValue(0)
-        self.db_max_label = QLabel("0")
-        
-        db_layout.addWidget(QLabel("Min:"))
-        db_layout.addWidget(self.db_min_slider)
-        db_layout.addWidget(self.db_min_label)
-        db_layout.addWidget(QLabel("Max:"))
-        db_layout.addWidget(self.db_max_slider)
-        db_layout.addWidget(self.db_max_label)
-        
-        # Refresh button
-        self.refresh_button = QPushButton("Refresh")
-        
-        # Add all frames to main layout
-        layout.addWidget(fft_frame)
-        layout.addWidget(colormap_frame)
-        layout.addWidget(db_frame)
-        layout.addStretch()
-        layout.addWidget(self.refresh_button)
-    
-    def connect_signals(self):
-        """Connect widget signals."""
-        self.fft_size_combo.currentTextChanged.connect(self.emit_parameters_changed)
-        self.hop_combo.currentTextChanged.connect(self.emit_parameters_changed)
-        self.colormap_combo.currentTextChanged.connect(self.on_colormap_changed_realtime)
-        
-        self.db_min_slider.valueChanged.connect(self.update_db_range_realtime)
-        self.db_max_slider.valueChanged.connect(self.update_db_range_realtime)
-        
-        self.refresh_button.clicked.connect(self.refresh_requested.emit)
-    
-    def emit_parameters_changed(self):
-        """Emit parameters changed signal."""
-        params = {
-            'fft_size': int(self.fft_size_combo.currentText()),
-            'hop_length': int(self.hop_combo.currentText())
-        }
-        self.parameters_changed.emit(params)
-    
-    def on_colormap_changed_realtime(self, colormap: str):
-        """Handle real-time colormap changes with shader uniforms."""
-        # Emit traditional signal for compatibility
-        self.colormap_changed.emit(colormap)
-        
-        # PERFORMANCE: Update shader uniforms directly for instant change
-        main_window = self.parent()
-        if hasattr(main_window, 'update_shader_colormap'):
-            main_window.update_shader_colormap(colormap)
-    
-    def update_db_range(self):
-        """Update dB range display and emit signal."""
-        db_min = self.db_min_slider.value()
-        db_max = self.db_max_slider.value()
-        
-        # Ensure min < max
-        if db_min >= db_max:
-            if self.sender() == self.db_min_slider:
-                db_max = db_min + 10
-                self.db_max_slider.setValue(db_max)
-            else:
-                db_min = db_max - 10
-                self.db_min_slider.setValue(db_min)
-        
-        self.db_min_label.setText(str(db_min))
-        self.db_max_label.setText(str(db_max))
-        
-        self.db_range_changed.emit(db_min, db_max)
-    
-    def update_db_range_realtime(self):
-        """Handle real-time dB range changes with shader uniforms."""
-        db_min = self.db_min_slider.value()
-        db_max = self.db_max_slider.value()
-        
-        # Ensure min < max
-        if db_min >= db_max:
-            if self.sender() == self.db_min_slider:
-                db_max = db_min + 10
-                self.db_max_slider.setValue(db_max)
-            else:
-                db_min = db_max - 10
-                self.db_min_slider.setValue(db_min)
-        
-        self.db_min_label.setText(str(db_min))
-        self.db_max_label.setText(str(db_max))
-        
-        # Emit traditional signal for compatibility
-        self.db_range_changed.emit(db_min, db_max)
-        
-        # PERFORMANCE: Update shader uniforms directly for instant change
-        main_window = self.parent()
-        if hasattr(main_window, 'update_shader_db_range'):
-            main_window.update_shader_db_range(db_min, db_max)
 
 class MainWindow(QMainWindow):
     """Main application window."""
@@ -1033,7 +58,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         
         self.setWindowTitle("GPU-Accelerated Audio Visualizer")
-        self.setMinimumSize(1200, 800)
+        self.setMinimumSize(1400, 900)
+        self.resize(1600, 1000)
         
         # Apply modern glassmorphic theme
         self.apply_modern_theme()
@@ -1058,17 +84,22 @@ class MainWindow(QMainWindow):
         # Tile-based caching and rendering
         self.tile_cache = TileCache(max_memory_tiles=100, max_disk_gb=10.0)
         
-        # Computation engines
+        # Computation engines (spectrogram only)
         self.spectrogram_engine = SpectrogramEngine(self.cache_manager, self.task_manager)
-        self.cepstrogram_engine = CepstrogramEngine(self.cache_manager, self.task_manager, self.spectrogram_engine)
-        self.fk_engine = FKEngine(self.cache_manager, self.task_manager, self.spectrogram_engine)
         
         # Engines dictionary for easy access
         self.engines = {
             'spectrogram': self.spectrogram_engine,
-            'cepstrogram': self.cepstrogram_engine,
-            'fk_transform': self.fk_engine
         }
+        
+        # Adaptive Spectrogram Manager for zoom-based quality optimization
+        self.adaptive_manager = get_adaptive_spectrogram_manager(
+            sample_rate=self.spectrogram_engine.sample_rate
+        )
+        
+        # Settings state
+        self.auto_db_range_enabled = True
+        self.current_freq_scale = 'linear'
         
         # Tile manager (coordinates tiles, cache, and atlases)
         self.tile_manager = TileMgr(
@@ -1076,21 +107,35 @@ class MainWindow(QMainWindow):
             engines=self.engines
         )
         
-        # Set up default array geometry for F-K analysis (simulated linear array)
-        # For single-channel audio, we simulate a simple 8-element linear array
-        array_spacing = 0.1  # 10 cm spacing
-        n_sensors = 8
-        sensor_positions = np.array([[i * array_spacing, 0.0] for i in range(n_sensors)])
-        self.fk_engine.set_array_geometry(sensor_positions)
+        # Atlas renderer for spectrogram view
+        self.atlas_renderers = {}
+        atlas = self.tile_manager.get_atlas('spectrogram')
+        if atlas:
+            self.atlas_renderers['spectrogram'] = AtlasRenderer(atlas)
         
-        # Current state
-        self.current_file = None
+        logger.info(f"Initialized {len(self.atlas_renderers)} atlas renderers")
+        
+        
+        # Multi-file state
+        self.current_file = None  # Currently active file
+        self.file_data = {}  # file_path -> {audio_data, sample_rate, duration, view_range}
         # Default view range (will be updated when file is loaded)
         self.current_view_range = ((0.0, 10.0), (0.0, 22050.0))  # (time, freq)
+        
+        # Spectrogram cache to avoid recomputation
+        self.spectrogram_cache = {
+            'time_range': None,
+            'freq_range': None,
+            'fft_size': None,
+            'hop_length': None,
+            'data': None,
+            'extent': None
+        }
         
         # Setup UI
         self.setup_ui()
         self.setup_menu_bar()
+        self.setup_zoom_toolbar()
         self.setup_status_bar()
         
         # Performance timer
@@ -1121,57 +166,52 @@ class MainWindow(QMainWindow):
         viz_container = QFrame()
         viz_container.setObjectName("viz_container")
         viz_container.setFrameShape(QFrame.NoFrame)
-        viz_layout = QVBoxLayout(viz_container)
+        viz_layout = QHBoxLayout(viz_container)
         viz_layout.setContentsMargins(0, 0, 0, 0)  # NO MARGINS!
         viz_layout.setSpacing(0)
         
-        # Tab widget for different views - NO PADDING
-        self.tab_widget = QTabWidget()
-        self.tab_widget.setContentsMargins(0, 0, 0, 0)
+        # Splitter for playlist and canvas
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        viz_layout.addWidget(self.main_splitter)
         
-        # Create tabs with proper containers
+        # Simple playlist on the left (single panel, no tabs)
+        self.playlist_widget = PlaylistWidget()
+        self.playlist_widget.setMaximumWidth(220)
+        self.playlist_widget.setMinimumWidth(180)
+        self.connect_playlist_signals()
+        self.main_splitter.addWidget(self.playlist_widget)
+        
+        # Center container for spectrogram canvas
+        center_container = QWidget()
+        center_layout = QVBoxLayout(center_container)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+        self.main_splitter.addWidget(center_container)
+        self.main_splitter.setSizes([260, 1200])
+        
         if HAS_VISPY:
-            # Spectrogram tab
             spec_container = QFrame()
             spec_container.setFrameShape(QFrame.NoFrame)
             spec_layout = QVBoxLayout(spec_container)
-            spec_layout.setContentsMargins(0, 0, 0, 0)  # NO MARGINS!
+            spec_layout.setContentsMargins(0, 0, 0, 0)
             spec_layout.setSpacing(0)
             
             self.spectrogram_canvas = VisPyCanvas('spectrogram')
+            self.spectrogram_canvas.native.setMinimumSize(600, 400)
             spec_layout.addWidget(self.spectrogram_canvas.native)
+            center_layout.addWidget(spec_container, 1)
             
-            # Cepstrogram tab
-            cepstro_container = QFrame()
-            cepstro_container.setFrameShape(QFrame.NoFrame)
-            cepstro_layout = QVBoxLayout(cepstro_container)
-            cepstro_layout.setContentsMargins(0, 0, 0, 0)  # NO MARGINS!
-            cepstro_layout.setSpacing(0)
+            # Connect callbacks for status bar updates
+            self.spectrogram_canvas.on_zoom_changed_callback = self.on_zoom_level_changed
+            self.spectrogram_canvas.on_cursor_moved_callback = self.on_cursor_moved
             
-            self.cepstrogram_canvas = VisPyCanvas('cepstrogram')
-            cepstro_layout.addWidget(self.cepstrogram_canvas.native)
+            # Connect auto-recompute callback for high-quality zoom
+            self.spectrogram_canvas.on_auto_recompute_callback = self.on_auto_recompute
             
-            # F-K tab
-            fk_container = QFrame()
-            fk_container.setFrameShape(QFrame.NoFrame)
-            fk_layout = QVBoxLayout(fk_container)
-            fk_layout.setContentsMargins(0, 0, 0, 0)  # NO MARGINS!
-            fk_layout.setSpacing(0)
-            
-            self.fk_canvas = VisPyCanvas('fk_transform')
-            fk_layout.addWidget(self.fk_canvas.native)
-            
-            # Add tabs
-            self.tab_widget.addTab(spec_container, "Spectrogram")
-            self.tab_widget.addTab(cepstro_container, "Cepstrogram")
-            self.tab_widget.addTab(fk_container, "F-K Transform")
+            # Set measurement mode callback
+            self.spectrogram_canvas.set_measurement_callback(self.on_measurement_mode_changed)
         else:
-            # Fallback widgets when VisPy not available
-            self.tab_widget.addTab(QLabel("VisPy not available"), "Spectrogram")
-            self.tab_widget.addTab(QLabel("VisPy not available"), "Cepstrogram")
-            self.tab_widget.addTab(QLabel("VisPy not available"), "F-K Transform")
-        
-        viz_layout.addWidget(self.tab_widget)
+            center_layout.addWidget(QLabel("VisPy not available"))
         main_layout.addWidget(viz_container)
         
         # Connect signals
@@ -1179,8 +219,14 @@ class MainWindow(QMainWindow):
         self.controls_widget.colormap_changed.connect(self.on_colormap_changed)
         self.controls_widget.db_range_changed.connect(self.on_db_range_changed)
         self.controls_widget.refresh_requested.connect(self.refresh_current_view)
+        self.controls_widget.interpolation_changed.connect(self.on_interpolation_changed)
         
-        self.tab_widget.currentChanged.connect(self.on_tab_changed)
+        # No tab changes; visualization is always spectrogram
+    
+    def connect_playlist_signals(self):
+        """Connect signals from playlist widget."""
+        self.playlist_widget.file_selected.connect(self.on_file_selected_from_playlist)
+        self.playlist_widget.files_dropped.connect(self.on_files_dropped)
     
     def setup_menu_bar(self):
         """Setup the menu bar."""
@@ -1234,6 +280,116 @@ class MainWindow(QMainWindow):
         refresh_action.setShortcut("F5")
         refresh_action.triggered.connect(self.refresh_current_view)
         analysis_menu.addAction(refresh_action)
+        
+        # Help menu
+        help_menu = menubar.addMenu("Help")
+        
+        shortcuts_action = QAction("Keyboard Shortcuts", self)
+        shortcuts_action.setShortcut("F1")
+        shortcuts_action.triggered.connect(self.show_keyboard_shortcuts)
+        help_menu.addAction(shortcuts_action)
+    
+    def setup_zoom_toolbar(self):
+        """Setup compact zoom navigation toolbar."""
+        zoom_toolbar = QToolBar("Navigation")
+        zoom_toolbar.setMovable(False)
+        self.addToolBar(Qt.TopToolBarArea, zoom_toolbar)
+        
+        # Reset zoom
+        reset_btn = QPushButton("Reset")
+        reset_btn.setToolTip("Reset zoom to show all data (R)")
+        reset_btn.setFixedWidth(55)
+        reset_btn.clicked.connect(self.zoom_to_fit)
+        zoom_toolbar.addWidget(reset_btn)
+        
+        zoom_toolbar.addSeparator()
+        
+        # Time axis zoom
+        time_label = QLabel(" Time: ")
+        time_label.setStyleSheet("color: rgba(255,255,255,0.7);")
+        zoom_toolbar.addWidget(time_label)
+        
+        zoom_time_in = QPushButton("+")
+        zoom_time_in.setToolTip("Zoom in time (Shift+Scroll)")
+        zoom_time_in.setFixedWidth(28)
+        zoom_time_in.clicked.connect(lambda: self.zoom_axis('time', 'in'))
+        zoom_toolbar.addWidget(zoom_time_in)
+        
+        zoom_time_out = QPushButton("-")
+        zoom_time_out.setToolTip("Zoom out time")
+        zoom_time_out.setFixedWidth(28)
+        zoom_time_out.clicked.connect(lambda: self.zoom_axis('time', 'out'))
+        zoom_toolbar.addWidget(zoom_time_out)
+        
+        zoom_toolbar.addSeparator()
+        
+        # Frequency axis zoom
+        freq_label = QLabel(" Freq: ")
+        freq_label.setStyleSheet("color: rgba(255,255,255,0.7);")
+        zoom_toolbar.addWidget(freq_label)
+        
+        zoom_freq_in = QPushButton("+")
+        zoom_freq_in.setToolTip("Zoom in frequency (Ctrl+Scroll)")
+        zoom_freq_in.setFixedWidth(28)
+        zoom_freq_in.clicked.connect(lambda: self.zoom_axis('freq', 'in'))
+        zoom_toolbar.addWidget(zoom_freq_in)
+        
+        zoom_freq_out = QPushButton("-")
+        zoom_freq_out.setToolTip("Zoom out frequency")
+        zoom_freq_out.setFixedWidth(28)
+        zoom_freq_out.clicked.connect(lambda: self.zoom_axis('freq', 'out'))
+        zoom_toolbar.addWidget(zoom_freq_out)
+        
+        zoom_toolbar.addSeparator()
+        
+        # Both axes zoom
+        both_label = QLabel(" Both: ")
+        both_label.setStyleSheet("color: rgba(255,255,255,0.7);")
+        zoom_toolbar.addWidget(both_label)
+        
+        zoom_both_in = QPushButton("+ +")
+        zoom_both_in.setToolTip("Zoom in both axes (Scroll)")
+        zoom_both_in.setFixedWidth(35)
+        zoom_both_in.clicked.connect(lambda: self.zoom_axis('both', 'in'))
+        zoom_toolbar.addWidget(zoom_both_in)
+        
+        zoom_both_out = QPushButton("- -")
+        zoom_both_out.setToolTip("Zoom out both axes")
+        zoom_both_out.setFixedWidth(35)
+        zoom_both_out.clicked.connect(lambda: self.zoom_axis('both', 'out'))
+        zoom_toolbar.addWidget(zoom_both_out)
+        
+        # Add stretch spacer
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        zoom_toolbar.addWidget(spacer)
+        
+        # Navigation hints
+        hints = QLabel("Pan: drag | Zoom: scroll | Time zoom: Shift+scroll | Freq zoom: Ctrl+scroll")
+        hints.setStyleSheet("color: rgba(255,255,255,0.4); font-size: 10px; padding-right: 10px;")
+        zoom_toolbar.addWidget(hints)
+    
+    def zoom_axis(self, axis: str, direction: str):
+        """Zoom on specified axis.
+        
+        Args:
+            axis: 'time', 'freq', or 'both'
+            direction: 'in' or 'out'
+        """
+        if not HAS_VISPY or not hasattr(self, 'spectrogram_canvas'):
+            return
+        
+        factor = 1.5 if direction == 'in' else 2/3
+        
+        if axis == 'time':
+            scale_factors = [factor, 1.0]
+        elif axis == 'freq':
+            scale_factors = [1.0, factor]
+        else:  # both
+            scale_factors = [factor, factor]
+        
+        self.spectrogram_canvas.zoom_with_center(scale_factors, None)
+        logger.debug(f"Zoom {direction} on {axis} axis")
     
     def setup_status_bar(self):
         """Setup the status bar."""
@@ -1274,16 +430,34 @@ class MainWindow(QMainWindow):
             sample_rate, duration = self.audio_loader.load_file(file_path)
             
             self.current_file = file_path
-            # Show full audio duration instead of just 10 seconds
-            self.current_view_range = ((0.0, duration), 
-                                     (0.0, sample_rate / 2))
             
-            # Update spectrogram engine parameters
+            # IMPORTANT: Max frequency is Nyquist = sample_rate / 2
+            nyquist_freq = sample_rate / 2
+            self.current_view_range = ((0.0, duration), (0.0, nyquist_freq))
+            
+            # Update spectrogram engine parameters with correct sample rate
             self.spectrogram_engine.set_parameters(sample_rate=sample_rate)
+            
+            # Update adaptive manager with correct sample rate
+            self.adaptive_manager.sample_rate = sample_rate
+            self.adaptive_manager.clear_cache()
+            
+            # Reset zoom detector for new file
+            if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+                self.spectrogram_canvas.zoom_detector.reset()
+            
+            logger.info(f"Loaded: {os.path.basename(file_path)} - {duration:.1f}s, {sample_rate}Hz, max freq {nyquist_freq:.0f}Hz")
+            
+            # Update playlist widget with file info
+            if hasattr(self, 'playlist_widget'):
+                self.playlist_widget.add_file_path(file_path)
+                self.playlist_widget.update_file_info(
+                    file_path, duration=duration, sample_rate=sample_rate, is_loaded=True
+                )
             
             self.statusBar().showMessage(
                 f"Loaded: {os.path.basename(file_path)} "
-                f"({duration:.1f}s, {sample_rate}Hz)"
+                f"({duration:.1f}s, {sample_rate}Hz, max {nyquist_freq:.0f}Hz)"
             )
             
             # Refresh current view
@@ -1297,11 +471,26 @@ class MainWindow(QMainWindow):
     def on_parameters_changed(self, params: dict):
         """Handle parameter changes with smart cache invalidation."""
         
+        # Clear spectrogram cache
+        self.spectrogram_cache = {
+            'time_range': None, 'freq_range': None,
+            'fft_size': None, 'hop_length': None,
+            'data': None, 'extent': None
+        }
+        
+        # Clean up old data before computing new
+        if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+            self.spectrogram_canvas.raw_display_data = None
+            self.spectrogram_canvas.normalized_display_data = None
+        
+        # Release GPU memory
+        self.cleanup_gpu_memory()
+        
         # Get current parameters before updating
         old_params = {
-            'fft_size': getattr(self.spectrogram_engine, 'fft_size', 2048),
+            'fft_size': getattr(self.spectrogram_engine, 'fft_size', 4096),
             'hop_length': getattr(self.spectrogram_engine, 'hop_length', 512),
-            'window': getattr(self.spectrogram_engine, 'window', 'hann'),
+            'window': getattr(self.spectrogram_engine, 'window', 'blackman'),
             'sample_rate': getattr(self.spectrogram_engine, 'sample_rate', 44100)
         }
         
@@ -1325,8 +514,6 @@ class MainWindow(QMainWindow):
         for view_type in invalidation_actions.keys():
             if view_type == 'spectrogram' and hasattr(self.spectrogram_canvas, 'tiled_renderer'):
                 self.spectrogram_canvas.tiled_renderer.clear_tiles()
-            elif view_type == 'cepstrogram' and hasattr(self.cepstrogram_canvas, 'tiled_renderer'):
-                self.cepstrogram_canvas.tiled_renderer.clear_tiles()
         
         # Log invalidation summary
         if invalidation_actions:
@@ -1348,32 +535,75 @@ class MainWindow(QMainWindow):
                     self.spectrogram_canvas.image_visual.cmap = colormap
                     logger.debug(f"Updated spectrogram colormap to {colormap}")
                 
-                if hasattr(self, 'cepstrogram_canvas') and self.cepstrogram_canvas.image_visual:
-                    self.cepstrogram_canvas.image_visual.cmap = colormap
-                    logger.debug(f"Updated cepstrogram colormap to {colormap}")
-                
-                if hasattr(self, 'fk_canvas') and self.fk_canvas.image_visual:
-                    self.fk_canvas.image_visual.cmap = colormap
-                    logger.debug(f"Updated F-K transform colormap to {colormap}")
-                
                 # Trigger a visual update
                 self.update_displays()
                 
         except Exception as e:
             logger.error(f"Error updating colormap: {e}")
     
+    def on_interpolation_changed(self, interpolation: str):
+        """Handle interpolation changes."""
+        logger.info(f"Interpolation changed to: {interpolation}")
+        
+        try:
+            if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+                self.spectrogram_canvas.set_interpolation(interpolation)
+        except Exception as e:
+            logger.error(f"Error updating interpolation: {e}")
+    
     def update_displays(self):
         """Force update of all displays."""
         try:
-            if HAS_VISPY:
-                if hasattr(self, 'spectrogram_canvas'):
-                    self.spectrogram_canvas.update()
-                if hasattr(self, 'cepstrogram_canvas'):
-                    self.cepstrogram_canvas.update()
-                if hasattr(self, 'fk_canvas'):
-                    self.fk_canvas.update()
+            if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+                self.spectrogram_canvas.update()
         except Exception as e:
             logger.debug(f"Error updating displays: {e}")
+    
+    def on_zoom_level_changed(self, time_zoom: float, freq_zoom: float):
+        """Handle zoom level change - update status bar."""
+        if hasattr(self, 'status_widget'):
+            self.status_widget.update_zoom(time_zoom, freq_zoom)
+    
+    def on_cursor_moved(self, time_sec: float, freq_hz: float):
+        """Handle cursor movement - update status bar."""
+        if hasattr(self, 'status_widget'):
+            self.status_widget.update_cursor(time_sec, freq_hz)
+    
+    def on_measurement_mode_changed(self, is_on: bool):
+        """Handle measurement mode toggle - update status bar."""
+        if hasattr(self, 'status_widget'):
+            self.status_widget.update_measurement_mode(is_on)
+    
+    def on_auto_recompute(self, visible_region):
+        """Auto-recompute spectrogram at current zoom level for high quality."""
+        if not self.current_file:
+            return
+        
+        # Check if zoom level is high enough to benefit from recompute
+        time_zoom, freq_zoom = self.spectrogram_canvas.get_zoom_level()
+        if max(time_zoom, freq_zoom) < 2.0:
+            # Not zoomed in enough, skip recompute
+            return
+        
+        # Store original bounds before recompute
+        original_bounds = self.spectrogram_canvas.data_bounds
+        
+        # Update view range and recompute
+        self.current_view_range = (
+            (visible_region.time_start, visible_region.time_end),
+            (visible_region.freq_start, visible_region.freq_end)
+        )
+        
+        logger.info(f"Auto-recompute at zoom {max(time_zoom, freq_zoom):.1f}x")
+        
+        # Set flag to preserve view during this recompute
+        self._preserve_view_on_update = True
+        self.load_view_data('spectrogram')
+        self._preserve_view_on_update = False
+        
+        # Restore original bounds so user can still navigate the full file
+        if original_bounds:
+            self.spectrogram_canvas.data_bounds = original_bounds
     
     def on_db_range_changed(self, db_min: float, db_max: float):
         """Handle dB range changes."""
@@ -1387,11 +617,8 @@ class MainWindow(QMainWindow):
                 if hasattr(self, 'spectrogram_canvas') and self.spectrogram_canvas.image_visual:
                     # Store dB range for use during data normalization
                     self.spectrogram_canvas.db_range = (db_min, db_max)
+                    self.spectrogram_canvas.update_dynamic_clim()
                     logger.debug(f"Updated spectrogram dB range to [{db_min:.1f}, {db_max:.1f}]")
-                
-                if hasattr(self, 'cepstrogram_canvas') and self.cepstrogram_canvas.image_visual:
-                    self.cepstrogram_canvas.db_range = (db_min, db_max)
-                    logger.debug(f"Updated cepstrogram dB range to [{db_min:.1f}, {db_max:.1f}]")
                 
                 # Refresh current view to apply new dB range
                 self.refresh_current_view()
@@ -1429,15 +656,171 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error updating shader dB range: {e}")
     
+    # ========== Adaptive Spectrogram Methods ==========
+    
+    def on_zoom_recompute_needed(self, view: ViewRegion):
+        """Handle zoom-triggered spectrogram recomputation.
+        
+        Called when the zoom level changed significantly enough to warrant
+        recomputing the spectrogram with optimized FFT parameters.
+        """
+        if not self.current_file:
+            return
+        
+        # Check if adaptive FFT is enabled
+        if not self.controls_widget.is_adaptive_fft_enabled():
+            logger.debug("Adaptive FFT disabled, skipping zoom recompute")
+            return
+        
+        try:
+            # Get optimal parameters for this view
+            window_type = self.controls_widget.get_current_window()
+            optimal_params = self.adaptive_manager.calculate_optimal_params(view, window_type)
+            
+            # Check if we should actually recompute
+            if not self.adaptive_manager.should_recompute(optimal_params):
+                logger.debug("Parameters didn't change significantly, skipping recompute")
+                return
+            
+            logger.info(f"Adaptive recompute: fft={optimal_params.fft_size}, hop={optimal_params.hop_length}")
+            
+            # Update current parameters
+            self.adaptive_manager.current_params = optimal_params
+            
+            # Recompute spectrogram with new parameters
+            self.compute_adaptive_spectrogram(view, optimal_params)
+            
+        except Exception as e:
+            logger.error(f"Error in zoom recompute: {e}")
+    
+    def compute_adaptive_spectrogram(self, view: ViewRegion, params: FFTParameters):
+        """Compute spectrogram with adaptive parameters for the visible region.
+        
+        Args:
+            view: Current visible region
+            params: Optimal FFT parameters
+        """
+        if not self.current_file:
+            return
+        
+        try:
+            self.statusBar().showMessage(f"Recomputing spectrogram (FFT={params.fft_size}, hop={params.hop_length})...")
+            
+            # Get audio data for the visible time range (with some padding)
+            padding = (view.time_end - view.time_start) * 0.1  # 10% padding
+            time_start = max(0, view.time_start - padding)
+            time_end = min(self.audio_loader.duration, view.time_end + padding)
+            
+            sample_rate = self.spectrogram_engine.sample_rate
+            start_sample = int(time_start * sample_rate)
+            end_sample = int(time_end * sample_rate)
+            
+            num_samples = min(end_sample - start_sample, self.audio_loader.total_samples - start_sample)
+            audio_data = self.audio_loader.get_chunk(start_sample, num_samples)
+            
+            if audio_data is None or len(audio_data) < params.fft_size:
+                logger.warning("Insufficient audio data for adaptive computation")
+                return
+            
+            # Compute STFT with adaptive parameters
+            magnitude_db, times = self.spectrogram_engine.batched_fft_engine.compute_stft_batched(
+                audio_data,
+                fft_size=params.fft_size,
+                hop_length=params.hop_length,
+                window=params.window_type,
+                sample_rate=sample_rate,
+                use_gpu=self.spectrogram_engine.use_gpu
+            )
+            
+            frequencies = np.fft.rfftfreq(params.fft_size, 1.0 / sample_rate).astype(np.float32)
+            
+            # Cache the result
+            self.adaptive_manager.cache_spectrogram(view, params, magnitude_db, frequencies, times)
+            
+            # Update display
+            if HAS_VISPY and magnitude_db.size > 0:
+                # Calculate extent
+                frame_duration = params.hop_length / sample_rate
+                time_min = time_start
+                time_max = time_start + len(audio_data) / sample_rate
+                freq_min = 0.0
+                freq_max = sample_rate / 2.0
+                
+                extent = (time_min, time_max, freq_min, freq_max)
+                
+                self.spectrogram_canvas.update_image(magnitude_db, extent)
+                
+                self.statusBar().showMessage(
+                    f"Adaptive spectrogram: {magnitude_db.shape[1]} frames, "
+                    f"FFT={params.fft_size}, hop={params.hop_length}"
+                )
+                
+                logger.info(f"Adaptive spectrogram computed: {magnitude_db.shape}")
+        
+        except Exception as e:
+            logger.error(f"Error computing adaptive spectrogram: {e}")
+            self.statusBar().showMessage(f"Computation error: {str(e)}")
+    
+    def set_quality_mode(self, mode: str):
+        """Set the quality mode for adaptive spectrogram computation.
+        
+        Args:
+            mode: 'fast', 'balanced', or 'quality'
+        """
+        self.adaptive_manager.set_quality_mode(mode)
+        logger.info(f"Quality mode set to: {mode}")
+        
+        # Trigger recompute if we have data
+        if self.current_file:
+            self.refresh_current_view()
+    
+    def set_interpolation(self, mode: str):
+        """Set image interpolation mode.
+        
+        Args:
+            mode: 'nearest', 'bilinear', or 'bicubic'
+        """
+        if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+            self.spectrogram_canvas.set_interpolation(mode)
+            logger.info(f"Interpolation set to: {mode}")
+    
+    def set_freq_scale(self, scale: str):
+        """Set frequency scale mode.
+        
+        Args:
+            scale: 'linear', 'log', or 'mel'
+        """
+        self.current_freq_scale = scale
+        logger.info(f"Frequency scale set to: {scale}")
+        
+        # TODO: Implement log and mel scale transformations
+        # For now, just store the setting - full implementation requires
+        # transforming the frequency axis display
+        
+        if self.current_file:
+            self.refresh_current_view()
+    
+    def set_auto_db_range(self, auto: bool):
+        """Set automatic dB range adjustment.
+        
+        Args:
+            auto: If True, automatically adjust dB range based on visible data
+        """
+        self.auto_db_range_enabled = auto
+        logger.info(f"Auto dB range: {'enabled' if auto else 'disabled'}")
+        
+        if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+            if auto:
+                # Trigger dynamic normalization
+                self.spectrogram_canvas.update_dynamic_clim()
+            # else: manual mode uses the slider values directly
+    
     def on_tab_changed(self, index: int):
         """Handle tab changes - lazy loading trigger."""
         if not self.current_file:
             return
-        
-        tab_names = ['spectrogram', 'cepstrogram', 'fk_transform']
-        if 0 <= index < len(tab_names):
-            view_type = tab_names[index]
-            self.load_view_data(view_type)
+        if index == 0:
+            self.load_view_data('spectrogram')
     
     def load_view_data(self, view_type: str):
         """Load data for specified view type using tile system."""
@@ -1467,6 +850,11 @@ class MainWindow(QMainWindow):
     
     def load_view_data_tiled(self, view_type: str, time_range: tuple, freq_range: tuple) -> bool:
         """Load data using tile system with on-demand tile generation. Returns True if successful."""
+        # DISABLED: Tile system has bugs - using direct computation with downsampling instead
+        # TODO: Fix tile system properly in future
+        logger.debug("Tile system disabled - using direct computation")
+        return False
+        
         try:
             # For large files, use tile-based rendering to avoid OpenGL texture limits
             # Check if we need tiling (file duration > 6 minutes or width > OpenGL limit)
@@ -1512,17 +900,52 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"{view_type.title()} rendered from {len(visible_tiles)} tiles")
                 return True
             
+            # Fallback: if tile rendering failed, try direct rendering with the cached tiles
+            logger.warning("Tile rendering failed, trying direct tile cache rendering")
+            tile_data_list = []
+            tile_time_duration = 60.0
+            current_time = time_range[0]
+            while current_time < time_range[1]:
+                tile_end = min(current_time + tile_time_duration, time_range[1])
+                cached = self.tile_cache.get(view_type, (current_time, tile_end), freq_range, 0)
+                if cached is not None:
+                    tile_data_list.append(cached)
+                current_time = tile_end
+            
+            if tile_data_list and hasattr(self, 'spectrogram_canvas'):
+                success = self.spectrogram_canvas.tiled_renderer.render_tiles(
+                    tile_data_list, time_range, freq_range, tile_time_duration
+                )
+                if success:
+                    self.spectrogram_canvas.set_data_bounds(time_range[0], time_range[1], freq_range[0], freq_range[1])
+                    self.spectrogram_canvas.update()
+                    self.statusBar().showMessage(f"Rendered {len(tile_data_list)} tiles directly")
+                return True
+            
             return False
             
         except Exception as e:
-            logger.error(f"Tile-based loading failed for {view_type}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"Tile-based loading failed for {view_type}: {e}")
             return False
+    
+    def cleanup_gpu_memory(self):
+        """Release GPU memory to prevent memory leaks."""
+        try:
+            import cupy as cp
+            mempool = cp.get_default_memory_pool()
+            pinned_mempool = cp.get_default_pinned_memory_pool()
+            mempool.free_all_blocks()
+            pinned_mempool.free_all_blocks()
+            logger.debug("GPU memory released")
+        except Exception:
+            pass  # CuPy not available or error
     
     def load_view_data_direct(self, view_type: str, time_range: tuple):
         """Fallback to direct computation."""
         logger.info(f"Using direct computation for {view_type}")
+        
+        # Clean up GPU memory before new computation
+        self.cleanup_gpu_memory()
         
         # Get audio data for current time range
         start_sample = int(time_range[0] * self.spectrogram_engine.sample_rate)
@@ -1536,11 +959,9 @@ class MainWindow(QMainWindow):
         
         # Use original direct computation methods
         if view_type == 'spectrogram':
-            self.load_spectrogram_data(audio_data)
-        elif view_type == 'cepstrogram':
-            self.load_cepstrogram_data(audio_data)
-        elif view_type == 'fk_transform':
-            self.load_fk_data(audio_data)
+            self.load_spectrogram_data(audio_data, time_range)
+        else:
+            logger.warning(f"Unsupported view type requested: {view_type}")
     
     def ensure_tiles_exist(self, view_type: str, time_range: tuple, freq_range: tuple, zoom_level: float) -> bool:
         """Ensure tiles exist for the given region, computing them if necessary."""
@@ -1567,7 +988,7 @@ class MainWindow(QMainWindow):
                 
                 current_time = tile_time_end
             
-            logger.info(f"Need {len(tiles_needed)} tiles to cover region {time_range} × {freq_range}")
+            logger.info(f"Need {len(tiles_needed)} tiles to cover region {time_range} Ã— {freq_range}")
             
             # Get audio data for computation
             sample_rate = self.spectrogram_engine.sample_rate
@@ -1617,13 +1038,10 @@ class MainWindow(QMainWindow):
                     logger.error(f"No engine for {view_type}")
                     return False
                 
-                if view_type == 'spectrogram':
-                    tile_data = self._compute_spectrogram_tile_data(audio_chunk, tile_freq_range)
-                elif view_type == 'cepstrogram':
-                    tile_data = self._compute_cepstrogram_tile_data(audio_chunk, tile_freq_range)
-                else:
+                if view_type != 'spectrogram':
                     logger.warning(f"Unsupported view type for tiling: {view_type}")
                     return False
+                tile_data = self._compute_spectrogram_tile_data(audio_chunk, tile_freq_range)
                 
                 if tile_data is None or tile_data.size == 0:
                     logger.warning(f"Empty tile data for {tile_time_range}")
@@ -1640,9 +1058,7 @@ class MainWindow(QMainWindow):
             return len(computed_tiles) > 0
             
         except Exception as e:
-            logger.error(f"Error ensuring tiles exist: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"Error ensuring tiles exist: {e}")
             return False
     
     def _compute_spectrogram_tile_data(self, audio_chunk: np.ndarray, freq_range: tuple) -> np.ndarray:
@@ -1659,118 +1075,97 @@ class MainWindow(QMainWindow):
             logger.error(f"Error computing spectrogram tile: {e}")
             return None
     
-    def _compute_cepstrogram_tile_data(self, audio_chunk: np.ndarray, quefrency_range: tuple) -> np.ndarray:
-        """Compute cepstrogram data for a tile.
-        
-        Args:
-            audio_chunk: Audio data for this tile
-            quefrency_range: Range of quefrencies (in seconds) - currently ignored but could be used for filtering
-        """
-        try:
-            # First get spectrogram
-            magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_chunk)
-            
-            logger.debug(f"Computing cepstrogram tile: spectrogram shape={magnitude_db.shape}")
-            
-            # Then compute cepstrogram (real cepstrum)
-            cepstral = self.cepstrogram_engine.compute_cepstrogram_from_spectrogram(magnitude_db, frequencies)
-            
-            logger.debug(f"Computed cepstrogram tile: shape={cepstral.shape}")
-            
-            # Ensure proper data type and handle any NaN/Inf values
-            cepstral = np.nan_to_num(cepstral, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            return cepstral.astype(np.float32)
-            
-        except Exception as e:
-            logger.error(f"Error computing cepstrogram tile: {e}")
-            return None
     
     def render_tiles_to_display(self, view_type: str, tiles: list, time_range: tuple, freq_range: tuple) -> bool:
-        """Render tiles to the display by stitching them together."""
+        """Render tiles to the display using TiledImageRenderer."""
         try:
             if not tiles:
                 return False
             
-            # For now, stitch tiles together into a single image
-            # TODO: Implement proper texture atlas rendering in Phase 3.5
+            # Get tile data from cache
+            tile_data_list = []
+            for tile in tiles:
+                if isinstance(tile, np.ndarray):
+                    tile_data_list.append(tile)
+                elif hasattr(tile, 'data'):
+                    tile_data_list.append(tile.data)
             
-            # Reconstruct tile grid from time/freq ranges
-            tile_time_duration = 60.0  # Must match ensure_tiles_exist
-            
-            time_start, time_end = time_range
-            freq_start, freq_end = freq_range
-            
-            # Get all tile data by reconstructing the grid
-            # This MUST match the grid structure in ensure_tiles_exist
-            tile_data_list = []  # List of tiles, each covering full frequency spectrum
-            current_time = time_start
-            
-            while current_time < time_end:
-                tile_time_end = min(current_time + tile_time_duration, time_end)
-                
-                # Get tile from cache (full frequency spectrum)
-                tile_data = self.tile_cache.get(
-                    view_type,
-                    (current_time, tile_time_end),
-                    (freq_start, freq_end),  # Full frequency spectrum
-                    resolution_level=0
-                )
-                
-                if tile_data is not None and tile_data.size > 0:
-                    tile_data_list.append(tile_data)
-                else:
-                    logger.warning(f"Missing tile for time={current_time:.1f}-{tile_time_end:.1f}")
-                
-                current_time = tile_time_end
+            if not tile_data_list:
+                # Try to get from tile cache directly
+                tile_time_duration = 60.0  # seconds per tile
+                current_time = time_range[0]
+                while current_time < time_range[1]:
+                    tile_end = min(current_time + tile_time_duration, time_range[1])
+                    cached = self.tile_cache.get(view_type, (current_time, tile_end), freq_range, 0)
+                    if cached is not None:
+                        tile_data_list.append(cached)
+                    current_time = tile_end
             
             if not tile_data_list:
                 logger.warning("No tile data available for rendering")
                 return False
             
-            # Use multi-tile rendering to eliminate downsampling!
-            if view_type == 'spectrogram':
-                success = self.spectrogram_canvas.tiled_renderer.render_tiles(
+            # Use TiledImageRenderer on the canvas
+            if view_type == 'spectrogram' and hasattr(self, 'spectrogram_canvas'):
+                canvas = self.spectrogram_canvas
+                tile_time_duration = 60.0
+                
+                success = canvas.tiled_renderer.render_tiles(
                     tile_data_list, time_range, freq_range, tile_time_duration
                 )
                 
                 if success:
-                    # Hide the single-image visual since we're using tiles
-                    self.spectrogram_canvas.image_visual.visible = False
-                    
-                    # Set data bounds and reset camera
-                    sample_rate = self.spectrogram_engine.sample_rate
-                    self.spectrogram_canvas.set_data_bounds(
-                        time_range[0], time_range[1], 0, sample_rate / 2
-                    )
-                    self.spectrogram_canvas.view.camera.set_range(
-                        x=time_range,
-                        y=(0, sample_rate / 2)
-                    )
-                    self.spectrogram_canvas.update()
-                    
-                return success
-            
-            elif view_type == 'cepstrogram':
-                success = self.cepstrogram_canvas.tiled_renderer.render_tiles(
-                    tile_data_list, time_range, freq_range, tile_time_duration
-                )
-                
-                if success:
-                    self.cepstrogram_canvas.image_visual.visible = False
-                    self.cepstrogram_canvas.set_data_bounds(
-                        time_range[0], time_range[1], 0, tile_data_list[0].shape[0]
-                    )
-                    self.cepstrogram_canvas.update()
-                    
-                return success
+                    # Update canvas data bounds
+                    canvas.set_data_bounds(time_range[0], time_range[1], freq_range[0], freq_range[1])
+                    canvas.view.camera.rect = (time_range[0], freq_range[0],
+                                               time_range[1] - time_range[0], freq_range[1] - freq_range[0])
+                    canvas.update()
+                    return True
             
             return False
+        
+        except Exception as e:
+            logger.exception(f"Error rendering tiles to display: {e}")
+            return False
+    
+    def render_atlas_to_display(self, view_type: str, time_range: tuple, freq_range: tuple) -> bool:
+        """Render atlas data directly to the display."""
+        try:
+            # Get atlas and renderer for this view type
+            atlas_renderer = self.atlas_renderers.get(view_type)
+            if not atlas_renderer:
+                logger.warning(f"No atlas renderer for view type: {view_type}")
+                return False
+            
+            atlas = atlas_renderer.atlas
+            
+            # Get canvas for this view type
+            canvas = getattr(self, f'{view_type}_canvas', None)
+            if not canvas or not hasattr(canvas, 'image_visual'):
+                logger.warning(f"No canvas or image visual for view type: {view_type}")
+                return False
+            
+            # Check if atlas has any data
+            atlas_stats = atlas.get_stats()
+            if atlas_stats['slots_used'] == 0:
+                logger.debug(f"No tiles loaded in {view_type} atlas, skipping render")
+                return False
+            
+            # Update the display with atlas data
+            atlas_renderer.update_display(canvas.image_visual)
+            
+            # Update world coordinates to match the atlas data
+            # For now, use the provided time/freq range
+            canvas.view.camera.rect = (
+                time_range[0], freq_range[0],
+                time_range[1] - time_range[0], freq_range[1] - freq_range[0]
+            )
+            
+            logger.debug(f"Atlas rendering successful for {view_type}: {atlas_stats['slots_used']} tiles displayed")
+            return True
             
         except Exception as e:
-            logger.error(f"Error rendering tiles: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Error rendering atlas to display for {view_type}: {e}")
             return False
     
     def update_spectrogram_display(self, data: np.ndarray, time_range: tuple, freq_range: tuple):
@@ -1799,22 +1194,6 @@ class MainWindow(QMainWindow):
             y=(0, sample_rate / 2)
         )
         self.spectrogram_canvas.update()
-    
-    def update_cepstrogram_display(self, data: np.ndarray, time_range: tuple, freq_range: tuple):
-        """Update cepstrogram display with pre-computed data."""
-        if not HAS_VISPY or not hasattr(self, 'cepstrogram_canvas'):
-            return
-        
-        # Normalize data for display
-        if data.min() < data.max():
-            display_data = (data - data.min()) / (data.max() - data.min())
-        else:
-            display_data = np.zeros_like(data)
-        
-        # Update image
-        self.cepstrogram_canvas.update_image(display_data.astype(np.float32))
-        self.cepstrogram_canvas.set_data_bounds(time_range[0], time_range[1], 0, data.shape[0])
-        self.cepstrogram_canvas.update()
     
     def estimate_zoom_level(self, time_range: tuple, freq_range: tuple) -> float:
         """Estimate zoom level based on visible range."""
@@ -1886,19 +1265,138 @@ class MainWindow(QMainWindow):
         # This ensures we show actual data instead of empty atlas
         pass  # Will be handled by old load_spectrogram_data methods
     
-    def load_spectrogram_data(self, audio_data: np.ndarray):
+    def load_spectrogram_data(self, audio_data: np.ndarray, view_time_range: tuple = None):
         """Load spectrogram data using batched FFT - NO DOWNSAMPLING (use tile system instead)."""
         try:
-            # NOTE: We removed the downsampling logic here!
-            # Large files should use the tile system (load_view_data_tiled) instead
-            # This method is only called for files that fit in OpenGL texture limits
+            # Check if cached spectrogram covers this region
+            # Skip cache during auto-recompute (we want higher resolution)
+            preserve_view = getattr(self, '_preserve_view_on_update', False)
+            if not preserve_view:
+                cache = self.spectrogram_cache
+                if (cache['data'] is not None and 
+                    cache['time_range'] is not None and
+                    view_time_range is not None):
+                    
+                    cached_start, cached_end = cache['time_range']
+                    req_start, req_end = view_time_range
+                    
+                    # Check if cached region EXACTLY matches (not just contains)
+                    time_match = abs(cached_start - req_start) < 0.1 and abs(cached_end - req_end) < 0.1
+                    if (time_match and cache['fft_size'] == self.spectrogram_engine.fft_size):
+                        
+                        logger.info(f"Using cached spectrogram (exact match {req_start:.1f}-{req_end:.1f}s)")
+                        self.spectrogram_canvas.update_image(cache['data'], cache['extent'])
+                        return
+            
+            # Show progress bar
+            self.status_widget.show_progress("Computing spectrogram")
+            self.status_widget.update_progress(10)
+            QApplication.processEvents()  # Update UI
             
             # Compute STFT using optimized batched FFT at FULL RESOLUTION
-            magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_data)
+            base_fft = self.spectrogram_engine.fft_size
+            base_hop = self.spectrogram_engine.hop_length
+            sample_rate = float(getattr(self.spectrogram_engine, "sample_rate", 44100))
+            
+            # Adaptive FFT size based on frequency zoom level
+            # When zoomed in on frequency, use larger FFT for better frequency resolution
+            if view_time_range and hasattr(self, 'spectrogram_canvas'):
+                time_zoom, freq_zoom = self.spectrogram_canvas.get_zoom_level()
+                
+                # Scale FFT size based on frequency zoom (up to 4x)
+                if freq_zoom > 2.0:
+                    fft_scale = min(4, int(freq_zoom / 2))
+                    adaptive_fft = min(16384, base_fft * fft_scale)
+                    if adaptive_fft != base_fft:
+                        logger.info(f"Adaptive FFT: {base_fft} -> {adaptive_fft} (freq zoom {freq_zoom:.1f}x)")
+                        base_fft = adaptive_fft
+            
+            # LOD: Calculate optimal hop length based on:
+            # 1. Canvas width (no need for more frames than pixels)
+            # 2. OpenGL texture limit (16384)
+            # 3. User's base hop setting (minimum quality)
+            
+            n_samples = len(audio_data)
+            max_texture_size = 16384
+            
+            if view_time_range:
+                time_span = max(view_time_range[1] - view_time_range[0], 1e-6)
+            else:
+                time_span = n_samples / sample_rate if sample_rate > 0 else 1.0
+            
+            canvas_width = max(400, getattr(self.spectrogram_canvas.native, "width", lambda: 800)())
+            if callable(canvas_width):
+                canvas_width = max(400, canvas_width())
+            
+            # Calculate the minimum hop needed to exceed OpenGL limit
+            min_hop_for_texture = max(1, n_samples // (max_texture_size - 100))
+            
+            # For quality: use user's base_hop as maximum (highest quality)
+            # But also compute what hop would give us 4x canvas resolution
+            target_frames = canvas_width * 4  # 4x oversampling for excellent quality
+            hop_for_canvas = max(1, n_samples // target_frames)
+            
+            # Use the SMALLER hop (higher resolution) but respect texture limits
+            # Priority: user quality setting > canvas-based > texture limit
+            effective_hop = max(
+                min_hop_for_texture,  # Must not exceed OpenGL limit
+                min(base_hop, hop_for_canvas)  # Use best quality that makes sense
+            )
+            
+            expected_frames = 1 + (n_samples - base_fft) // effective_hop
+            logger.info(f"LOD: samples={n_samples}, time_span={time_span:.2f}s, "
+                       f"canvas={canvas_width}, hop={effective_hop} -> {expected_frames} frames")
+            
+            # Update progress before FFT
+            self.status_widget.update_progress(30)
+            QApplication.processEvents()
+            
+            # Use batched FFT engine directly with adaptive hop
+            magnitude_db, times = self.spectrogram_engine.batched_fft_engine.compute_stft_batched(
+                audio_data,
+                fft_size=base_fft,
+                hop_length=effective_hop,
+                window=self.spectrogram_engine.window_type,
+                sample_rate=sample_rate,
+                use_gpu=self.spectrogram_engine.use_gpu
+            )
+            
+            # Update progress after FFT
+            self.status_widget.update_progress(70)
+            QApplication.processEvents()
+            
+            frequencies = np.fft.rfftfreq(base_fft, 1.0 / sample_rate).astype(np.float32)
             
             logger.info(f"Computed spectrogram: {magnitude_db.shape} (no downsampling)")
             
             if HAS_VISPY and magnitude_db.size > 0:
+                frame_duration = effective_hop / sample_rate if sample_rate > 0 else 0.0
+                
+                # Determine frequency range from STFT output
+                if frequencies is not None and len(frequencies) > 0:
+                    freq_min = float(np.nanmin(frequencies))
+                    freq_max = float(np.nanmax(frequencies))
+                    if not np.isfinite(freq_min):
+                        freq_min = 0.0
+                    if not np.isfinite(freq_max):
+                        freq_max = sample_rate / 2.0
+                else:
+                    freq_min = 0.0
+                    freq_max = sample_rate / 2.0
+                
+                # Default time range before refinement
+                if view_time_range:
+                    time_offset = view_time_range[0]
+                else:
+                    time_offset = 0.0
+                
+                if sample_rate > 0:
+                    time_min = time_offset
+                    time_max = time_offset + len(audio_data) / sample_rate
+                else:
+                    time_min = time_offset
+                    time_max = time_offset + float(magnitude_db.shape[1])
+                
                 # Check if result exceeds OpenGL texture limits
                 max_texture_size = 16384
                 
@@ -1916,59 +1414,65 @@ class MainWindow(QMainWindow):
                     
                     logger.info(f"Downsampled: {magnitude_db.shape[1]} frames")
                 
+                # Determine accurate time range using STFT times (center of frames)
+                if times is not None and len(times) > 0:
+                    time_min = float(np.nanmin(times)) + time_offset
+                    time_max = float(np.nanmax(times)) + time_offset + frame_duration
+                    if not np.isfinite(time_min):
+                        time_min = time_offset
+                    if not np.isfinite(time_max):
+                        time_max = time_offset + (len(audio_data) / sample_rate if sample_rate > 0 else float(magnitude_db.shape[1]))
+                # Ensure bounds are sane
+                if time_max <= time_min:
+                    time_max = time_min + max(frame_duration, 1e-6)
+                if freq_max <= freq_min:
+                    freq_max = freq_min + sample_rate / (2 * max(1, magnitude_db.shape[0])) if sample_rate > 0 else freq_min + 1.0
+                
+                # Update progress before display update
+                self.status_widget.update_progress(90)
+                QApplication.processEvents()
+                
                 # Update display
-                extent = (self.current_view_range[0][0], self.current_view_range[0][1],
-                         self.current_view_range[1][0], self.current_view_range[1][1])
-                self.spectrogram_canvas.update_image(magnitude_db, extent)
+                extent = (time_min, time_max, freq_min, freq_max)
+                preserve_view = getattr(self, '_preserve_view_on_update', False)
+                self.spectrogram_canvas.update_image(magnitude_db, extent, preserve_view=preserve_view)
                 frames = magnitude_db.shape[1]
                 
+                # Hide progress and show success
+                self.status_widget.hide_progress()
                 self.statusBar().showMessage(f"Spectrogram ready ({frames} frames)")
+                
+                # Track current view range using accurate physical axes
+                self.current_view_range = ((time_min, time_max), (freq_min, freq_max))
+                
+                # Update cache
+                self.spectrogram_cache = {
+                    'time_range': (time_min, time_max),
+                    'freq_range': (freq_min, freq_max),
+                    'fft_size': base_fft,
+                    'hop_length': effective_hop,
+                    'data': magnitude_db.copy(),
+                    'extent': extent
+                }
         except Exception as e:
-            logger.error(f"Spectrogram computation error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"Spectrogram computation error: {e}")
+            self.status_widget.hide_progress()
             self.statusBar().showMessage(f"Spectrogram error: {str(e)}")
     
-    def load_cepstrogram_data(self, audio_data: np.ndarray):
-        """Load cepstrogram data."""
-        try:
-            # First compute spectrogram
-            magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_data)
-            
-            logger.info(f"Computing cepstrogram from spectrogram: {magnitude_db.shape}")
-            
-            # Clear mel filterbank cache to rebuild with correct dimensions
-            self.cepstrogram_engine._mel_filterbank = None
-            
-            # Then compute cepstrogram from it
-            cepstral = self.cepstrogram_engine.compute_cepstrogram_from_spectrogram(
-                magnitude_db, frequencies)
-            
-            logger.info(f"Computed cepstrogram: {cepstral.shape}")
-            
-            if HAS_VISPY and cepstral.size > 0:
-                extent = (self.current_view_range[0][0], self.current_view_range[0][1],
-                         0, cepstral.shape[0])  # Quefrency range
-                self.cepstrogram_canvas.update_image(cepstral, extent)
-                frames = cepstral.shape[1]
-                self.statusBar().showMessage(f"Cepstrogram ready ({frames} frames)")
-        except Exception as e:
-            logger.error(f"Cepstrogram computation error: {e}")
-            import traceback
-            traceback.print_exc()
-            self.statusBar().showMessage(f"Cepstrogram error: {str(e)}")
-    
-    def load_fk_data(self, audio_data: np.ndarray):
-        """Load F-K transform data."""
-        # F-K transform is complex and memory-intensive
-        # Disable for now - will be optimized in Phase 5
-        logger.info("F-K transform disabled (Phase 5 optimization pending)")
-        self.statusBar().showMessage("F-K transform - optimization in progress")
-    
     def refresh_current_view(self):
-        """Refresh the currently active view."""
-        current_index = self.tab_widget.currentIndex()
-        self.on_tab_changed(current_index)
+        """Refresh the currently active view - always compute full file."""
+        if not self.current_file:
+            return
+        
+        # Always compute full file to avoid alignment issues
+        # The LOD system will choose appropriate resolution
+        duration = self.audio_loader.duration
+        sample_rate = self.spectrogram_engine.sample_rate
+        
+        self.current_view_range = ((0.0, duration), (0.0, sample_rate / 2))
+        logger.info(f"Recomputing full file: {duration:.1f}s")
+        
+        self.load_view_data('spectrogram')
     
     def zoom_to_fit(self):
         """Zoom to fit all data."""
@@ -2023,19 +1527,10 @@ class MainWindow(QMainWindow):
             return
         
         try:
-            # Get current tab
-            current_index = self.tab_widget.currentIndex()
-            tab_names = ['spectrogram', 'cepstrogram', 'fk_transform']
-            view_type = tab_names[current_index] if 0 <= current_index < len(tab_names) else 'spectrogram'
+            view_type = 'spectrogram'
             
             # Get canvas
-            canvas = None
-            if view_type == 'spectrogram' and hasattr(self, 'spectrogram_canvas'):
-                canvas = self.spectrogram_canvas
-            elif view_type == 'cepstrogram' and hasattr(self, 'cepstrogram_canvas'):
-                canvas = self.cepstrogram_canvas
-            elif view_type == 'fk_transform' and hasattr(self, 'fk_canvas'):
-                canvas = self.fk_canvas
+            canvas = getattr(self, 'spectrogram_canvas', None)
             
             if not canvas or not HAS_VISPY:
                 QMessageBox.warning(self, "Export Warning", "No valid view to export.")
@@ -2073,10 +1568,7 @@ class MainWindow(QMainWindow):
             return
         
         try:
-            # Get current tab and data
-            current_index = self.tab_widget.currentIndex()
-            tab_names = ['spectrogram', 'cepstrogram', 'fk_transform']
-            view_type = tab_names[current_index] if 0 <= current_index < len(tab_names) else 'spectrogram'
+            view_type = 'spectrogram'
             
             # Get the last computed data for this view
             data = self.get_current_view_data(view_type)
@@ -2108,10 +1600,7 @@ class MainWindow(QMainWindow):
             return
         
         try:
-            # Get current tab and data
-            current_index = self.tab_widget.currentIndex()
-            tab_names = ['spectrogram', 'cepstrogram', 'fk_transform']
-            view_type = tab_names[current_index] if 0 <= current_index < len(tab_names) else 'spectrogram'
+            view_type = 'spectrogram'
             
             data = self.get_current_view_data(view_type)
             
@@ -2132,7 +1621,7 @@ class MainWindow(QMainWindow):
                 # Convert 2D array to DataFrame
                 if data.ndim == 2:
                     df = pd.DataFrame(data)
-                    df.index.name = 'frequency_bin' if view_type == 'spectrogram' else 'coefficient'
+                    df.index.name = 'frequency_bin'
                     df.columns.name = 'time_frame'
                 else:
                     df = pd.DataFrame(data.flatten(), columns=[view_type])
@@ -2172,15 +1661,6 @@ class MainWindow(QMainWindow):
             if view_type == 'spectrogram':
                 magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_data)
                 return magnitude_db
-            elif view_type == 'cepstrogram':
-                magnitude_db, frequencies, times = self.spectrogram_engine.compute_stft_batched(audio_data)
-                # Clear cache to rebuild with correct dimensions
-                self.cepstrogram_engine._mel_filterbank = None
-                cepstral = self.cepstrogram_engine.compute_cepstrogram_from_spectrogram(magnitude_db, frequencies)
-                return cepstral
-            elif view_type == 'fk_transform':
-                # F-K transform disabled for now
-                return None
             
             return None
             
@@ -2465,6 +1945,46 @@ class MainWindow(QMainWindow):
             }
         """)
     
+    def show_keyboard_shortcuts(self):
+        """Show keyboard shortcuts help dialog."""
+        shortcuts_text = """
+<h2>Keyboard Shortcuts</h2>
+
+<h3>Navigation</h3>
+<table>
+<tr><td><b>Scroll</b></td><td>Zoom both axes</td></tr>
+<tr><td><b>Shift + Scroll</b></td><td>Zoom time axis only</td></tr>
+<tr><td><b>Ctrl + Scroll</b></td><td>Zoom frequency axis only</td></tr>
+<tr><td><b>Drag</b></td><td>Pan view</td></tr>
+<tr><td><b>R</b></td><td>Reset zoom to show all</td></tr>
+</table>
+
+<h3>Keyboard Zoom</h3>
+<table>
+<tr><td><b>x</b></td><td>Zoom in time axis</td></tr>
+<tr><td><b>X</b></td><td>Zoom out time axis</td></tr>
+<tr><td><b>y</b></td><td>Zoom in frequency axis</td></tr>
+<tr><td><b>Y</b></td><td>Zoom out frequency axis</td></tr>
+</table>
+
+<h3>Measurement</h3>
+<table>
+<tr><td><b>M</b></td><td>Toggle measurement mode</td></tr>
+<tr><td><b>Click</b></td><td>Set start/end point (in measure mode)</td></tr>
+<tr><td><b>ESC</b></td><td>Clear measurement</td></tr>
+</table>
+
+<h3>General</h3>
+<table>
+<tr><td><b>Ctrl+O</b></td><td>Open audio file</td></tr>
+<tr><td><b>F5</b></td><td>Refresh / Recompute</td></tr>
+<tr><td><b>Ctrl+0</b></td><td>Zoom to fit</td></tr>
+<tr><td><b>Ctrl+E</b></td><td>Export as image</td></tr>
+<tr><td><b>F1</b></td><td>Show this help</td></tr>
+</table>
+"""
+        QMessageBox.information(self, "Keyboard Shortcuts", shortcuts_text)
+    
     def closeEvent(self, event):
         """Handle application close."""
         logger.info("Application closing - cleaning up resources...")
@@ -2477,8 +1997,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'task_manager'):
             self.task_manager.shutdown(wait=True)
         
-        # Clear tile cache
+        # Shutdown tile manager and progressive loader
         if hasattr(self, 'tile_manager'):
+            self.tile_manager.shutdown()
             self.tile_manager.clear()
         
         # Clear old cache manager
@@ -2496,6 +2017,36 @@ class MainWindow(QMainWindow):
         
         logger.info("Application closed cleanly")
         event.accept()
+    
+    def on_file_selected_from_playlist(self, file_path: str):
+        """Handle file selection from playlist."""
+        if file_path != self.current_file:
+            self.load_audio_file(file_path)
+    
+    def on_files_dropped(self, file_paths: list):
+        """Handle files dropped onto playlist."""
+        if file_paths:
+            # Load the first dropped file
+            self.load_audio_file(file_paths[0])
+    
+    def get_current_view_type(self) -> str:
+        """Get the currently selected view type."""
+        return 'spectrogram'
+    
+    def clear_all_displays(self):
+        """Clear all visualization displays."""
+        try:
+            if hasattr(self, 'spectrogram_canvas') and hasattr(self.spectrogram_canvas, 'image_visual'):
+                self.spectrogram_canvas.image_visual.set_data(None)
+                self.spectrogram_canvas.update()
+        except Exception as e:
+            logger.debug(f"Error clearing displays: {e}")
+    
+    def get_current_file_data(self):
+        """Get the current file's audio data."""
+        if not self.current_file or self.current_file not in self.file_data:
+            return None
+        return self.file_data[self.current_file]
 
 def main():
     """Main application entry point."""
