@@ -5,6 +5,8 @@ import sys
 import os
 import logging
 import numpy as np
+from typing import Optional
+from pathlib import Path
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                               QWidget, QToolBar, QLabel, QPushButton, QFileDialog, 
@@ -39,6 +41,24 @@ from .vispy_canvas import VisPyCanvas
 from .controls_widget import ControlsWidget
 from .status_widget import StatusWidget
 from .multi_file_manager import PlaylistWidget
+from .annotation_manager import AnnotationManager
+from .annotation_table import AnnotationTableWidget
+from .annotation_renderer import AnnotationRenderer
+from .annotation_data import Annotation
+from .interaction_manager import InteractionManager, CoordinateMapper
+from .cutout_dialog import CutoutDialog
+from .spectrum_dialog import SpectrumDialog
+from .measurement_panel import MeasurementPanel
+from ..core.filter_manager import FilterManager
+from ..core.cutout_analyzer import (
+    extract_spectrogram_cutout, 
+    normalize_cutout, 
+    save_cutout_image, 
+    save_cutout_numpy, 
+    write_cutout_metadata
+)
+from PySide6.QtWidgets import QMenu
+from PySide6.QtGui import QCursor
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +142,17 @@ class MainWindow(QMainWindow):
         # Default view range (will be updated when file is loaded)
         self.current_view_range = ((0.0, 10.0), (0.0, 22050.0))  # (time, freq)
         
+        # Annotation system
+        self.annotation_manager = AnnotationManager()
+        self.annotation_renderer = None  # Will be initialized after canvas creation
+        self.selected_annotation_id = None
+        
+        # Measurement panel (floating window)
+        self.measurement_panel = None
+        
+        # Filter manager
+        self.filter_manager = FilterManager()
+        
         # Spectrogram cache to avoid recomputation
         self.spectrogram_cache = {
             'time_range': None,
@@ -158,8 +189,13 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         
-        # Controls at the top
+        # Add compact toolbar at the top
+        self.setup_compact_toolbar()
+        main_layout.addWidget(self.toolbar)
+        
+        # Minimal controls at the top (hidden by default, toggle with Ctrl+P)
         self.controls_widget = ControlsWidget()
+        self.controls_widget.setVisible(False)  # Hidden by default
         main_layout.addWidget(self.controls_widget)
         
         # Container for visualization - glassmorphic card style
@@ -199,6 +235,18 @@ class MainWindow(QMainWindow):
             self.spectrogram_canvas = VisPyCanvas('spectrogram')
             self.spectrogram_canvas.native.setMinimumSize(600, 400)
             spec_layout.addWidget(self.spectrogram_canvas.native)
+            
+            # Initialize annotation renderer
+            self.annotation_renderer = AnnotationRenderer(self.spectrogram_canvas.view)
+            self.spectrogram_canvas.set_annotation_renderer(self.annotation_renderer)
+            
+            # Set annotation callbacks
+            self.spectrogram_canvas.set_annotation_callbacks(
+                on_created=self.on_annotation_created,
+                on_clicked=self.on_annotation_clicked,
+                on_context_menu=self.on_annotation_context_menu
+            )
+            
             center_layout.addWidget(spec_container, 1)
             
             # Connect callbacks for status bar updates
@@ -210,8 +258,39 @@ class MainWindow(QMainWindow):
             
             # Set measurement mode callback
             self.spectrogram_canvas.set_measurement_callback(self.on_measurement_mode_changed)
+            self.spectrogram_canvas.set_measurement_completed_callback(self.on_measurement_completed)
+            
+            # Set curve callback
+            self.spectrogram_canvas.set_curve_callback(self.on_curve_completed)
+            
+            # Initialize InteractionManager for coordinate mapping
+            self.interaction_manager = InteractionManager(
+                canvas=self.spectrogram_canvas,
+                sample_rate=44100,  # Will be updated when file loads
+                hop_length=512,
+                fft_size=4096
+            )
+            # Connect ROI selection signal
+            self.interaction_manager.roi_selected.connect(self.on_roi_selected_wrapper)
+        
+        # Add annotation table below the spectrogram
+        self.annotation_table = AnnotationTableWidget()
+        self.annotation_table.setMaximumHeight(250)
+        self.annotation_table.setMinimumHeight(150)
+        
+        # Connect annotation table signals
+        self.annotation_table.annotation_selected.connect(self.on_table_annotation_selected)
+        self.annotation_table.annotation_deleted.connect(self.on_table_annotation_deleted)
+        self.annotation_table.annotation_updated.connect(self.on_table_annotation_updated)
+        self.annotation_table.annotation_visibility_changed.connect(self.on_annotation_visibility_changed)
+        self.annotation_table.doppler_visibility_changed.connect(self.on_doppler_visibility_changed)
+        
+        # Add table to center layout (below spectrogram)
+        if HAS_VISPY:
+            center_layout.addWidget(self.annotation_table)
         else:
             center_layout.addWidget(QLabel("VisPy not available"))
+        
         main_layout.addWidget(viz_container)
         
         # Connect signals
@@ -227,7 +306,57 @@ class MainWindow(QMainWindow):
         """Connect signals from playlist widget."""
         self.playlist_widget.file_selected.connect(self.on_file_selected_from_playlist)
         self.playlist_widget.files_dropped.connect(self.on_files_dropped)
+        
+    def on_export_project_csv(self):
+        """Export summary CSV for the whole project folder."""
+        if not self.current_file:
+            QMessageBox.warning(self, "No File", "Please load a file first to determine the project folder.")
+            return
+            
+        folder = os.path.dirname(self.current_file)
+        default_name = os.path.join(folder, "project_doppler_summary.csv")
+        
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Project Summary CSV", default_name, "CSV Files (*.csv)"
+        )
+        
+        if path:
+            success = self.annotation_manager.export_project_csv(folder, path)
+            if success:
+                QMessageBox.information(self, "Export Successful", f"Summary saved to:\n{path}")
+            else:
+                QMessageBox.critical(self, "Export Failed", "Could not generate the CSV report.")
     
+    def on_table_annotation_selected(self, annotation_id: int):
+        """Handle selection of annotation in table."""
+        if not HAS_VISPY:
+            return
+            
+        self.selected_annotation_id = annotation_id
+        
+        # Highlight in renderer
+        if self.annotation_renderer:
+            self.annotation_renderer.select_annotation(annotation_id)
+        
+        # Zoom to annotation? Optional.
+        # ann = self.annotation_manager.get_annotation(annotation_id)
+        # if ann:
+        #    self.spectrogram_canvas.zoom_to_rect(...)
+
+        # NEW: Load curve points if they exist
+        ann = self.annotation_manager.get_annotation(annotation_id)
+        if ann:
+            # Load curve points to canvas
+            if ann.points:
+                self.spectrogram_canvas.set_curve_points(ann.points)
+                # Also display results in widget
+                if ann.doppler_result:
+                     # Doppler results exist - just display in status or log
+                     logger.info(f"Annotation {annotation_id} has Doppler data: "
+                               f"v={ann.doppler_result.get('velocity', 0)*3.6:.1f} km/h")
+            else:
+                self.spectrogram_canvas.clear_curve()
+
     def setup_menu_bar(self):
         """Setup the menu bar."""
         menubar = self.menuBar()
@@ -254,9 +383,19 @@ class MainWindow(QMainWindow):
         export_data_action.triggered.connect(self.export_data_as_npy)
         export_menu.addAction(export_data_action)
         
-        export_csv_action = QAction("Export Data as CSV...", self)
-        export_csv_action.triggered.connect(self.export_data_as_csv)
-        export_menu.addAction(export_csv_action)
+        export_spectrogram_csv_action = QAction("Export Spectrogram as CSV...", self)
+        export_spectrogram_csv_action.triggered.connect(self.export_spectrogram_as_csv)
+        export_menu.addAction(export_spectrogram_csv_action)
+        
+        export_ann_csv_action = QAction("Export Annotations as CSV...", self)
+        export_ann_csv_action.triggered.connect(self.export_annotations_as_csv)
+        export_menu.addAction(export_ann_csv_action)
+        
+        export_menu.addSeparator()
+        
+        export_all_cutouts_action = QAction("Export All Cutouts...", self)
+        export_all_cutouts_action.triggered.connect(self.export_all_cutouts)
+        export_menu.addAction(export_all_cutouts_action)
         
         file_menu.addSeparator()
         
@@ -273,6 +412,28 @@ class MainWindow(QMainWindow):
         zoom_fit_action.triggered.connect(self.zoom_to_fit)
         view_menu.addAction(zoom_fit_action)
         
+        view_menu.addSeparator()
+        
+        self.show_annotations_action = QAction("Show Annotations", self)
+        self.show_annotations_action.setCheckable(True)
+        self.show_annotations_action.setChecked(True)
+        self.show_annotations_action.triggered.connect(self.toggle_annotations_visibility)
+        view_menu.addAction(self.show_annotations_action)
+        
+        view_menu.addSeparator()
+        
+        # Measurement Panel
+        measurement_panel_action = QAction("Show Measurement Panel", self)
+        measurement_panel_action.setShortcut("Ctrl+M")
+        measurement_panel_action.triggered.connect(self.open_measurement_panel)
+        view_menu.addAction(measurement_panel_action)
+        
+        # Toggle Controls Panel
+        toggle_controls_action = QAction("Toggle Controls Panel", self)
+        toggle_controls_action.setShortcut("Ctrl+P")
+        toggle_controls_action.triggered.connect(lambda: self.controls_widget.setVisible(not self.controls_widget.isVisible()))
+        view_menu.addAction(toggle_controls_action)
+        
         # Analysis menu
         analysis_menu = menubar.addMenu("Analysis")
         
@@ -280,6 +441,36 @@ class MainWindow(QMainWindow):
         refresh_action.setShortcut("F5")
         refresh_action.triggered.connect(self.refresh_current_view)
         analysis_menu.addAction(refresh_action)
+        
+        # Annotation menu
+        annotation_menu = menubar.addMenu("Annotations")
+        
+        self.toggle_annotation_action = QAction("Enable Annotation Mode", self)
+        self.toggle_annotation_action.setCheckable(True)
+        self.toggle_annotation_action.setShortcut("A")
+        self.toggle_annotation_action.triggered.connect(self.toggle_annotation_mode)
+        annotation_menu.addAction(self.toggle_annotation_action)
+        
+        annotation_menu.addSeparator()
+        
+        save_annotations_action = QAction("Save Annotations...", self)
+        save_annotations_action.setShortcut("Ctrl+S")
+        save_annotations_action.triggered.connect(self.save_annotations)
+        annotation_menu.addAction(save_annotations_action)
+        
+        load_annotations_action = QAction("Load Annotations...", self)
+        load_annotations_action.triggered.connect(self.load_annotations)
+        annotation_menu.addAction(load_annotations_action)
+        
+        annotation_menu.addSeparator()
+        
+        delete_selected_action = QAction("Delete Selected Annotation", self)
+        delete_selected_action.setShortcut("Delete")
+        delete_selected_action.triggered.connect(self.delete_selected_annotation)
+        annotation_menu.addAction(delete_selected_action)
+        
+        # Filters menu
+        self.setup_filter_menu(menubar)
         
         # Help menu
         help_menu = menubar.addMenu("Help")
@@ -289,85 +480,245 @@ class MainWindow(QMainWindow):
         shortcuts_action.triggered.connect(self.show_keyboard_shortcuts)
         help_menu.addAction(shortcuts_action)
     
-    def setup_zoom_toolbar(self):
-        """Setup compact zoom navigation toolbar."""
-        zoom_toolbar = QToolBar("Navigation")
-        zoom_toolbar.setMovable(False)
-        self.addToolBar(Qt.TopToolBarArea, zoom_toolbar)
+    def setup_filter_menu(self, menubar):
+        """Setup the Filters menu."""
+        filter_menu = menubar.addMenu("Filters")
         
-        # Reset zoom
-        reset_btn = QPushButton("Reset")
-        reset_btn.setToolTip("Reset zoom to show all data (R)")
-        reset_btn.setFixedWidth(55)
-        reset_btn.clicked.connect(self.zoom_to_fit)
-        zoom_toolbar.addWidget(reset_btn)
+        apply_meijering_action = QAction("Apply Meijering Filter", self)
+        apply_meijering_action.triggered.connect(self.apply_meijering_filter)
+        filter_menu.addAction(apply_meijering_action)
         
-        zoom_toolbar.addSeparator()
+        filter_menu.addSeparator()
         
-        # Time axis zoom
-        time_label = QLabel(" Time: ")
-        time_label.setStyleSheet("color: rgba(255,255,255,0.7);")
-        zoom_toolbar.addWidget(time_label)
+        self.undo_filter_action = QAction("Undo Filter", self)
+        self.undo_filter_action.setShortcut("Ctrl+Z")
+        self.undo_filter_action.triggered.connect(self.undo_filter)
+        self.undo_filter_action.setEnabled(False)
+        filter_menu.addAction(self.undo_filter_action)
+
+    def setup_compact_toolbar(self):
+        """Setup a compact toolbar with essential controls."""
+        from PySide6.QtWidgets import QToolBar, QWidget, QLabel, QSizePolicy
         
-        zoom_time_in = QPushButton("+")
-        zoom_time_in.setToolTip("Zoom in time (Shift+Scroll)")
-        zoom_time_in.setFixedWidth(28)
-        zoom_time_in.clicked.connect(lambda: self.zoom_axis('time', 'in'))
-        zoom_toolbar.addWidget(zoom_time_in)
+        self.toolbar = QToolBar()
+        self.toolbar.setMovable(False)
+        self.toolbar.setMaximumHeight(32)
+        self.toolbar.setStyleSheet("""
+            QToolBar {
+                background: rgba(30, 30, 40, 0.9);
+                border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+                padding: 2px;
+            }
+            QToolButton {
+                background: transparent;
+                color: #B0B0B0;
+                border: none;
+                padding: 4px 8px;
+                margin: 0 2px;
+                border-radius: 4px;
+            }
+            QToolButton:hover {
+                background: rgba(255, 255, 255, 0.1);
+                color: white;
+            }
+            QToolButton:pressed {
+                background: rgba(255, 255, 255, 0.2);
+            }
+        """)
         
-        zoom_time_out = QPushButton("-")
-        zoom_time_out.setToolTip("Zoom out time")
-        zoom_time_out.setFixedWidth(28)
-        zoom_time_out.clicked.connect(lambda: self.zoom_axis('time', 'out'))
-        zoom_toolbar.addWidget(zoom_time_out)
+        # Settings button - opens settings menu
+        settings_action = QAction("⚙ Settings", self)
+        settings_action.triggered.connect(self.show_settings_menu)
+        self.toolbar.addAction(settings_action)
         
-        zoom_toolbar.addSeparator()
+        self.toolbar.addSeparator()
         
-        # Frequency axis zoom
-        freq_label = QLabel(" Freq: ")
-        freq_label.setStyleSheet("color: rgba(255,255,255,0.7);")
-        zoom_toolbar.addWidget(freq_label)
+        # Color palette button
+        colors_action = QAction("🎨 Colors", self)
+        colors_action.triggered.connect(self.show_colormap_menu)
+        self.toolbar.addAction(colors_action)
         
-        zoom_freq_in = QPushButton("+")
-        zoom_freq_in.setToolTip("Zoom in frequency (Ctrl+Scroll)")
-        zoom_freq_in.setFixedWidth(28)
-        zoom_freq_in.clicked.connect(lambda: self.zoom_axis('freq', 'in'))
-        zoom_toolbar.addWidget(zoom_freq_in)
+        # View mode button
+        view_action = QAction("👁 View", self)
+        view_action.triggered.connect(self.show_view_menu)
+        self.toolbar.addAction(view_action)
         
-        zoom_freq_out = QPushButton("-")
-        zoom_freq_out.setToolTip("Zoom out frequency")
-        zoom_freq_out.setFixedWidth(28)
-        zoom_freq_out.clicked.connect(lambda: self.zoom_axis('freq', 'out'))
-        zoom_toolbar.addWidget(zoom_freq_out)
+        self.toolbar.addSeparator()
         
-        zoom_toolbar.addSeparator()
+        # Annotation tools
+        annotation_action = QAction("📝 Annotations", self)
+        annotation_action.setCheckable(True)
+        annotation_action.triggered.connect(lambda checked: self.spectrogram_canvas.set_annotation_mode(checked))
+        self.toolbar.addAction(annotation_action)
         
-        # Both axes zoom
-        both_label = QLabel(" Both: ")
-        both_label.setStyleSheet("color: rgba(255,255,255,0.7);")
-        zoom_toolbar.addWidget(both_label)
+        # Measurement tool
+        measure_action = QAction("📏 Measure", self)
+        measure_action.setCheckable(True)
+        measure_action.triggered.connect(lambda checked: self.spectrogram_canvas.toggle_measurement_mode())
+        self.toolbar.addAction(measure_action)
         
-        zoom_both_in = QPushButton("+ +")
-        zoom_both_in.setToolTip("Zoom in both axes (Scroll)")
-        zoom_both_in.setFixedWidth(35)
-        zoom_both_in.clicked.connect(lambda: self.zoom_axis('both', 'in'))
-        zoom_toolbar.addWidget(zoom_both_in)
-        
-        zoom_both_out = QPushButton("- -")
-        zoom_both_out.setToolTip("Zoom out both axes")
-        zoom_both_out.setFixedWidth(35)
-        zoom_both_out.clicked.connect(lambda: self.zoom_axis('both', 'out'))
-        zoom_toolbar.addWidget(zoom_both_out)
-        
-        # Add stretch spacer
+        # Spacer to push info to the right
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        zoom_toolbar.addWidget(spacer)
+        self.toolbar.addWidget(spacer)
         
-        # Navigation hints
-        hints = QLabel("Pan: drag | Zoom: scroll | Time zoom: Shift+scroll | Freq zoom: Ctrl+scroll")
-        hints.setStyleSheet("color: rgba(255,255,255,0.4); font-size: 10px; padding-right: 10px;")
-        zoom_toolbar.addWidget(hints)
+        # Info label
+        self.toolbar_info = QLabel("Ready")
+        self.toolbar_info.setStyleSheet("color: #888; padding: 0 10px;")
+        self.toolbar.addWidget(self.toolbar_info)
+        
+    def show_settings_menu(self):
+        """Show settings menu with FFT parameters."""
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: rgba(30, 30, 40, 0.95);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu::item {
+                color: #B0B0B0;
+                padding: 6px 20px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background: rgba(100, 100, 255, 0.3);
+                color: white;
+            }
+        """)
+        
+        # FFT Size submenu
+        fft_menu = menu.addMenu("FFT Size")
+        current_fft = getattr(self.spectrogram_engine, 'fft_size', 4096)
+        for size in [1024, 2048, 4096, 8192, 16384]:
+            action = fft_menu.addAction(f"{size}" + (" ✓" if size == current_fft else ""))
+            action.triggered.connect(lambda checked, s=size: self.set_fft_size(s))
+        
+        # Overlap submenu - calculate current overlap from fft_size and hop_length
+        overlap_menu = menu.addMenu("Overlap %")
+        current_hop = getattr(self.spectrogram_engine, 'hop_length', 512)
+        current_overlap = 1 - (current_hop / current_fft) if current_fft > 0 else 0.75
+        for overlap in [0.5, 0.75, 0.875, 0.9375]:
+            pct = int(overlap * 100)
+            action = overlap_menu.addAction(f"{pct}%" + (" ✓" if abs(overlap - current_overlap) < 0.05 else ""))
+            action.triggered.connect(lambda checked, o=overlap: self.set_overlap(o))
+        
+        # Window function submenu
+        window_menu = menu.addMenu("Window Function")
+        current_window = getattr(self.spectrogram_engine, 'window_type', 'blackman')
+        for win in ['hann', 'hamming', 'blackman', 'bartlett', 'kaiser']:
+            action = window_menu.addAction(win.capitalize() + (" ✓" if win == current_window else ""))
+            action.triggered.connect(lambda checked, w=win: self.set_window(w))
+        
+        menu.addSeparator()
+        
+        # Toggle controls panel
+        toggle_action = menu.addAction("Show/Hide Advanced Settings")
+        toggle_action.triggered.connect(lambda: self.controls_widget.setVisible(not self.controls_widget.isVisible()))
+        
+        menu.exec(QCursor.pos())
+        
+    def set_fft_size(self, size: int):
+        """Set FFT size and recompute spectrogram."""
+        logger.info(f"Setting FFT size to {size}")
+        # Calculate new hop length to maintain similar overlap ratio
+        current_fft = getattr(self.spectrogram_engine, 'fft_size', 4096)
+        current_hop = getattr(self.spectrogram_engine, 'hop_length', 512)
+        overlap_ratio = 1 - (current_hop / current_fft)
+        new_hop = int(size * (1 - overlap_ratio))
+        
+        self.on_parameters_changed({'fft_size': size, 'hop_length': new_hop})
+        if hasattr(self, 'toolbar_info'):
+            self.toolbar_info.setText(f"FFT: {size}")
+        
+    def set_overlap(self, overlap: float):
+        """Set overlap and recompute spectrogram."""
+        logger.info(f"Setting overlap to {overlap*100}%")
+        fft_size = getattr(self.spectrogram_engine, 'fft_size', 4096)
+        hop_length = int(fft_size * (1 - overlap))
+        self.on_parameters_changed({'hop_length': hop_length})
+        if hasattr(self, 'toolbar_info'):
+            self.toolbar_info.setText(f"Overlap: {int(overlap*100)}%")
+            
+    def set_window(self, window: str):
+        """Set window function and recompute spectrogram."""
+        logger.info(f"Setting window to {window}")
+        self.on_parameters_changed({'window_type': window})
+        if hasattr(self, 'toolbar_info'):
+            self.toolbar_info.setText(f"Window: {window}")
+        
+    def show_colormap_menu(self):
+        """Show colormap selection menu."""
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: rgba(30, 30, 40, 0.95);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu::item {
+                color: #B0B0B0;
+                padding: 6px 20px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background: rgba(100, 100, 255, 0.3);
+                color: white;
+            }
+        """)
+        
+        colormaps = ['viridis', 'plasma', 'inferno', 'magma', 'turbo', 'jet', 'hot', 'cool']
+        for cmap in colormaps:
+            action = menu.addAction(cmap.capitalize())
+            action.triggered.connect(lambda checked, c=cmap: self.set_colormap(c))
+        
+        menu.exec(QCursor.pos())
+        
+    def show_view_menu(self):
+        """Show view options menu."""
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: rgba(30, 30, 40, 0.95);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu::item {
+                color: #B0B0B0;
+                padding: 6px 20px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background: rgba(100, 100, 255, 0.3);
+                color: white;
+            }
+        """)
+        
+        # Frequency scale
+        freq_menu = menu.addMenu("Frequency Scale")
+        linear_action = freq_menu.addAction("Linear")
+        linear_action.triggered.connect(lambda: self.set_freq_scale('linear'))
+        log_action = freq_menu.addAction("Logarithmic")
+        log_action.triggered.connect(lambda: self.set_freq_scale('log'))
+        mel_action = freq_menu.addAction("Mel")
+        mel_action.triggered.connect(lambda: self.set_freq_scale('mel'))
+        
+        menu.addSeparator()
+        
+        # Zoom actions
+        zoom_fit = menu.addAction("Zoom to Fit")
+        zoom_fit.triggered.connect(self.zoom_to_fit)
+        
+        menu.exec(QCursor.pos())
+        
+    def setup_zoom_toolbar(self):
+        """Setup minimal toolbar - removed for cleaner UI."""
+        # All zoom/pan controls are now via keyboard/mouse
+        # Toolbar removed per user request
+        pass
     
     def zoom_axis(self, axis: str, direction: str):
         """Zoom on specified axis.
@@ -395,7 +746,7 @@ class MainWindow(QMainWindow):
         """Setup the status bar."""
         self.status_widget = StatusWidget()
         self.statusBar().addPermanentWidget(self.status_widget)
-        self.statusBar().showMessage("Ready")
+        self.statusBar().showMessage("Ready | Shortcuts: A=Annotation C=Curve M=Measure | Right-click annotation for FFT/Doppler")
     
     def open_audio_file(self):
         """Open file dialog to select audio file."""
@@ -446,6 +797,16 @@ class MainWindow(QMainWindow):
             if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
                 self.spectrogram_canvas.zoom_detector.reset()
             
+            # Update InteractionManager with new sample rate
+            if hasattr(self, 'interaction_manager'):
+                fft_size = getattr(self.spectrogram_engine, 'fft_size', 4096)
+                hop_length = getattr(self.spectrogram_engine, 'hop_length', 512)
+                self.interaction_manager.update_parameters(
+                    sample_rate=sample_rate,
+                    hop_length=hop_length,
+                    fft_size=fft_size
+                )
+            
             logger.info(f"Loaded: {os.path.basename(file_path)} - {duration:.1f}s, {sample_rate}Hz, max freq {nyquist_freq:.0f}Hz")
             
             # Update playlist widget with file info
@@ -460,12 +821,659 @@ class MainWindow(QMainWindow):
                 f"({duration:.1f}s, {sample_rate}Hz, max {nyquist_freq:.0f}Hz)"
             )
             
+            # Update annotation manager for new file
+            self.annotation_manager.set_file_path(file_path)
+            
+            # Auto-loading disabled by user preference (can be enabled via Load Annotations menu)
+            # if self.annotation_manager.load_from_json():
+            #     self.refresh_annotation_display()
+            
             # Refresh current view
             self.refresh_current_view()
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load audio file:\n{str(e)}")
             self.statusBar().showMessage("Ready")
+    
+    # ==================== Annotation Methods ====================
+    
+    def on_roi_selected_wrapper(self, t_start, t_end, f_min, f_max):
+        """Wrapper to handle ROI selection."""
+        self.on_annotation_created(t_start, t_end, f_min, f_max)
+    
+    def on_annotation_created(self, t_start: float, t_end: float, f_min: float, f_max: float):
+        """Handle creation of a new annotation rectangle.
+        
+        Args:
+            t_start: Start time in seconds
+            t_end: End time in seconds
+            f_min: Minimum frequency in Hz
+            f_max: Maximum frequency in Hz
+        """
+        if not self.current_file:
+            return
+        
+        # Get file name
+        file_name = os.path.basename(self.current_file)
+        
+        # Create annotation
+        annotation = Annotation(
+            id=None,  # Will be auto-assigned
+            file_name=file_name,
+            t_start=min(t_start, t_end),
+            t_end=max(t_start, t_end),
+            f_min=min(f_min, f_max),
+            f_max=max(f_min, f_max)
+        )
+        
+        # Add to manager
+        annotation = self.annotation_manager.add_annotation(annotation)
+        
+        # Add to renderer
+        if self.annotation_renderer:
+            self.annotation_renderer.add_annotation(annotation, is_selected=False)
+        
+        # Add to table
+        self.annotation_table.add_annotation(annotation)
+        
+        logger.info(f"Created annotation {annotation.id}")
+    
+    def on_annotation_clicked(self, time: float, freq: float) -> Optional[Annotation]:
+        """Handle click on canvas - check if clicking on existing annotation.
+        
+        Args:
+            time: Time coordinate in seconds
+            freq: Frequency coordinate in Hz
+        
+        Returns:
+            Annotation if clicked on one, None otherwise
+        """
+        # Find annotation at this point
+        annotation = self.annotation_manager.get_annotation_at_point(time, freq)
+        if annotation:
+            # Select this annotation
+            self.select_annotation(annotation.id)
+            return annotation
+        return None
+    
+    def on_annotation_context_menu(self, time: float, freq: float):
+        """Handle right-click context menu on annotations.
+        
+        Args:
+            time: Time coordinate
+            freq: Frequency coordinate
+        """
+        annotation = self.annotation_manager.get_annotation_at_point(time, freq)
+        if not annotation:
+            return
+            
+        # Select it first
+        self.select_annotation(annotation.id)
+        
+        # Show menu
+        menu = QMenu(self)
+        
+        # FFT Spectrum
+        fft_action = menu.addAction("View FFT Spectrum")
+        fft_action.triggered.connect(lambda: self.show_fft_dialog(annotation))
+        
+        menu.addSeparator()
+        
+        # Cutout extraction
+        extract_action = menu.addAction("Extract Cutout...")
+        extract_action.triggered.connect(lambda: self.extract_and_show_cutout(annotation))
+        
+        # Draw Doppler Curve (if no curve yet)
+        if not annotation.points or len(annotation.points) < 4:
+            draw_curve_action = menu.addAction("Draw Doppler Curve (C)")
+            draw_curve_action.triggered.connect(lambda: self.start_curve_for_annotation(annotation))
+        else:
+            # Already has curve - offer to calculate or redraw
+            doppler_action = menu.addAction("Calculate Doppler Velocity")
+            doppler_action.triggered.connect(lambda: self.calculate_doppler_for_annotation(annotation))
+            
+            redraw_action = menu.addAction("Redraw Curve")
+            redraw_action.triggered.connect(lambda: self.start_curve_for_annotation(annotation))
+        
+        menu.addSeparator()
+        
+        # Delete
+        delete_action = menu.addAction("Delete Annotation")
+        delete_action.triggered.connect(lambda: self.on_table_annotation_deleted(annotation.id))
+        
+        menu.exec(QCursor.pos())
+
+    def show_fft_dialog(self, annotation: Annotation):
+        """Show FFT spectrum dialog for the annotation region."""
+        if not self.audio_loader or not hasattr(self.audio_loader, 'sample_rate'):
+            QMessageBox.warning(self, "No Audio", "No audio data loaded.")
+            return
+            
+        try:
+            # Get audio data for the time range
+            sample_rate = self.audio_loader.sample_rate
+            
+            # Calculate sample indices
+            idx_start = int(annotation.t_start * sample_rate)
+            idx_end = int(annotation.t_end * sample_rate)
+            num_samples = idx_end - idx_start
+            
+            if num_samples <= 0:
+                QMessageBox.warning(self, "Invalid Range", "Time range is invalid.")
+                return
+                
+            # Get chunk of audio
+            audio_data = self.audio_loader.get_chunk(idx_start, num_samples)
+            
+            # Create and show dialog
+            # SpectrumDialog expects the full audio, not just a chunk
+            # So we pass the loader and let it extract what it needs
+            dialog = SpectrumDialog(
+                audio_data=audio_data,
+                sample_rate=sample_rate,
+                t_start=0,  # Relative to the chunk we extracted
+                t_end=num_samples / sample_rate,
+                parent=self
+            )
+            dialog.setWindowTitle(f"FFT Spectrum - Annotation {annotation.id} | "
+                                f"Time: {annotation.t_start:.2f}-{annotation.t_end:.2f}s | "
+                                f"Freq: {annotation.f_min:.0f}-{annotation.f_max:.0f}Hz")
+            dialog.exec()
+            
+        except Exception as e:
+            logger.error(f"Error showing FFT dialog: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to show FFT: {e}")
+
+    def start_curve_for_annotation(self, annotation: Annotation):
+        """Start drawing a curve for the selected annotation."""
+        # Select the annotation
+        self.select_annotation(annotation.id)
+        
+        # Clear any existing curve
+        if HAS_VISPY:
+            self.spectrogram_canvas.clear_curve()
+            
+            # Enter curve mode
+            self.spectrogram_canvas.set_curve_mode(True)
+            self.statusBar().showMessage(f"Drawing curve for annotation #{annotation.id} | Click to add points | Enter when done")
+    
+    def calculate_doppler_for_annotation(self, annotation: Annotation):
+        """Calculate Doppler velocity from annotation's curve points."""
+        if not annotation.points or len(annotation.points) < 4:
+            QMessageBox.warning(self, "Not enough points", 
+                              "Please draw at least 4 points on the curve.")
+            return
+            
+        try:
+            from ..core.doppler_analysis import DopplerAnalyzer
+            
+            # Extract arrays
+            times = np.array([p[0] for p in annotation.points])
+            freqs = np.array([p[1] for p in annotation.points])
+            
+            # Create analyzer
+            analyzer = DopplerAnalyzer(speed_of_sound=343.0)
+            result = analyzer.fit_curve(times, freqs)
+            
+            if result:
+                # Save to annotation
+                annotation.doppler_result = {
+                    'velocity': result.velocity,
+                    'cpa_distance': result.cpa_distance,
+                    't_cpa': result.t_cpa,
+                    'f0': result.f0,
+                    'rmse': result.rmse,
+                    'direction': result.direction
+                }
+                
+                # Update Doppler curve visual in renderer
+                if self.annotation_renderer:
+                    self.annotation_renderer.update_doppler_curve(annotation)
+                
+                # Update table to show the new values
+                self.annotation_table.update_annotation(annotation)
+                
+                # Save to file
+                self.annotation_manager.save_to_json()
+                
+                QMessageBox.information(self, "Doppler Analysis", 
+                                      f"Velocity: {result.velocity_kmh:.1f} km/h\n"
+                                      f"Rest Frequency: {result.f0:.1f} Hz\n"
+                                      f"CPA Distance: {result.cpa_distance:.1f} m\n"
+                                      f"RMSE: {result.rmse:.2f}")
+            else:
+                QMessageBox.warning(self, "Fit Failed", 
+                                  "Could not fit Doppler curve to the points.")
+                
+        except Exception as e:
+            logger.error(f"Error calculating Doppler: {e}")
+            QMessageBox.critical(self, "Error", f"Doppler calculation failed: {e}")
+    
+    def extract_and_show_cutout(self, annotation: Annotation):
+        """Extract spectrogram data for the annotation and show in popup."""
+        # Get full spectrogram data
+        # Priority: 1. Cache, 2. Canvas Raw Data (fallback)
+        
+        full_data = None
+        if self.spectrogram_cache.get('data') is not None:
+            full_data = self.spectrogram_cache['data']
+        elif hasattr(self.spectrogram_canvas, 'raw_display_data'):
+            full_data = self.spectrogram_canvas.raw_display_data
+            logger.warning("Using display data for cutout (might be downsampled)")
+            
+        if full_data is None:
+            QMessageBox.warning(self, "Error", "No spectrogram data available.")
+            return
+            
+        # Reconstruct axes
+        # We need times and freqs arrays corresponding to full_data
+        # full_data shape is (n_freqs, n_times)
+        
+        n_freqs, n_times = full_data.shape
+        
+        # Get parameters - USE CACHED VALUES which reflect actual computation
+        sr = getattr(self.spectrogram_engine, 'sample_rate', 44100)
+        fft_size = self.spectrogram_cache.get('fft_size', getattr(self.spectrogram_engine, 'fft_size', 4096))
+        # CRITICAL: Use the actual hop_length from cache, not engine default!
+        hop_length = self.spectrogram_cache.get('hop_length', getattr(self.spectrogram_engine, 'hop_length', 512))
+        
+        logger.debug(f"Cutout extraction using: sr={sr}, fft_size={fft_size}, hop_length={hop_length}")
+        
+        # Frequency axis - use cached extent if available
+        cache_freq_range = self.spectrogram_cache.get('freq_range')
+        if cache_freq_range:
+            freqs = np.linspace(cache_freq_range[0], cache_freq_range[1], n_freqs)
+        else:
+            expected_n_freqs = fft_size // 2 + 1
+            if n_freqs == expected_n_freqs:
+                freqs = np.fft.rfftfreq(fft_size, 1.0/sr)
+            else:
+                max_freq = sr / 2.0
+                freqs = np.linspace(0, max_freq, n_freqs)
+            
+        # Time axis - use cached extent if available
+        cache_time_range = self.spectrogram_cache.get('time_range')
+        if cache_time_range:
+            times = np.linspace(cache_time_range[0], cache_time_range[1], n_times)
+        else:
+            duration_per_frame = hop_length / sr
+            times = np.arange(n_times) * duration_per_frame
+        
+        logger.debug(f"Cutout axes: times=[{times[0]:.2f}, {times[-1]:.2f}], freqs=[{freqs[0]:.1f}, {freqs[-1]:.1f}]")
+        
+        # Launch Dialog
+        dialog = CutoutDialog(
+            parent=self,
+            spectrogram_data=full_data,
+            freqs=freqs,
+            times=times,
+            t_start=annotation.t_start,
+            t_end=annotation.t_end,
+            f_low=annotation.f_min,
+            f_high=annotation.f_max,
+            audio_file_path=self.current_file
+        )
+        dialog.exec()
+
+    def _get_spectrogram_axes(self):
+        """Get the current spectrogram data and axes.
+        
+        Returns:
+            Tuple of (full_data, freqs, times) or (None, None, None) if unavailable
+        """
+        full_data = None
+        if self.spectrogram_cache.get('data') is not None:
+            full_data = self.spectrogram_cache['data']
+        elif hasattr(self.spectrogram_canvas, 'raw_display_data'):
+            full_data = self.spectrogram_canvas.raw_display_data
+            
+        if full_data is None:
+            return None, None, None
+        
+        n_freqs, n_times = full_data.shape
+        sr = getattr(self.spectrogram_engine, 'sample_rate', 44100)
+        
+        # Frequency axis
+        cache_freq_range = self.spectrogram_cache.get('freq_range')
+        if cache_freq_range:
+            freqs = np.linspace(cache_freq_range[0], cache_freq_range[1], n_freqs)
+        else:
+            fft_size = self.spectrogram_cache.get('fft_size', getattr(self.spectrogram_engine, 'fft_size', 4096))
+            expected_n_freqs = fft_size // 2 + 1
+            if n_freqs == expected_n_freqs:
+                freqs = np.fft.rfftfreq(fft_size, 1.0/sr)
+            else:
+                max_freq = sr / 2.0
+                freqs = np.linspace(0, max_freq, n_freqs)
+        
+        # Time axis
+        cache_time_range = self.spectrogram_cache.get('time_range')
+        if cache_time_range:
+            times = np.linspace(cache_time_range[0], cache_time_range[1], n_times)
+        else:
+            hop_length = self.spectrogram_cache.get('hop_length', getattr(self.spectrogram_engine, 'hop_length', 512))
+            duration_per_frame = hop_length / sr
+            times = np.arange(n_times) * duration_per_frame
+        
+        return full_data, freqs, times
+
+
+    def on_table_annotation_selected(self, annotation_id: int):
+        """Handle annotation selection from table.
+        
+        Args:
+            annotation_id: ID of selected annotation
+        """
+        self.select_annotation(annotation_id)
+    
+    def on_table_annotation_deleted(self, annotation_id: int):
+        """Handle annotation deletion from table.
+        
+        Args:
+            annotation_id: ID of annotation to delete
+        """
+        # Remove from manager
+        if self.annotation_manager.remove_annotation(annotation_id):
+            # Remove from renderer
+            if self.annotation_renderer:
+                self.annotation_renderer.remove_annotation(annotation_id)
+                # Force canvas update to remove visual immediately
+                if hasattr(self, 'spectrogram_canvas'):
+                    self.spectrogram_canvas.update()
+            
+            # Remove from table (if called from elsewhere)
+            # Note: if called from table itself, this might be redundant but safe
+            self.annotation_table.remove_annotation(annotation_id)
+            
+            # Clear selection if this was selected
+            if self.selected_annotation_id == annotation_id:
+                self.selected_annotation_id = None
+                if self.annotation_renderer:
+                    self.annotation_renderer.set_selected(None)
+            
+            # Auto-save to persist deletion
+            self.save_annotations(silent=True)
+            
+            logger.info(f"Deleted annotation {annotation_id} and updated file")
+    
+    def on_table_annotation_updated(self, annotation_id: int):
+        """Handle annotation update from table.
+        
+        Args:
+            annotation_id: ID of updated annotation
+        """
+        # Get annotation from manager
+        annotation = self.annotation_manager.get_annotation(annotation_id)
+        if not annotation:
+            return
+        
+        # Get updated data from table
+        row = None
+        for r, ann_id in self.annotation_table.row_to_id.items():
+            if ann_id == annotation_id:
+                row = r
+                break
+        
+        if row is None:
+            return
+        
+        # Read updated values from table
+        data = self.annotation_table.get_annotation_data_from_row(row)
+        if data:
+            annotation.track_label = data.get('track_label', '')
+            annotation.is_visible = data.get('is_visible', True)
+            annotation.show_doppler_curve = data.get('show_doppler_curve', True)
+            
+            # Save changes
+            self.annotation_manager.save_to_json()
+            logger.debug(f"Updated annotation {annotation_id}")
+    
+    def on_annotation_visibility_changed(self, annotation_id: int, is_visible: bool):
+        """Handle annotation visibility toggle from table.
+        
+        Args:
+            annotation_id: ID of annotation
+            is_visible: New visibility state
+        """
+        annotation = self.annotation_manager.get_annotation(annotation_id)
+        if not annotation:
+            return
+        
+        annotation.is_visible = is_visible
+        
+        # Update visual
+        if self.annotation_renderer:
+            self.annotation_renderer.set_annotation_visible(annotation_id, is_visible)
+        
+        # Save changes
+        self.annotation_manager.save_to_json()
+        logger.info(f"Annotation {annotation_id} visibility: {is_visible}")
+    
+    def on_doppler_visibility_changed(self, annotation_id: int, show_curve: bool):
+        """Handle Doppler curve visibility toggle from table.
+        
+        Args:
+            annotation_id: ID of annotation
+            show_curve: New visibility state for Doppler curve
+        """
+        annotation = self.annotation_manager.get_annotation(annotation_id)
+        if not annotation:
+            return
+        
+        annotation.show_doppler_curve = show_curve
+        
+        # Update visual
+        if self.annotation_renderer:
+            self.annotation_renderer.set_doppler_curve_visible(annotation_id, show_curve)
+        
+        # Save changes
+        self.annotation_manager.save_to_json()
+        logger.info(f"Annotation {annotation_id} Doppler curve visibility: {show_curve}")
+    
+    def select_annotation(self, annotation_id: int):
+        """Select an annotation (highlight it).
+        
+        Args:
+            annotation_id: ID of annotation to select
+        """
+        self.selected_annotation_id = annotation_id
+        
+        # Update renderer
+        if self.annotation_renderer:
+            self.annotation_renderer.set_selected(annotation_id)
+        
+        # Select in table
+        self.annotation_table.select_annotation(annotation_id)
+    
+    def refresh_annotation_display(self):
+        """Refresh all annotation visuals from manager."""
+        if not self.annotation_renderer:
+            return
+        
+        # Clear existing visuals
+        self.annotation_renderer.clear_all()
+        self.annotation_table.clear_all()
+        
+        # Re-add all annotations
+        for annotation in self.annotation_manager:
+            self.annotation_renderer.add_annotation(
+                annotation, 
+                is_selected=(annotation.id == self.selected_annotation_id)
+            )
+            self.annotation_table.add_annotation(annotation)
+    
+    def toggle_annotation_mode(self):
+        """Toggle annotation drawing mode on/off."""
+        enabled = self.toggle_annotation_action.isChecked()
+        
+        if hasattr(self, 'spectrogram_canvas') and self.spectrogram_canvas:
+            self.spectrogram_canvas.set_annotation_mode(enabled)
+        
+        if enabled:
+            self.statusBar().showMessage("Annotation mode enabled - Click and drag to draw rectangles")
+        else:
+            self.statusBar().showMessage("Annotation mode disabled")
+    
+    def save_annotations(self, silent=False):
+        """Save annotations to JSON file.
+        
+        Args:
+            silent: If True, don't show success message (for auto-save)
+        """
+        if not self.current_file:
+            if not silent:
+                QMessageBox.warning(self, "Save Annotations", "No audio file loaded.")
+            return
+        
+        # Allow saving empty list to clear the file
+        # if len(self.annotation_manager) == 0: ...
+        
+        if self.annotation_manager.save_to_json():
+            if not silent:
+                QMessageBox.information(self, "Save Annotations", 
+                                      f"Saved {len(self.annotation_manager)} annotations successfully.")
+        else:
+            if not silent:
+                QMessageBox.critical(self, "Save Annotations", "Failed to save annotations.")
+    
+    def load_annotations(self):
+        """Load annotations from a user-selected JSON file."""
+        if not self.current_file:
+            QMessageBox.warning(self, "Load Annotations", "No audio file loaded.")
+            return
+            
+        # Start at current file dir or user home
+        start_dir = str(Path(self.current_file).parent) if self.current_file else os.path.expanduser("~")
+        
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Load Annotations File", start_dir, "Annotation Files (*.json *.jsonl);;All Files (*)"
+        )
+        
+        if not file_path:
+            return
+        
+        if self.annotation_manager.load_from_file(file_path):
+            self.refresh_annotation_display()
+            QMessageBox.information(self, "Load Annotations",
+                                  f"Loaded {len(self.annotation_manager)} annotations successfully.")
+        else:
+            QMessageBox.critical(self, "Load Annotations", "Failed to load annotations.")
+    
+    def toggle_annotations_visibility(self):
+        """Toggle visibility of annotation rectangles."""
+        visible = self.show_annotations_action.isChecked()
+        if self.annotation_renderer:
+            self.annotation_renderer.set_visible(visible)
+            # Force update
+            if hasattr(self, 'spectrogram_canvas'):
+                self.spectrogram_canvas.update()
+    
+    def export_all_cutouts(self):
+        """Export all annotations as cutouts."""
+        if len(self.annotation_manager) == 0:
+            QMessageBox.information(self, "Export Cutouts", "No annotations to export.")
+            return
+            
+        # Ask for directory
+        start_dir = str(Path(self.current_file).parent) if self.current_file else os.path.expanduser("~")
+        save_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory", start_dir)
+        if not save_dir:
+            return
+            
+        # Get spectrogram data
+        full_data = None
+        if self.spectrogram_cache.get('data') is not None:
+            full_data = self.spectrogram_cache['data']
+        elif hasattr(self.spectrogram_canvas, 'raw_display_data'):
+            full_data = self.spectrogram_canvas.raw_display_data
+            
+        if full_data is None:
+            QMessageBox.warning(self, "Error", "No spectrogram data available.")
+            return
+            
+        # Reconstruct axes - USE CACHED VALUES which reflect actual computation
+        n_freqs, n_times = full_data.shape
+        sr = getattr(self.spectrogram_engine, 'sample_rate', 44100)
+        
+        # Use cached extent for accurate axes
+        cache_freq_range = self.spectrogram_cache.get('freq_range')
+        cache_time_range = self.spectrogram_cache.get('time_range')
+        
+        if cache_freq_range:
+            freqs = np.linspace(cache_freq_range[0], cache_freq_range[1], n_freqs)
+        else:
+            fft_size = self.spectrogram_cache.get('fft_size', getattr(self.spectrogram_engine, 'fft_size', 4096))
+            expected_n_freqs = fft_size // 2 + 1
+            if n_freqs == expected_n_freqs:
+                freqs = np.fft.rfftfreq(fft_size, 1.0/sr)
+            else:
+                max_freq = sr / 2.0
+                freqs = np.linspace(0, max_freq, n_freqs)
+        
+        if cache_time_range:
+            times = np.linspace(cache_time_range[0], cache_time_range[1], n_times)
+        else:
+            hop_length = self.spectrogram_cache.get('hop_length', getattr(self.spectrogram_engine, 'hop_length', 512))
+            duration_per_frame = hop_length / sr
+            times = np.arange(n_times) * duration_per_frame
+        
+        # Process
+        from datetime import datetime
+        timestamp_batch = datetime.now().strftime("%Y%m%d_%H%M%S")
+        manifest_path = Path(save_dir) / f"manifest_{timestamp_batch}.jsonl"
+        
+        count = 0
+        for annotation in self.annotation_manager:
+            try:
+                # Extract
+                cutout = extract_spectrogram_cutout(
+                    full_data, freqs, times, 
+                    annotation.t_start, annotation.t_end, 
+                    annotation.f_min, annotation.f_max
+                )
+                
+                if cutout['S_crop'].size == 0:
+                    continue
+                    
+                # Normalize (Auto mode)
+                S_norm, info = normalize_cutout(cutout['S_crop'], mode='auto')
+                
+                # Save
+                base_name = f"cutout_{annotation.id}_{timestamp_batch}"
+                png_path = Path(save_dir) / f"{base_name}.png"
+                npy_path = Path(save_dir) / f"{base_name}.npy"
+                
+                save_cutout_image(S_norm, cutout['times_crop'], cutout['freqs_crop'], str(png_path))
+                save_cutout_numpy(S_norm, cutout['times_crop'], cutout['freqs_crop'], str(npy_path), raw_data=cutout['S_crop'])
+                
+                meta = {
+                    "annotation_id": annotation.id,
+                    "file_name": Path(self.current_file).name,
+                    "time_start": annotation.t_start,
+                    "time_end": annotation.t_end,
+                    "freq_low": annotation.f_min,
+                    "freq_high": annotation.f_max,
+                    "cutout_png_path": str(png_path.name),
+                    "cutout_npy_path": str(npy_path.name),
+                    "normalization_used": info.get('applied_mode', 'auto'),
+                    "created_utc": datetime.utcnow().isoformat()
+                }
+                write_cutout_metadata(meta, str(manifest_path))
+                count += 1
+                
+            except Exception as e:
+                logger.error(f"Failed to export annotation {annotation.id}: {e}")
+        
+        QMessageBox.information(self, "Export Complete", f"Successfully exported {count} cutouts to:\n{save_dir}")
+
+    def delete_selected_annotation(self):
+        """Delete the currently selected annotation."""
+        if self.selected_annotation_id is None:
+            QMessageBox.information(self, "Delete Annotation", "No annotation selected.")
+            return
+        
+        # Remove via table (which will trigger the signal chain)
+        self.annotation_table.remove_annotation(self.selected_annotation_id)
     
     
     def on_parameters_changed(self, params: dict):
@@ -490,7 +1498,7 @@ class MainWindow(QMainWindow):
         old_params = {
             'fft_size': getattr(self.spectrogram_engine, 'fft_size', 4096),
             'hop_length': getattr(self.spectrogram_engine, 'hop_length', 512),
-            'window': getattr(self.spectrogram_engine, 'window', 'blackman'),
+            'window_type': getattr(self.spectrogram_engine, 'window_type', 'blackman'),
             'sample_rate': getattr(self.spectrogram_engine, 'sample_rate', 44100)
         }
         
@@ -569,6 +1577,56 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'status_widget'):
             self.status_widget.update_cursor(time_sec, freq_hz)
     
+    def open_measurement_panel(self):
+        """Open or show the measurement panel."""
+        if self.measurement_panel is None:
+            self.measurement_panel = MeasurementPanel(self)
+            # Connect new sequence signal to clear visuals
+            self.measurement_panel.new_sequence_requested.connect(self.on_new_measurement_sequence)
+        
+        # Always show and bring to front
+        self.measurement_panel.show()
+        self.measurement_panel.raise_()
+        self.measurement_panel.activateWindow()
+        logger.info("Measurement panel opened")
+        
+    def on_new_measurement_sequence(self):
+        """Handle request for new measurement sequence."""
+        if hasattr(self, 'spectrogram_canvas'):
+            self.spectrogram_canvas.clear_measurement()
+    
+    def on_measurement_completed(self, t1: float, f1: float, t2: float, f2: float):
+        """Handle completed measurement from canvas."""
+        # Add to measurement panel
+        if self.measurement_panel is None:
+            self.open_measurement_panel()
+        self.measurement_panel.add_measurement(t1, f1, t2, f2)
+        
+    def on_curve_completed(self, points: list):
+        """Handle curve completion - save to selected annotation and calculate Doppler."""
+        if not points or len(points) < 4:
+            self.statusBar().showMessage("Need at least 4 points for Doppler analysis")
+            return
+            
+        # If there's a selected annotation, save the curve to it
+        ann_id = self.annotation_table.get_selected_annotation_id()
+        if ann_id:
+            annotation = self.annotation_manager.get_annotation(ann_id)
+            if annotation:
+                # Save curve points
+                annotation.points = points
+                logger.info(f"Saved {len(points)} curve points to annotation {ann_id}")
+                
+                # Automatically calculate Doppler
+                self.calculate_doppler_for_annotation(annotation)
+                
+                # Save to file
+                self.annotation_manager.save_to_json()
+                
+                self.statusBar().showMessage(f"Doppler analysis complete for annotation #{ann_id}")
+        else:
+            self.statusBar().showMessage("No annotation selected - curve not saved")
+        
     def on_measurement_mode_changed(self, is_on: bool):
         """Handle measurement mode toggle - update status bar."""
         if hasattr(self, 'status_widget'):
@@ -1486,6 +2544,58 @@ class MainWindow(QMainWindow):
         self.current_view_range = ((0.0, duration), (0.0, sample_rate / 2))
         self.refresh_current_view()
     
+    def apply_meijering_filter(self):
+        """Apply Meijering filter to the current spectrogram."""
+        # Get current data
+        full_data, _, _ = self._get_spectrogram_axes()
+        if full_data is None:
+            QMessageBox.warning(self, "Filter Error", "No spectrogram data available.")
+            return
+            
+        # Push state for Undo
+        self.filter_manager.push_state(full_data)
+        self.undo_filter_action.setEnabled(True)
+        
+        # Show processing dialog/message
+        self.statusBar().showMessage("Applying Meijering Filter... Please wait.")
+        QApplication.processEvents()
+        
+        # Apply filter
+        try:
+            # Parameters could be adjustable in a dialog, but using defaults for now
+            filtered_data, log_msg = self.filter_manager.apply_meijering(
+                full_data, sigmas=range(1, 4), black_ridges=False, mode='reflect'
+            )
+            
+            # Update cache
+            self.spectrogram_cache['data'] = filtered_data
+            
+            # Update display
+            if hasattr(self.spectrogram_canvas, 'update_image'):
+                 self.spectrogram_canvas.update_image(filtered_data)
+            
+            # Show log message
+            QMessageBox.information(self, "Filter Applied", log_msg)
+            self.statusBar().showMessage(f"Filter applied: {log_msg}")
+            
+        except Exception as e:
+            logger.exception("Filter application failed")
+            QMessageBox.critical(self, "Filter Error", f"Failed to apply filter: {e}")
+            self.undo_filter() # Revert state
+            
+    def undo_filter(self):
+        """Undo the last filter operation."""
+        full_data, _, _ = self._get_spectrogram_axes()
+        restored_data = self.filter_manager.undo(full_data)
+        
+        if restored_data is not None:
+            self.spectrogram_cache['data'] = restored_data
+            if hasattr(self.spectrogram_canvas, 'update_image'):
+                 self.spectrogram_canvas.update_image(restored_data)
+            
+            self.undo_filter_action.setEnabled(self.filter_manager.can_undo())
+            self.statusBar().showMessage("Filter undone.")
+
     def update_performance_stats(self):
         """Update performance statistics display."""
         # Get GPU memory info
@@ -1593,8 +2703,8 @@ class MainWindow(QMainWindow):
             logger.error(f"Error exporting NPY data: {e}")
             QMessageBox.critical(self, "Export Error", f"Failed to export data:\n{str(e)}")
     
-    def export_data_as_csv(self):
-        """Export the current view data as CSV."""
+    def export_spectrogram_as_csv(self):
+        """Export the current spectrogram data as CSV."""
         if not self.current_file:
             QMessageBox.warning(self, "Export Warning", "No audio file loaded to export.")
             return
@@ -1610,7 +2720,7 @@ class MainWindow(QMainWindow):
             
             # File dialog
             filename, _ = QFileDialog.getSaveFileName(
-                self, f"Export {view_type.title()} Data",
+                self, f"Export Spectrogram Data",
                 f"{view_type}_{os.path.splitext(os.path.basename(self.current_file))[0]}.csv",
                 "CSV Files (*.csv);;All Files (*)"
             )
@@ -1627,14 +2737,53 @@ class MainWindow(QMainWindow):
                     df = pd.DataFrame(data.flatten(), columns=[view_type])
                 
                 df.to_csv(filename)
-                self.statusBar().showMessage(f"Exported {view_type} data to {filename}")
-                logger.info(f"Exported {view_type} data to {filename} (shape: {data.shape})")
+                self.statusBar().showMessage(f"Exported spectrogram data to {filename}")
+                logger.info(f"Exported spectrogram data to {filename} (shape: {data.shape})")
                 
         except ImportError:
             QMessageBox.critical(self, "Export Error", "pandas library not available for CSV export.")
         except Exception as e:
             logger.error(f"Error exporting CSV data: {e}")
             QMessageBox.critical(self, "Export Error", f"Failed to export data:\n{str(e)}")
+
+    def export_annotations_as_csv(self):
+        """Export all annotations table as CSV."""
+        if not self.current_file:
+            QMessageBox.warning(self, "Export Warning", "No audio file loaded.")
+            return
+            
+        if len(self.annotation_manager) == 0:
+            QMessageBox.information(self, "Export Warning", "No annotations to export.")
+            return
+            
+        try:
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Export Annotations Table",
+                f"annotations_{os.path.splitext(os.path.basename(self.current_file))[0]}.csv",
+                "CSV Files (*.csv);;All Files (*)"
+            )
+            
+            if filename:
+                import pandas as pd
+                
+                # Collect all annotations
+                data = []
+                for ann in self.annotation_manager:
+                    row = ann.to_dict()
+                    # Flatten or format if needed
+                    data.append(row)
+                
+                df = pd.DataFrame(data)
+                df.to_csv(filename, index=False)
+                
+                self.statusBar().showMessage(f"Exported {len(data)} annotations to {filename}")
+                logger.info(f"Exported annotations to {filename}")
+                
+        except ImportError:
+            QMessageBox.critical(self, "Export Error", "pandas library not available.")
+        except Exception as e:
+            logger.error(f"Error exporting annotations CSV: {e}")
+            QMessageBox.critical(self, "Export Error", f"Failed to export annotations:\n{str(e)}")
     
     def get_current_view_data(self, view_type: str):
         """Get the current view's data for export."""

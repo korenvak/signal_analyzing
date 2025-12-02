@@ -3,21 +3,121 @@ VisPy Canvas for spectrogram visualization.
 Handles zoom, pan, normalization, and display.
 """
 import logging
-from typing import Optional
+from typing import Optional, Tuple, Callable
 import numpy as np
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Signal
 
 try:
     from vispy import scene
+    from vispy.visuals.axis import AxisVisual
     HAS_VISPY = True
 except ImportError:
     scene = None
+    AxisVisual = None
     HAS_VISPY = False
 
 from ..core.adaptive_spectrogram import ViewRegion, ZoomLevelDetector
 
 logger = logging.getLogger(__name__)
+
+
+class TimeAxisFormatter:
+    """Custom tick formatter for time axis (displays mm:ss format)."""
+    
+    @staticmethod
+    def format_tick(value: float) -> str:
+        """Format time value as mm:ss or ss.ms depending on magnitude."""
+        if value < 0:
+            return ""
+        if value < 60:
+            return f"{value:.1f}s"
+        minutes = int(value // 60)
+        seconds = value % 60
+        if seconds == int(seconds):
+            return f"{minutes}:{int(seconds):02d}"
+        return f"{minutes}:{seconds:04.1f}"
+    
+    @staticmethod
+    def get_ticks(t_min: float, t_max: float, n_ticks: int = 8) -> list:
+        """Generate nice tick positions for time axis."""
+        span = t_max - t_min
+        if span <= 0:
+            return [t_min]
+        
+        # Choose interval based on span
+        if span < 0.5:
+            interval = 0.1
+        elif span < 2:
+            interval = 0.25
+        elif span < 5:
+            interval = 0.5
+        elif span < 10:
+            interval = 1
+        elif span < 30:
+            interval = 5
+        elif span < 60:
+            interval = 10
+        elif span < 300:
+            interval = 30
+        elif span < 600:
+            interval = 60
+        else:
+            interval = 120
+        
+        start = np.ceil(t_min / interval) * interval
+        ticks = []
+        current = start
+        while current <= t_max and len(ticks) < n_ticks:
+            ticks.append(current)
+            current += interval
+        return ticks
+
+
+class FreqAxisFormatter:
+    """Custom tick formatter for frequency axis (displays kHz format)."""
+    
+    @staticmethod
+    def format_tick(value: float) -> str:
+        """Format frequency value as kHz or Hz."""
+        if value < 0:
+            return ""
+        if value >= 10000:
+            return f"{value/1000:.0f}k"
+        elif value >= 1000:
+            return f"{value/1000:.1f}k"
+        return f"{value:.0f}"
+    
+    @staticmethod
+    def get_ticks(f_min: float, f_max: float, n_ticks: int = 8) -> list:
+        """Generate nice tick positions for frequency axis."""
+        span = f_max - f_min
+        if span <= 0:
+            return [f_min]
+        
+        # Choose interval based on span
+        if span < 100:
+            interval = 20
+        elif span < 500:
+            interval = 100
+        elif span < 1000:
+            interval = 200
+        elif span < 5000:
+            interval = 500
+        elif span < 10000:
+            interval = 1000
+        elif span < 20000:
+            interval = 2000
+        else:
+            interval = 5000
+        
+        start = np.ceil(f_min / interval) * interval
+        ticks = []
+        current = start
+        while current <= f_max and len(ticks) < n_ticks:
+            ticks.append(current)
+            current += interval
+        return ticks
 
 
 class TiledImageRenderer:
@@ -188,6 +288,7 @@ class VisPyCanvas(scene.SceneCanvas):
         
         # Image visual
         self.image_visual = scene.visuals.Image(parent=self.view.scene, interpolation='bilinear', cmap='plasma')
+        self.image_visual.order = 0  # Base layer
         self.current_interpolation = 'bilinear'
         
         # Tiled renderer
@@ -237,20 +338,68 @@ class VisPyCanvas(scene.SceneCanvas):
         
         # Measurement tool state
         self.measurement_mode = False
-        self.measurement_start = None  # (time, freq)
-        self.measurement_end = None    # (time, freq)
+        self.measurement_start = None  # (time, freq) - current start point
+        self.measurement_end = None    # (time, freq) - current end point  
+        self.measurement_all_points = []  # All points in current sequence [(t, f), ...]
         self._measurement_mode_callback = None
+        self._on_measurement_callback = None  # Callback when measurement completes
         
-        # Measurement visuals
-        self.measurement_line = scene.visuals.Line(color=(1.0, 0.8, 0.0, 0.9), width=2.0, parent=self.view.scene)
+        # Annotation drawing state
+        self.annotation_mode = False
+        self.annotation_drawing = False
+        self.annotation_start = None  # (time, freq)
+        self.annotation_end = None    # (time, freq)
+        self._annotation_renderer = None
+        self._on_annotation_created_callback = None
+        self._on_annotation_clicked_callback = None
+        self._on_annotation_context_menu_callback = None  # For right-click menu
+        
+        # Measurement visuals - using same setup as annotation rectangles
+        # Line for all measurement segments
+        self.measurement_line = scene.visuals.Line(parent=self.view.scene)
+        self.measurement_line.set_data(color=(1.0, 0.8, 0.0, 0.9), width=2.0)
         self.measurement_line.visible = False
+        self.measurement_line.order = 150  # Above spectrogram
+        self.measurement_line.set_gl_state('translucent', depth_test=False)
+        
+        # Markers for all measurement points
+        self.measurement_markers = scene.visuals.Markers(parent=self.view.scene)
+        self.measurement_markers.visible = False
+        self.measurement_markers.order = 200  # On top
+        self.measurement_markers.set_gl_state('translucent', depth_test=False)
+        
+        # Legacy markers for backwards compatibility
         self.measurement_start_marker = scene.visuals.Markers(parent=self.view.scene)
         self.measurement_start_marker.visible = False
+        self.measurement_start_marker.order = 200  # On top
+        self.measurement_start_marker.set_gl_state('translucent', depth_test=False)
+        
         self.measurement_end_marker = scene.visuals.Markers(parent=self.view.scene)
         self.measurement_end_marker.visible = False
+        self.measurement_end_marker.order = 200  # On top
+        self.measurement_end_marker.set_gl_state('translucent', depth_test=False)
         self.measurement_text = scene.visuals.Text('', color='yellow', font_size=12,
                                                     bold=True, parent=self.view.scene)
         self.measurement_text.visible = False
+        
+        # Curve Drawing State (Doppler)
+        # Curve drawing visuals - using same setup as annotation rectangles
+        self.curve_mode = False
+        self.curve_points = []  # List of (time, freq)
+        self.curve_visual = scene.visuals.Line(parent=self.view.scene, method='gl')
+        self.curve_visual.set_data(color='cyan', width=2.0)
+        self.curve_visual.visible = False
+        self.curve_visual.order = 150  # Above spectrogram
+        self.curve_visual.set_gl_state('translucent', depth_test=False)  # Same as annotations
+        
+        self.curve_markers = scene.visuals.Markers(parent=self.view.scene)
+        self.curve_markers.visible = False
+        self.curve_markers.order = 200  # On top
+        self.curve_markers.set_gl_state('translucent', depth_test=False)
+        
+        self._on_curve_updated_callback = None  # Callback(points) when curve changes
+        self._on_curve_completed_callback = None  # Callback(points) when Enter pressed when curve changes
+        self._on_curve_completed_callback = None  # Callback(points) when user presses Enter
         
         # Text readout
         self.text_visual = scene.visuals.Text('', color='white', font_size=11,
@@ -378,43 +527,215 @@ class VisPyCanvas(scene.SceneCanvas):
         elif event.key in ('M', 'm'):
             # Toggle measurement mode
             self.toggle_measurement_mode()
+        elif event.key in ('C', 'c'):
+            # Toggle curve drawing mode
+            self.set_curve_mode(not self.curve_mode)
+        elif event.key == 'Return' or event.key == 'Enter':
+            # Finish curve drawing (save to selected annotation)
+            if self.curve_mode and len(self.curve_points) >= 4:
+                logger.info(f"Curve completed with {len(self.curve_points)} points")
+                # Call callback to save curve
+                if self._on_curve_completed_callback:
+                    self._on_curve_completed_callback(self.curve_points)
+                # Exit curve mode
+                self.set_curve_mode(False)
+                self.update_text_readout(f"Curve saved: {len(self.curve_points)} points", (10, 60))
+            elif self.curve_mode:
+                logger.warning(f"Need at least 4 points (have {len(self.curve_points)})")
+        elif event.key in ('A', 'a'):
+            # Toggle annotation mode
+            self.set_annotation_mode(not self.annotation_mode)
         elif event.key == 'Escape':
-            # Clear measurement
+            # Clear measurement or curve, but DON'T close the window
             if self.measurement_mode:
                 self.clear_measurement()
+                # Don't exit measurement mode, just clear current measurement
+                event.handled = True
+            elif self.curve_mode:
+                self.clear_curve()
+                # Optionally exit curve mode
+                self.set_curve_mode(False)
+                event.handled = True
     
     def on_mouse_press(self, event):
-        """Handle mouse press for panning or measurement."""
-        if event.button == 1:
-            # Check if in measurement mode
-            if self.measurement_mode:
-                try:
-                    tr = self.view.scene.node_transform(self.view.scene)
-                    if tr is not None:
-                        world_pos = tr.map(event.pos)
-                        self.set_measurement_point(world_pos[0], world_pos[1])
+        """Handle mouse press for panning, measurement, or annotation."""
+        # Handle Right Click (Context Menu)
+        if event.button == 2:  # 2 is Right Click in VisPy
+            try:
+                world_pos = self._screen_to_world(event.pos)
+                if world_pos is not None:
+                    time_pos, freq_pos = world_pos
+                    
+                    # If in curve mode, right click clears the curve
+                    if self.curve_mode:
+                        self.clear_curve()
                         event.handled = True
                         return
-                except Exception:
-                    pass
+
+                    logger.debug(f"Right click at t={time_pos:.3f}, f={freq_pos:.0f}")
+                    if self._on_annotation_context_menu_callback:
+                        self._on_annotation_context_menu_callback(time_pos, freq_pos)
+                        event.handled = True
+                        return
+            except Exception as e:
+                logger.warning(f"Error handling right click: {e}", exc_info=True)
+        
+        if event.button == 1:
+            # Priority 1: Curve Drawing Mode
+            if self.curve_mode:
+                world_pos = self._screen_to_world(event.pos)
+                if world_pos is not None:
+                    self.add_curve_point(world_pos[0], world_pos[1])
+                    logger.debug(f"Added curve point: t={world_pos[0]:.3f}s, f={world_pos[1]:.1f}Hz (total: {len(self.curve_points)})")
+                    event.handled = True
+                    return
+
+            # Priority 2: Check if in annotation mode
+            if self.annotation_mode:
+                try:
+                    # Convert screen coordinates to world coordinates (time, freq)
+                    world_pos = self._screen_to_world(event.pos)
+                    if world_pos is not None:
+                        time_pos, freq_pos = world_pos
+                        logger.debug(f"Annotation press at t={time_pos:.3f}s, f={freq_pos:.0f}Hz")
+                        
+                        # Check if clicking on existing annotation
+                        if self._on_annotation_clicked_callback:
+                            clicked_ann = self._on_annotation_clicked_callback(time_pos, freq_pos)
+                            if clicked_ann:
+                                event.handled = True
+                                return
+                        
+                        # Start drawing new annotation
+                        self.annotation_drawing = True
+                        self.annotation_start = (time_pos, freq_pos)
+                        self.annotation_end = None
+                        
+                        # Show initial temp rectangle
+                        if self._annotation_renderer:
+                            self._annotation_renderer.show_temp_rectangle(
+                                time_pos, time_pos, freq_pos, freq_pos
+                            )
+                        
+                        event.handled = True
+                        return
+                except Exception as e:
+                    logger.warning(f"Error in annotation mouse press: {e}", exc_info=True)
             
-            # Normal panning
-            self.is_panning = True
-            self.last_mouse_pos = event.pos
-            event.handled = True
+            # Check if in measurement mode
+            if self.measurement_mode:
+                world_pos = self._screen_to_world(event.pos)
+                if world_pos is not None:
+                    self.set_measurement_point(world_pos[0], world_pos[1])
+                    event.handled = True
+                    return
+            
+            # Normal panning (only if not in annotation, measurement, or curve mode)
+            if not self.annotation_mode and not self.measurement_mode and not self.curve_mode:
+                self.is_panning = True
+                self.last_mouse_pos = event.pos
+                event.handled = True
     
     def on_mouse_release(self, event):
         """Handle mouse release."""
         if event.button == 1:
+            # Priority 1: Finish annotation drawing
+            if self.annotation_drawing and self.annotation_start is not None:
+                try:
+                    # Convert screen coordinates to world coordinates
+                    world_pos = self._screen_to_world(event.pos)
+                    if world_pos is not None:
+                        time_pos, freq_pos = world_pos
+                        self.annotation_end = (time_pos, freq_pos)
+                        
+                        # Get start and end positions
+                        t_start, f_start = self.annotation_start
+                        t_end, f_end = self.annotation_end
+                        
+                        # Calculate size
+                        dt = abs(t_end - t_start)
+                        df = abs(f_end - f_start)
+                        
+                        logger.debug(f"Annotation release: dt={dt:.3f}s, df={df:.0f}Hz")
+                        
+                        # Only create annotation if it has meaningful size
+                        if dt > 0.001 and df > 1.0:
+                            # Ensure correct ordering (min/max)
+                            t_min = min(t_start, t_end)
+                            t_max = max(t_start, t_end)
+                            f_min = min(f_start, f_end)
+                            f_max = max(f_start, f_end)
+                            
+                            logger.info(f"Creating annotation: time=[{t_min:.3f}, {t_max:.3f}]s, freq=[{f_min:.0f}, {f_max:.0f}]Hz")
+                            
+                            if self._on_annotation_created_callback:
+                                self._on_annotation_created_callback(
+                                    t_min, t_max, f_min, f_max
+                                )
+                        else:
+                            logger.debug(f"Annotation too small (dt={dt:.4f}s, df={df:.1f}Hz), cancelled")
+                    
+                    # Always clean up drawing state
+                    self.annotation_drawing = False
+                    self.annotation_start = None
+                    self.annotation_end = None
+                    
+                    # Hide temp rectangle
+                    if self._annotation_renderer:
+                        self._annotation_renderer.hide_temp_rectangle()
+                    
+                    # Force update to remove temp rectangle
+                    self.update()
+                    
+                    event.handled = True
+                    return
+                    
+                except Exception as e:
+                    logger.warning(f"Error in annotation mouse release: {e}", exc_info=True)
+                    # Clean up on error
+                    self.annotation_drawing = False
+                    self.annotation_start = None
+                    self.annotation_end = None
+                    if self._annotation_renderer:
+                        self._annotation_renderer.hide_temp_rectangle()
+                    self.update()
+            
+            # Clean up panning state
             self.is_panning = False
             self.last_mouse_pos = None
             event.handled = True
     
     def on_mouse_move(self, event):
-        """Handle mouse movement for panning and crosshair."""
+        """Handle mouse movement for panning, crosshair, and annotation drawing."""
         if event.pos is None:
             return
         
+        # Priority 1: Handle annotation drawing (live rectangle preview)
+        if self.annotation_drawing and self.annotation_start is not None:
+            try:
+                world_pos = self._screen_to_world(event.pos)
+                if world_pos is not None:
+                    time_pos, freq_pos = world_pos
+                    t_start, f_start = self.annotation_start
+                    
+                    # Update temporary rectangle in real-time
+                    if self._annotation_renderer:
+                        self._annotation_renderer.show_temp_rectangle(
+                            t_start, time_pos, f_start, freq_pos
+                        )
+                        # Force canvas update for immediate visual feedback
+                        self.update()
+                    
+                    # Also update cursor position for status bar
+                    if self.on_cursor_moved_callback:
+                        self.on_cursor_moved_callback(time_pos, freq_pos)
+                    
+                    event.handled = True
+                    return
+            except Exception as e:
+                logger.debug(f"Error in annotation drawing: {e}")
+        
+        # Priority 2: Handle panning
         if self.is_panning and self.last_mouse_pos is not None:
             try:
                 delta_screen = event.pos - self.last_mouse_pos
@@ -451,27 +772,26 @@ class VisPyCanvas(scene.SceneCanvas):
                 
             except Exception:
                 pass
+            return
         
-        elif not self.is_panning:
-            try:
-                tr = self.view.scene.node_transform(self.view.scene)
-                if tr is not None:
-                    world_pos = tr.map(event.pos)
-                    time_pos = world_pos[0]
-                    freq_pos = world_pos[1]
-                    self.mouse_pos = (time_pos, freq_pos)
-                    
-                    # Update cursor position callback (for status bar)
-                    if self.on_cursor_moved_callback:
-                        self.on_cursor_moved_callback(time_pos, freq_pos)
-                    
-                    # Update crosshair if enabled
-                    if self.crosshair_enabled:
-                        self.set_crosshair(True, self.mouse_pos)
-                        readout = f"Time: {time_pos:.3f}s, Freq: {freq_pos:.0f}Hz"
-                        self.update_text_readout(readout, (10, 30))
-            except Exception:
-                pass
+        # Priority 3: Normal mouse hover (crosshair and status updates)
+        try:
+            world_pos = self._screen_to_world(event.pos)
+            if world_pos is not None:
+                time_pos, freq_pos = world_pos
+                self.mouse_pos = (time_pos, freq_pos)
+                
+                # Update cursor position callback (for status bar)
+                if self.on_cursor_moved_callback:
+                    self.on_cursor_moved_callback(time_pos, freq_pos)
+                
+                # Update crosshair if enabled
+                if self.crosshair_enabled:
+                    self.set_crosshair(True, self.mouse_pos)
+                    readout = f"Time: {self._format_time(time_pos)}, Freq: {self._format_freq(freq_pos)}"
+                    self.update_text_readout(readout, (10, 30))
+        except Exception as e:
+            logger.debug(f"Error in mouse move: {e}")
     
     def set_data_bounds(self, time_min, time_max, freq_min, freq_max):
         """Set data bounds for zoom/pan constraints."""
@@ -721,11 +1041,129 @@ class VisPyCanvas(scene.SceneCanvas):
         except Exception:
             pass
     
+    # ==================== Curve Drawing (Doppler) ====================
+
+    def set_curve_mode(self, enabled: bool):
+        """Enable or disable curve drawing mode."""
+        was_enabled = self.curve_mode
+        self.curve_mode = enabled
+        
+        if enabled and not was_enabled:
+            # Entering curve mode - disable other modes
+            self.annotation_mode = False
+            self.measurement_mode = False
+            # Show visual feedback
+            self.update_text_readout("CURVE MODE: Click to add points | Right-click to clear | ESC to exit", (10, 60))
+            logger.info("Curve mode: ON (Click to add points, Right-click to clear)")
+        elif not enabled and was_enabled:
+            self.update_text_readout("", (10, 60))
+            logger.info("Curve mode: OFF")
+            
+        # Update cursor or visual feedback if needed
+        self.update()
+    
+    def set_curve_callback(self, callback):
+        """Set callback for when curve drawing is completed (Enter pressed)."""
+        self._on_curve_completed_callback = callback
+        
+    def add_curve_point(self, t: float, f: float):
+        """Add a point to the current curve."""
+        self.curve_points.append((t, f))
+        # Sort points by time
+        self.curve_points.sort(key=lambda p: p[0])
+        logger.info(f"Added curve point: t={t:.3f}s, f={f:.1f}Hz, total points: {len(self.curve_points)}")
+        self._update_curve_visuals()
+        
+        # Update status text
+        n_points = len(self.curve_points)
+        self.update_text_readout(f"CURVE MODE: {n_points} points | Click to add | Right-click to clear | Enter to finish", (10, 60))
+        
+        if self._on_curve_updated_callback:
+            self._on_curve_updated_callback(self.curve_points)
+            
+    def set_curve_points(self, points: list):
+        """Set the curve points externally (e.g. loading from annotation)."""
+        self.curve_points = list(points)
+        # Sort by time
+        self.curve_points.sort(key=lambda p: p[0])
+        self._update_curve_visuals()
+        
+    def clear_curve(self):
+        """Clear the current curve."""
+        self.curve_points = []
+        self._update_curve_visuals()
+        if self._on_curve_updated_callback:
+            self._on_curve_updated_callback([])
+            
+    def _update_curve_visuals(self):
+        """Update the VisPy visuals for the curve with cubic spline interpolation."""
+        if not self.curve_points:
+            self.curve_visual.visible = False
+            self.curve_markers.visible = False
+            self.update()
+            return
+            
+        points = np.array(self.curve_points)
+        logger.info(f"Updating curve visuals with {len(points)} points")
+        
+        # If we have enough points, use cubic spline interpolation
+        if len(points) >= 4:
+            try:
+                from scipy.interpolate import CubicSpline
+                
+                # Sort by time
+                sorted_indices = np.argsort(points[:, 0])
+                sorted_points = points[sorted_indices]
+                
+                times = sorted_points[:, 0]
+                freqs = sorted_points[:, 1]
+                
+                # Create cubic spline
+                cs = CubicSpline(times, freqs)
+                
+                # Generate smooth curve
+                t_min, t_max = times[0], times[-1]
+                t_smooth = np.linspace(t_min, t_max, max(100, len(points) * 10))
+                f_smooth = cs(t_smooth)
+                
+                smooth_curve = np.column_stack((t_smooth, f_smooth))
+                
+                # Update Line with smooth curve - color set in set_data
+                self.curve_visual.set_data(pos=smooth_curve, color='yellow', width=2.5)
+                
+            except Exception as e:
+                logger.debug(f"Spline interpolation failed: {e}, using linear")
+                # Fallback to linear
+                self.curve_visual.set_data(pos=points, color='cyan', width=2.0)
+        else:
+            # Not enough points for spline, use linear
+            self.curve_visual.set_data(pos=points, color='cyan', width=2.0)
+            
+        self.curve_visual.visible = True
+        
+        # Update Markers (always show the actual clicked points)
+        self.curve_markers.set_data(
+            pos=points,
+            face_color='cyan',
+            edge_color='white',
+            size=15,  # Larger size for visibility
+            edge_width=3,
+            symbol='disc'  # Explicit symbol
+        )
+        self.curve_markers.visible = True
+        self.curve_markers.order = 300  # Very high order to ensure on top
+        logger.info(f"Curve markers set to visible with {len(points)} points at order 300")
+        self.update()
+
     # ==================== Measurement Tool ====================
     
     def set_measurement_callback(self, callback):
         """Set callback for measurement mode changes."""
         self._measurement_mode_callback = callback
+        
+    def set_measurement_completed_callback(self, callback):
+        """Set callback for when a measurement is completed."""
+        self._on_measurement_callback = callback
     
     def toggle_measurement_mode(self):
         """Toggle measurement mode on/off."""
@@ -741,31 +1179,48 @@ class VisPyCanvas(scene.SceneCanvas):
         return self.measurement_mode
     
     def clear_measurement(self):
-        """Clear current measurement."""
+        """Clear current measurement sequence."""
         self.measurement_start = None
         self.measurement_end = None
+        self.measurement_all_points = []
         self.measurement_line.visible = False
+        self.measurement_markers.visible = False
         self.measurement_start_marker.visible = False
         self.measurement_end_marker.visible = False
         self.measurement_text.visible = False
         self.update()
     
     def set_measurement_point(self, time_pos: float, freq_pos: float):
-        """Set a measurement point (first click = start, second = end)."""
-        if self.measurement_start is None:
+        """Set a measurement point - supports continuous measurements.
+        
+        First click = start point
+        Second click = end point (completes first measurement)
+        Third click = new end point (measurement from previous end to this point)
+        And so on...
+        
+        All points and lines remain visible throughout the sequence.
+        """
+        # Add point to the sequence
+        self.measurement_all_points.append((time_pos, freq_pos))
+        
+        if len(self.measurement_all_points) == 1:
             # First click - set start point
             self.measurement_start = (time_pos, freq_pos)
-            self._update_measurement_marker(self.measurement_start_marker, time_pos, freq_pos, (0, 1, 0, 1))
-            self.measurement_start_marker.visible = True
-            logger.debug(f"Measurement start: time={time_pos:.3f}s, freq={freq_pos:.1f}Hz")
+            logger.info(f"Measurement start: time={time_pos:.3f}s, freq={freq_pos:.1f}Hz")
         else:
-            # Second click - set end point and show measurement
+            # Subsequent clicks - complete measurement segment
+            prev_point = self.measurement_all_points[-2]
+            self.measurement_start = prev_point
             self.measurement_end = (time_pos, freq_pos)
-            self._update_measurement_marker(self.measurement_end_marker, time_pos, freq_pos, (1, 0, 0, 1))
-            self.measurement_end_marker.visible = True
-            self._update_measurement_display()
-            logger.debug(f"Measurement end: time={time_pos:.3f}s, freq={freq_pos:.1f}Hz")
+            
+            logger.info(f"Measurement: ({prev_point[0]:.3f}s, {prev_point[1]:.1f}Hz) -> ({time_pos:.3f}s, {freq_pos:.1f}Hz)")
+            
+            # Notify callback for this segment
+            if hasattr(self, '_on_measurement_callback') and self._on_measurement_callback:
+                self._on_measurement_callback(prev_point[0], prev_point[1], time_pos, freq_pos)
         
+        # Update all visuals to show all points and lines
+        self._update_all_measurement_visuals()
         self.update()
     
     def _update_measurement_marker(self, marker, time_pos, freq_pos, color):
@@ -778,41 +1233,53 @@ class VisPyCanvas(scene.SceneCanvas):
             edge_width=2
         )
     
-    def _update_measurement_display(self):
-        """Update the measurement line and text display."""
-        if self.measurement_start is None or self.measurement_end is None:
+    def _update_all_measurement_visuals(self):
+        """Update all measurement visuals to show all points and lines."""
+        if not self.measurement_all_points:
             return
         
-        t1, f1 = self.measurement_start
-        t2, f2 = self.measurement_end
+        points = np.array(self.measurement_all_points)
         
-        # Draw line between points
-        self.measurement_line.set_data(pos=np.array([[t1, f1], [t2, f2]]))
-        self.measurement_line.visible = True
+        # Draw all points with colors: green for first, yellow for middle, red for last
+        n_points = len(points)
+        colors = []
+        for i in range(n_points):
+            if i == 0:
+                colors.append([0, 1, 0, 1])  # Green for first
+            elif i == n_points - 1:
+                colors.append([1, 0, 0, 1])  # Red for last
+            else:
+                colors.append([1, 1, 0, 1])  # Yellow for middle
         
-        # Calculate differences
-        delta_time = abs(t2 - t1)
-        delta_freq = abs(f2 - f1)
+        self.measurement_markers.set_data(
+            pos=points,
+            face_color=np.array(colors),
+            edge_color='white',
+            size=12,
+            edge_width=2
+        )
+        self.measurement_markers.visible = True
+        self.measurement_markers.order = 200
         
-        # Format time
-        if delta_time >= 60:
-            time_str = f"{int(delta_time // 60)}m {delta_time % 60:.2f}s"
-        else:
-            time_str = f"{delta_time:.3f}s"
+        # Draw lines connecting all points
+        if n_points >= 2:
+            self.measurement_line.set_data(
+                pos=points,
+                color='yellow',
+                width=3.0,
+                connect='strip'  # Connect all points in sequence
+            )
+            self.measurement_line.visible = True
+            self.measurement_line.order = 180
         
-        # Format frequency
-        if delta_freq >= 1000:
-            freq_str = f"{delta_freq / 1000:.2f} kHz"
-        else:
-            freq_str = f"{delta_freq:.1f} Hz"
-        
-        # Position text at midpoint
-        mid_t = (t1 + t2) / 2
-        mid_f = (f1 + f2) / 2
-        
-        self.measurement_text.text = f"Δt: {time_str}  |  Δf: {freq_str}"
-        self.measurement_text.pos = (mid_t, mid_f + delta_freq * 0.1)  # Slightly above line
-        self.measurement_text.visible = True
+        # Hide legacy markers
+        self.measurement_start_marker.visible = False
+        self.measurement_end_marker.visible = False
+    
+    def _update_measurement_display(self):
+        """Update the measurement line and text display - legacy method."""
+        # Now handled by _update_all_measurement_visuals
+        self._update_all_measurement_visuals()
     
     def get_visible_region(self) -> Optional[ViewRegion]:
         """Get currently visible region."""
@@ -861,10 +1328,44 @@ class VisPyCanvas(scene.SceneCanvas):
             return (1.0, 1.0)
     
     def notify_zoom_changed(self):
-        """Notify callback about zoom level change."""
+        """Notify callback about zoom level change and update axis labels."""
         if self.on_zoom_changed_callback:
             time_zoom, freq_zoom = self.get_zoom_level()
             self.on_zoom_changed_callback(time_zoom, freq_zoom)
+        
+        # Update axis labels if axes exist
+        self._update_axis_labels()
+    
+    def _update_axis_labels(self):
+        """Update axis tick labels with formatted values (mm:ss, kHz)."""
+        try:
+            rect = self.view.camera.rect
+            if rect is None:
+                return
+            
+            # The AxisWidget automatically updates ticks based on the linked view
+            # But we can customize the axis labels here if needed
+            t_min, t_max = float(rect.left), float(rect.right)
+            f_min, f_max = float(rect.bottom), float(rect.top)
+            
+            # Update axis labels with appropriate formatting
+            if hasattr(self, 'x_axis') and self.x_axis:
+                # Format X axis label based on time range
+                time_span = t_max - t_min
+                if time_span < 60:
+                    self.x_axis.axis.axis_label = 'Time (s)'
+                else:
+                    self.x_axis.axis.axis_label = 'Time (mm:ss)'
+            
+            if hasattr(self, 'y_axis') and self.y_axis:
+                # Format Y axis label based on frequency range
+                if f_max >= 1000:
+                    self.y_axis.axis.axis_label = 'Frequency (kHz)'
+                else:
+                    self.y_axis.axis.axis_label = 'Frequency (Hz)'
+                    
+        except Exception as e:
+            logger.debug(f"Error updating axis labels: {e}")
     
     def set_zoom_recompute_callback(self, callback):
         """Set callback for zoom-triggered recomputation."""
@@ -877,4 +1378,206 @@ class VisPyCanvas(scene.SceneCanvas):
         self.image_visual.set_data(np.zeros((2, 2), dtype=np.float32))
         self.tiled_renderer.clear_tiles()
         self.update()
+    
+    # ==================== Annotation Drawing Methods ====================
+    
+    def set_annotation_renderer(self, renderer):
+        """Set the annotation renderer for drawing rectangles."""
+        self._annotation_renderer = renderer
+    
+    def set_annotation_mode(self, enabled: bool):
+        """Enable or disable annotation drawing mode.
+        
+        Args:
+            enabled: True to enable annotation mode, False to disable
+        """
+        self.annotation_mode = enabled
+        if not enabled:
+            # Clean up any in-progress drawing
+            self.annotation_drawing = False
+            self.annotation_start = None
+            self.annotation_end = None
+            if self._annotation_renderer:
+                self._annotation_renderer.hide_temp_rectangle()
+        logger.info(f"Annotation mode: {'ON' if enabled else 'OFF'}")
+    
+    def set_annotation_callbacks(self, on_created=None, on_clicked=None, on_context_menu=None):
+        """Set callbacks for annotation events.
+        
+        Args:
+            on_created: Callback(time_start, time_end, freq_min, freq_max) called when annotation is created
+            on_clicked: Callback(time, freq) -> annotation or None, called when clicking on canvas
+            on_context_menu: Callback(time, freq) -> void, called on right-click
+        """
+        self._on_annotation_created_callback = on_created
+        self._on_annotation_clicked_callback = on_clicked
+        self._on_annotation_context_menu_callback = on_context_menu
+    
+    def _screen_to_world(self, screen_pos) -> Optional[Tuple[float, float]]:
+        """Convert screen coordinates to world coordinates (time, frequency).
+        
+        This method properly handles the PanZoomCamera and grid layout
+        to convert mouse screen pixels to spectrogram time/frequency values.
+        
+        Args:
+            screen_pos: (x, y) screen coordinates from mouse event
+        
+        Returns:
+            (time, frequency) tuple, or None if conversion fails
+        """
+        try:
+            if screen_pos is None:
+                return None
+            
+            screen_x = float(screen_pos[0])
+            screen_y = float(screen_pos[1])
+            
+            # Get the camera rect (visible world coordinates)
+            rect = self.view.camera.rect
+            if rect is None:
+                return None
+            
+            # Get the ViewBox size in its own coordinate system
+            view_size = self.view.size
+            if view_size[0] <= 0 or view_size[1] <= 0:
+                return None
+            
+            # Get transform from ViewBox to canvas (screen)
+            try:
+                view_to_canvas = self.view.node_transform(self)
+                
+                # Map ViewBox corners to canvas coordinates
+                # ViewBox internal coords: (0,0) to (width, height)
+                corner_00 = view_to_canvas.map((0, 0, 0, 1))
+                corner_11 = view_to_canvas.map((view_size[0], view_size[1], 0, 1))
+                
+                # Extract 2D coordinates
+                vb_left = min(corner_00[0], corner_11[0])
+                vb_right = max(corner_00[0], corner_11[0])
+                vb_bottom = min(corner_00[1], corner_11[1])
+                vb_top = max(corner_00[1], corner_11[1])
+                
+                vb_width = max(vb_right - vb_left, 1.0)
+                vb_height = max(vb_top - vb_bottom, 1.0)
+                
+                # Check if click is within ViewBox bounds
+                if screen_x < vb_left or screen_x > vb_right:
+                    return None
+                if screen_y < vb_bottom or screen_y > vb_top:
+                    return None
+                
+                # Normalize position within ViewBox (0.0 to 1.0)
+                norm_x = (screen_x - vb_left) / vb_width
+                norm_y = (screen_y - vb_bottom) / vb_height
+                
+                # CRITICAL: In screen coordinates, Y=0 is at top, increasing downward
+                # In world coordinates (spectrogram), Y=0 is at bottom (low freq)
+                # So we need to flip Y
+                norm_y = 1.0 - norm_y
+                
+                # Map normalized coords to world coords using camera rect
+                # rect.left/bottom are the world coords of the view origin
+                time = float(rect.left) + norm_x * float(rect.width)
+                freq = float(rect.bottom) + norm_y * float(rect.height)
+                
+                return (time, freq)
+                
+            except Exception as e:
+                logger.debug(f"ViewBox transform failed: {e}, trying fallback")
+            
+            # Fallback method: use canvas size directly
+            # This assumes ViewBox fills most of the canvas (less accurate with axes)
+            try:
+                canvas_size = self.size
+                if canvas_size[0] <= 0 or canvas_size[1] <= 0:
+                    return None
+                
+                # Estimate axis margins (approximate)
+                left_margin = 60   # Y-axis width
+                bottom_margin = 40  # X-axis height
+                
+                # Effective ViewBox bounds
+                vb_left = left_margin
+                vb_right = canvas_size[0]
+                vb_bottom = 0
+                vb_top = canvas_size[1] - bottom_margin
+                
+                vb_width = max(vb_right - vb_left, 1.0)
+                vb_height = max(vb_top - vb_bottom, 1.0)
+                
+                # Check bounds
+                if screen_x < vb_left or screen_x > vb_right:
+                    return None
+                if screen_y < vb_bottom or screen_y > vb_top:
+                    return None
+                
+                norm_x = (screen_x - vb_left) / vb_width
+                norm_y = 1.0 - ((screen_y - vb_bottom) / vb_height)
+                
+                time = float(rect.left) + norm_x * float(rect.width)
+                freq = float(rect.bottom) + norm_y * float(rect.height)
+                
+                return (time, freq)
+                
+            except Exception as e:
+                logger.debug(f"Fallback transform also failed: {e}")
+            
+            return None
+        
+        except Exception as e:
+            logger.error(f"Error in _screen_to_world: {e}")
+            return None
+    
+    def get_audio_coordinates(self, screen_pos, sample_rate: int = None, 
+                             hop_length: int = None, fft_size: int = None) -> Optional[dict]:
+        """Get full audio coordinates for a screen position.
+        
+        Args:
+            screen_pos: (x, y) screen coordinates
+            sample_rate: Audio sample rate (default: from engine)
+            hop_length: Hop length (default: from engine)
+            fft_size: FFT size (default: from engine)
+        
+        Returns:
+            Dictionary with time_sec, freq_hz, frame_idx, bin_idx, or None
+        """
+        world = self._screen_to_world(screen_pos)
+        if world is None:
+            return None
+        
+        time_sec, freq_hz = world
+        
+        # Use defaults if not provided
+        sr = sample_rate or 44100
+        hop = hop_length or 512
+        fft = fft_size or 4096
+        
+        # Calculate spectrogram indices
+        frame_idx = int(time_sec * sr / hop)
+        bin_idx = int(freq_hz * fft / sr)
+        
+        return {
+            'time_sec': time_sec,
+            'freq_hz': freq_hz,
+            'frame_idx': max(0, frame_idx),
+            'bin_idx': max(0, bin_idx),
+            'time_formatted': self._format_time(time_sec),
+            'freq_formatted': self._format_freq(freq_hz)
+        }
+    
+    def _format_time(self, time_sec: float) -> str:
+        """Format time as mm:ss.ms or ss.ms"""
+        if time_sec < 0:
+            return "0:00"
+        if time_sec < 60:
+            return f"{time_sec:.2f}s"
+        minutes = int(time_sec // 60)
+        seconds = time_sec % 60
+        return f"{minutes}:{seconds:05.2f}"
+    
+    def _format_freq(self, freq_hz: float) -> str:
+        """Format frequency as kHz or Hz"""
+        if freq_hz >= 1000:
+            return f"{freq_hz/1000:.2f} kHz"
+        return f"{freq_hz:.1f} Hz"
 
