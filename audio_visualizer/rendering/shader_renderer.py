@@ -41,6 +41,10 @@ class ShaderRenderer:
         self.uniforms = {
             'u_db_min': -80.0,
             'u_db_max': 0.0,
+            'u_db_mean': -40.0,  # Mean for STD normalization
+            'u_db_std': 20.0,    # Standard deviation for STD normalization
+            'u_std_scale': 2.5,  # Scale factor for STD normalization (±2.5 sigma range)
+            'u_normalization_mode': 0,  # 0 = minmax, 1 = std
             'u_colormap_type': 0,  # 0=viridis, 1=plasma, 2=jet, 3=magma, 4=inferno
             'u_alpha': 1.0,
             'u_crosshair_pos': [0.0, 0.0, 0.0, 1.0],  # x, y, enabled, width
@@ -194,7 +198,7 @@ class ShaderRenderer:
         return False
     
     def set_db_range(self, db_min: float, db_max: float):
-        """Set the dB range for color mapping.
+        """Set the dB range for color mapping (minmax mode).
         
         Args:
             db_min: Minimum dB value
@@ -223,6 +227,58 @@ class ShaderRenderer:
             logger.debug(f"dB range changed to: [{db_min:.1f}, {db_max:.1f}] dB")
         
         return changed
+    
+    def set_std_normalization(self, db_mean: float, db_std: float, std_scale: float = 2.5):
+        """Set STD-based normalization parameters.
+        
+        Args:
+            db_mean: Mean dB value
+            db_std: Standard deviation in dB
+            std_scale: Scale factor (typically 2.0-3.0, maps ±scale*std to [0,1])
+        """
+        if not self.enabled or self.program is None:
+            return False
+        
+        changed = False
+        
+        if abs(self.uniforms['u_db_mean'] - db_mean) > 0.01:
+            self.uniforms['u_db_mean'] = db_mean
+            self.program['u_db_mean'] = float(db_mean)
+            changed = True
+        
+        if abs(self.uniforms['u_db_std'] - db_std) > 0.01:
+            self.uniforms['u_db_std'] = max(db_std, 1e-6)  # Avoid division by zero
+            self.program['u_db_std'] = float(self.uniforms['u_db_std'])
+            changed = True
+        
+        if abs(self.uniforms['u_std_scale'] - std_scale) > 0.01:
+            self.uniforms['u_std_scale'] = std_scale
+            self.program['u_std_scale'] = float(std_scale)
+            changed = True
+        
+        if changed:
+            logger.debug(f"STD normalization changed: mean={db_mean:.1f}, std={db_std:.1f}, scale={std_scale:.1f}")
+        
+        return changed
+    
+    def set_normalization_mode(self, mode: str):
+        """Set normalization mode.
+        
+        Args:
+            mode: 'minmax' or 'std'
+        """
+        if not self.enabled or self.program is None:
+            return False
+        
+        mode_int = 1 if mode == 'std' else 0
+        
+        if self.uniforms['u_normalization_mode'] != mode_int:
+            self.uniforms['u_normalization_mode'] = mode_int
+            self.program['u_normalization_mode'] = mode_int
+            logger.debug(f"Normalization mode changed to: {mode}")
+            return True
+        
+        return False
     
     def set_alpha(self, alpha: float):
         """Set the transparency level.

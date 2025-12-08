@@ -18,6 +18,7 @@ class ControlsWidget(QWidget):
     window_changed = Signal(str)
     interpolation_changed = Signal(str)
     freq_scale_changed = Signal(str)
+    normalization_mode_changed = Signal(str)  # 'minmax' or 'std'
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -61,7 +62,7 @@ class ControlsWidget(QWidget):
             'blackman', 'blackmanharris', 'hann', 'hamming',
             'kaiser', 'flattop', 'rectangular'
         ])
-        self.window_combo.setCurrentText('blackman')
+        self.window_combo.setCurrentText('hamming')
         self.window_combo.setFixedWidth(110)
         self.window_combo.setToolTip("Window function for FFT")
         layout.addWidget(self.window_combo)
@@ -80,6 +81,17 @@ class ControlsWidget(QWidget):
         self.refresh_button.setFixedWidth(90)
         self.refresh_button.setToolTip("Recompute spectrogram (F5)")
         layout.addWidget(self.refresh_button)
+        
+        self._add_separator(layout)
+        
+        # Normalization mode selector (prominent location)
+        layout.addWidget(QLabel("Normalize:"))
+        self.normalization_combo = QComboBox()
+        self.normalization_combo.addItems(['Min-Max', 'STD'])
+        self.normalization_combo.setCurrentText('STD')
+        self.normalization_combo.setFixedWidth(90)
+        self.normalization_combo.setToolTip("Normalization method: Min-Max (range) or STD (statistical)")
+        layout.addWidget(self.normalization_combo)
         
         layout.addStretch()
         
@@ -201,6 +213,33 @@ class ControlsWidget(QWidget):
         db_layout.addLayout(slider_row)
         advanced_layout.addWidget(db_group)
         
+        # Normalization Mode section
+        norm_group = self._create_group("Normalization Mode")
+        norm_layout = norm_group.layout()
+        
+        norm_row = QHBoxLayout()
+        norm_row.setSpacing(10)
+        
+        norm_row.addWidget(QLabel("Method:"))
+        self.advanced_norm_combo = QComboBox()
+        self.advanced_norm_combo.addItems(['Min-Max', 'STD'])
+        self.advanced_norm_combo.setCurrentText('STD')
+        self.advanced_norm_combo.setFixedWidth(100)
+        self.advanced_norm_combo.setToolTip("Min-Max: Use dB range. STD: Use statistical normalization (mean ± std)")
+        norm_row.addWidget(self.advanced_norm_combo)
+        
+        # Sync with main combo
+        self.advanced_norm_combo.currentTextChanged.connect(
+            lambda text: self.normalization_combo.setCurrentText(text) if self.normalization_combo.currentText() != text else None
+        )
+        self.normalization_combo.currentTextChanged.connect(
+            lambda text: self.advanced_norm_combo.setCurrentText(text) if self.advanced_norm_combo.currentText() != text else None
+        )
+        
+        norm_row.addStretch()
+        norm_layout.addLayout(norm_row)
+        advanced_layout.addWidget(norm_group)
+        
         # Style
         advanced_widget.setStyleSheet("""
             QFrame#settings_group {
@@ -241,6 +280,7 @@ class ControlsWidget(QWidget):
         self.interpolation_combo.currentTextChanged.connect(self.on_interpolation_changed)
         self.freq_scale_combo.currentTextChanged.connect(self.on_freq_scale_changed)
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
+        self.normalization_combo.currentTextChanged.connect(self.on_normalization_mode_changed)
     
     def emit_parameters_changed(self):
         """Emit parameters changed signal."""
@@ -317,4 +357,15 @@ class ControlsWidget(QWidget):
     def get_current_freq_scale(self) -> str:
         """Get current frequency scale."""
         return self.freq_scale_combo.currentText()
+    
+    def on_normalization_mode_changed(self, mode_text: str):
+        """Handle normalization mode change."""
+        # Convert display text to internal mode
+        mode = 'std' if mode_text == 'STD' else 'minmax'
+        self.normalization_mode_changed.emit(mode)
+    
+    def get_normalization_mode(self) -> str:
+        """Get current normalization mode ('minmax' or 'std')."""
+        mode_text = self.normalization_combo.currentText()
+        return 'std' if mode_text == 'STD' else 'minmax'
 

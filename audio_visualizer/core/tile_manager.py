@@ -11,6 +11,7 @@ import logging
 from .tile_cache import TileCache
 from .mipmap_pyramid import MipmapPyramid
 from .progressive_tile_loader import ProgressiveTileLoader, get_progressive_tile_loader
+from .performance_optimizer import PerformanceOptimizer
 from ..rendering.texture_atlas import TextureAtlas
 
 logger = logging.getLogger(__name__)
@@ -69,10 +70,14 @@ class TileManager:
             self.atlases[view_type] = TextureAtlas(atlas_size=atlas_size, tile_size=tile_size)
         
         # Progressive tile loader for background computation and LOD
+        # Auto-detect optimal worker count for maximum performance
         self.progressive_loader = get_progressive_tile_loader(tile_cache, engines)
         if self.progressive_loader is None:
-            self.progressive_loader = ProgressiveTileLoader(tile_cache, engines, max_workers=3)
+            self.progressive_loader = ProgressiveTileLoader(tile_cache, engines, max_workers=None)
             self.progressive_loader.start()
+        
+        # Performance optimizer for adaptive quality and throttling
+        self.performance_optimizer = PerformanceOptimizer()
         
         # Request management (legacy - now handled by progressive loader)
         self.pending_requests: List[TileRequest] = []
@@ -92,6 +97,7 @@ class TileManager:
         """Update the visible region for a view.
         
         This triggers loading of visible tiles and eviction of off-screen tiles.
+        Uses performance optimizer for adaptive quality during fast movement.
         
         Args:
             view_type: Type of view
@@ -99,6 +105,13 @@ class TileManager:
             freq_range: (start, end) in Hz
             zoom_level: Current zoom level
         """
+        # Check performance optimizer - may throttle or adjust quality
+        should_update, lod_offset = self.performance_optimizer.update_viewport(time_range, freq_range)
+        
+        if not should_update:
+            # Throttled - skip this update
+            return
+        
         # Update visible region
         self.visible_region[view_type] = {
             'time': time_range,
@@ -114,12 +127,18 @@ class TileManager:
         
         logger.debug(f"Visible region updated for {view_type}: time={time_range}, freq={freq_range}, zoom={zoom_level}")
         
+        # Get effective LOD with adaptive quality adjustments
+        base_lod = self.progressive_loader._select_lod_for_zoom(zoom_level)
+        effective_lod = self.performance_optimizer.get_effective_lod(base_lod, zoom_level)
+        
         # Use progressive loader for viewport-based tile requests
+        # Pass lod_offset to adjust quality during fast movement
         tile_requests = self.progressive_loader.request_tiles_for_viewport(
             view_type=view_type,
             time_range=time_range,
             freq_range=freq_range,
             zoom_level=zoom_level,
+            lod_offset=lod_offset,  # Pass adaptive quality offset
             callback=lambda request, data, error: self._on_progressive_tile_ready(request, data, error)
         )
         

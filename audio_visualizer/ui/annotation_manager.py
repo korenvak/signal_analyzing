@@ -2,13 +2,15 @@
 Annotation manager for tracking and managing annotation rectangles.
 """
 import logging
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from pathlib import Path
 import json
 import csv
 from datetime import datetime
+import numpy as np
 
 from .annotation_data import Annotation
+from ..core.auto_detector import AutomaticTrackDetector, DetectedTrack
 
 logger = logging.getLogger(__name__)
 
@@ -122,13 +124,26 @@ class AnnotationManager:
         json_path = audio_path.parent / f"{audio_path.stem}_annotations.json"
         return json_path
     
-    def save_to_json(self) -> bool:
-        """Save annotations to JSON file.
+    def save_to_json(self, spectrogram_params: Optional[Dict] = None, 
+                     project_manager=None) -> bool:
+        """Save annotations to JSON file with metadata.
+        
+        Args:
+            spectrogram_params: Optional dict with FFT parameters (fft_size, hop_length, window, etc.)
+            project_manager: Optional ProjectManager instance for project-based saving
         
         Returns:
             True if saved successfully, False otherwise
         """
-        json_path = self.get_json_path()
+        # Determine save path
+        if project_manager and project_manager.is_project_loaded():
+            # Use project structure - create_if_missing=True to get path for new files
+            filename = Path(self.file_path).name if self.file_path else 'unknown'
+            json_path = project_manager.get_file_annotations_path(filename, create_if_missing=True)
+        else:
+            # Use legacy path (next to audio file)
+            json_path = self.get_json_path()
+        
         if not json_path:
             logger.warning("Cannot save annotations: no file path set")
             return False
@@ -136,27 +151,41 @@ class AnnotationManager:
         try:
             # Convert annotations to dictionaries (excluding graphics_handle)
             data = {
-                'version': '1.1', # Bump version for Doppler support
+                'version': '2.0',  # Bump version for project support
                 'file_name': Path(self.file_path).name if self.file_path else '',
                 'last_modified': datetime.utcnow().isoformat(),
                 'annotations': [ann.to_dict() for ann in self.annotations]
             }
+            
+            # Add spectrogram parameters if provided
+            if spectrogram_params:
+                data['spectrogram_params'] = {
+                    'fft_size': spectrogram_params.get('fft_size'),
+                    'hop_length': spectrogram_params.get('hop_length'),
+                    'window': spectrogram_params.get('window_type') or spectrogram_params.get('window'),
+                    'overlap_percent': spectrogram_params.get('overlap_percent'),
+                    'sample_rate': spectrogram_params.get('sample_rate')
+                }
+            
+            # Ensure parent directory exists
+            json_path.parent.mkdir(parents=True, exist_ok=True)
             
             with open(json_path, 'w') as f:
                 json.dump(data, f, indent=2)
             
             logger.info(f"Saved {len(self.annotations)} annotations to {json_path}")
             return True
-        
+            
         except Exception as e:
             logger.error(f"Error saving annotations to {json_path}: {e}")
             return False
     
-    def load_from_file(self, path: str) -> bool:
+    def load_from_file(self, path: str, project_manager=None) -> bool:
         """Load annotations from a JSON or JSONL file.
         
         Args:
             path: Path to JSON or JSONL file
+            project_manager: Optional ProjectManager instance (for compatibility)
             
         Returns:
             True if successful
@@ -225,7 +254,7 @@ class AnnotationManager:
                     t_end=record['time_end'],
                     f_min=record['freq_low'],
                     f_max=record['freq_high'],
-                    label=record.get('label', ''),
+                    track_label=record.get('label', ''),
                     file_name=record.get('file_name', '')
                 )
             # Handle standard annotation format
@@ -237,16 +266,27 @@ class AnnotationManager:
             logger.debug(f"Could not convert record to annotation: {e}")
             return None
 
-    def load_from_json(self) -> bool:
+    def load_from_json(self, project_manager=None) -> bool:
         """Load annotations from JSON file (for current file).
+        
+        Args:
+            project_manager: Optional ProjectManager instance
         
         Returns:
             True if loaded successfully, False otherwise
         """
+        # Try project path first if project is loaded
+        if project_manager and project_manager.is_project_loaded() and self.file_path:
+            filename = Path(self.file_path).name
+            project_path = project_manager.get_file_annotations_path(filename)
+            if project_path and project_path.exists():
+                return self.load_from_file(str(project_path), project_manager=project_manager)
+        
+        # Fall back to legacy path (next to audio file)
         json_path = self.get_json_path()
         if not json_path:
             return False
-        return self.load_from_file(str(json_path))
+        return self.load_from_file(str(json_path), project_manager=project_manager)
     
     def export_project_csv(self, root_dir: str, output_path: str) -> bool:
         """
@@ -336,10 +376,89 @@ class AnnotationManager:
             logger.error(f"Failed to export project CSV: {e}")
             return False
 
+    def auto_detect_track(self, annotation_id: int,
+                          spectrogram: np.ndarray,
+                          times: np.ndarray,
+                          freqs: np.ndarray,
+                          sample_rate: float = 44100.0,
+                          hop_length: int = 512) -> List[DetectedTrack]:
+        """Run automatic track detection within an annotation region.
+
+        Args:
+            annotation_id: ID of the annotation to detect tracks in
+            spectrogram: Full spectrogram data (freq x time)
+            times: Time values for spectrogram columns
+            freqs: Frequency values for spectrogram rows
+            sample_rate: Audio sample rate
+            hop_length: FFT hop length
+
+        Returns:
+            List of DetectedTrack objects (sorted by score, best first)
+        """
+        annotation = self.get_annotation(annotation_id)
+        if annotation is None:
+            logger.warning(f"Annotation {annotation_id} not found")
+            return []
+
+        detector = AutomaticTrackDetector()
+
+        try:
+            tracks = detector.detect_in_region(
+                spectrogram=spectrogram,
+                times=times,
+                freqs=freqs,
+                t_start=annotation.t_start,
+                t_end=annotation.t_end,
+                f_min=annotation.f_min,
+                f_max=annotation.f_max,
+                sample_rate=sample_rate,
+                hop_length=hop_length
+            )
+            logger.info(f"Auto-detected {len(tracks)} tracks in annotation {annotation_id}")
+            return tracks
+        except Exception as e:
+            logger.error(f"Auto-detection failed for annotation {annotation_id}: {e}")
+            return []
+
+    def set_annotation_track(self, annotation_id: int,
+                             track_points: List[Tuple[float, float]]) -> bool:
+        """Set the track points for an annotation (from auto-detect or manual drawing).
+
+        Args:
+            annotation_id: ID of the annotation to update
+            track_points: List of (time, freq) tuples representing the track
+
+        Returns:
+            True if successful, False otherwise
+        """
+        annotation = self.get_annotation(annotation_id)
+        if annotation is None:
+            logger.warning(f"Annotation {annotation_id} not found")
+            return False
+
+        # Set the points
+        annotation.points = list(track_points)
+        logger.info(f"Set {len(track_points)} track points for annotation {annotation_id}")
+        return True
+
+    def get_annotation_track(self, annotation_id: int) -> Optional[List[Tuple[float, float]]]:
+        """Get the track points for an annotation.
+
+        Args:
+            annotation_id: ID of the annotation
+
+        Returns:
+            List of (time, freq) tuples, or None if not found/no track
+        """
+        annotation = self.get_annotation(annotation_id)
+        if annotation is None:
+            return None
+        return annotation.points if annotation.points else None
+
     def __len__(self) -> int:
         """Return the number of annotations."""
         return len(self.annotations)
-    
+
     def __iter__(self):
         """Iterate over annotations."""
         return iter(self.annotations)

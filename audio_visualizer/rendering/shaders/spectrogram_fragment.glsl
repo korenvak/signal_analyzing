@@ -7,8 +7,12 @@ in vec2 v_world_pos;
 
 // Uniforms
 uniform sampler2D u_spectrogram_data;  // Spectrogram magnitude data
-uniform float u_db_min;               // Minimum dB value for color mapping
-uniform float u_db_max;               // Maximum dB value for color mapping
+uniform float u_db_min;               // Minimum dB value for color mapping (minmax mode)
+uniform float u_db_max;               // Maximum dB value for color mapping (minmax mode)
+uniform float u_db_mean;              // Mean dB value (STD mode)
+uniform float u_db_std;               // Standard deviation (STD mode)
+uniform float u_std_scale;            // Scale factor for STD normalization (typically 2.0-3.0)
+uniform int u_normalization_mode;   // 0 = minmax, 1 = std
 uniform int u_colormap_type;          // Colormap selection (0=viridis, 1=plasma, 2=jet, etc.)
 uniform vec4 u_crosshair_pos;         // [time, freq, enabled, line_width]
 uniform vec4 u_crosshair_color;       // Crosshair color
@@ -87,8 +91,22 @@ void main() {
     // Sample spectrogram data
     float magnitude_db = texture(u_spectrogram_data, v_texcoord).r;
     
-    // Normalize to [0, 1] range based on dB limits
-    float normalized_db = (magnitude_db - u_db_min) / (u_db_max - u_db_min);
+    // Normalize to [0, 1] range based on normalization mode
+    float normalized_db;
+    
+    if (u_normalization_mode == 1) {
+        // STD-based normalization: (value - mean) / (std * scale)
+        // Maps to approximately [-scale, +scale] sigma range, then normalized to [0, 1]
+        float z_score = (magnitude_db - u_db_mean) / (u_db_std * u_std_scale);
+        // Map z-score to [0, 1]: z_score of -scale maps to 0, +scale maps to 1
+        normalized_db = (z_score + 1.0) * 0.5;
+    } else {
+        // Min-Max normalization (default)
+        normalized_db = (magnitude_db - u_db_min) / (u_db_max - u_db_min);
+    }
+    
+    // Clamp to valid range
+    normalized_db = clamp(normalized_db, 0.0, 1.0);
     
     // Apply colormap
     vec3 color = apply_colormap(normalized_db, u_colormap_type);

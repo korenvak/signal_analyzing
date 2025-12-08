@@ -19,8 +19,12 @@ in vec2 v_world_pos;
 out vec4 fragColor;
 
 uniform sampler2D u_spectrogram_data;
-uniform float u_db_min;
-uniform float u_db_max;
+uniform float u_db_min;              // Minimum dB value (minmax mode)
+uniform float u_db_max;              // Maximum dB value (minmax mode)
+uniform float u_db_mean;             // Mean dB value (STD mode)
+uniform float u_db_std;              // Standard deviation (STD mode)
+uniform float u_std_scale;           // Scale factor for STD normalization (typically 2.0-3.0)
+uniform int u_normalization_mode;    // 0 = minmax, 1 = std
 uniform int u_colormap_type;
 uniform float u_alpha;
 
@@ -163,9 +167,21 @@ void main() {
     // Sample magnitude value from texture (stored as dB)
     float magnitude_db = texture(u_spectrogram_data, v_texcoord).r;
     
-    // Normalize to [0, 1] using dB range (THIS HAPPENS ON GPU!)
-    // Changing u_db_min/u_db_max updates instantly - no recomputation!
-    float normalized = (magnitude_db - u_db_min) / (u_db_max - u_db_min);
+    // Normalize to [0, 1] based on normalization mode (THIS HAPPENS ON GPU!)
+    float normalized;
+    
+    if (u_normalization_mode == 1) {
+        // STD-based normalization: (value - mean) / (std * scale)
+        // Maps to approximately [-scale, +scale] sigma range, then normalized to [0, 1]
+        float z_score = (magnitude_db - u_db_mean) / (u_db_std * u_std_scale);
+        // Map z-score to [0, 1]: z_score of -scale maps to 0, +scale maps to 1
+        normalized = (z_score + 1.0) * 0.5;
+    } else {
+        // Min-Max normalization (default)
+        // Changing u_db_min/u_db_max updates instantly - no recomputation!
+        normalized = (magnitude_db - u_db_min) / (u_db_max - u_db_min);
+    }
+    
     normalized = clamp(normalized, 0.0, 1.0);
     
     // Apply colormap (THIS HAPPENS ON GPU!)

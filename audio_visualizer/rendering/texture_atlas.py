@@ -128,10 +128,26 @@ class TextureAtlas:
         return visible_tiles
     
     def _select_lod(self, zoom_level: float) -> int:
-        """Select appropriate LOD level based on zoom."""
-        # TODO: Implement proper LOD selection in Phase 3
-        # For now, always use LOD 0 (full resolution)
-        return 0
+        """Select appropriate LOD level based on zoom.
+        
+        Args:
+            zoom_level: Current zoom level (1.0 = fit to screen, >1.0 = zoomed in, <1.0 = zoomed out)
+        
+        Returns:
+            LOD level (0 = full resolution, higher = more downsampled)
+        """
+        # When zoomed out (zoom_level < 1.0), use lower resolution tiles
+        # When zoomed in (zoom_level > 1.0), use full resolution
+        if zoom_level >= 1.0:
+            return 0  # Full resolution when zoomed in
+        elif zoom_level >= 0.5:
+            return 1  # 2x downsampled
+        elif zoom_level >= 0.25:
+            return 2  # 4x downsampled
+        elif zoom_level >= 0.125:
+            return 3  # 8x downsampled
+        else:
+            return 4  # 16x downsampled for very zoomed out views
     
     def load_tile(self, tile_id: Tuple, tile_data: np.ndarray) -> bool:
         """Load a tile into the atlas.

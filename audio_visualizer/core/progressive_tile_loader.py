@@ -12,6 +12,7 @@ from typing import Dict, List, Tuple, Optional, Callable, Set
 from dataclasses import dataclass
 from enum import Enum
 import numpy as np
+import concurrent.futures
 
 logger = logging.getLogger(__name__)
 
@@ -126,17 +127,26 @@ class ViewportTracker:
 class ProgressiveTileLoader:
     """Manages progressive tile loading with LOD and background computation."""
     
-    def __init__(self, tile_cache, engines: Dict, max_workers: int = 3):
+    def __init__(self, tile_cache, engines: Dict, max_workers: int = None):
         """Initialize progressive tile loader.
         
         Args:
             tile_cache: TileCache instance
             engines: Dictionary of computation engines
-            max_workers: Maximum background computation threads
+            max_workers: Maximum background computation threads (auto-detect if None)
         """
         self.tile_cache = tile_cache
         self.engines = engines
-        self.max_workers = max_workers
+        
+        # Auto-detect optimal worker count
+        if max_workers is None:
+            import multiprocessing
+            cpu_count = multiprocessing.cpu_count()
+            # Use more workers for better parallelization (up to 8)
+            # Reserve 1-2 cores for UI and other tasks
+            self.max_workers = min(max(2, cpu_count - 2), 8)
+        else:
+            self.max_workers = max_workers
         
         # Request management
         self.request_queue = queue.PriorityQueue()
@@ -201,7 +211,8 @@ class ProgressiveTileLoader:
     
     def request_tiles_for_viewport(self, view_type: str, time_range: Tuple[float, float],
                                   freq_range: Tuple[float, float], zoom_level: float,
-                                  callback: Optional[Callable] = None) -> List[TileRequest]:
+                                  callback: Optional[Callable] = None,
+                                  lod_offset: int = 0) -> List[TileRequest]:
         """Request tiles for current viewport with progressive loading.
         
         Args:
@@ -210,6 +221,7 @@ class ProgressiveTileLoader:
             freq_range: Frequency range to display
             zoom_level: Current zoom level
             callback: Callback for tile completion
+            lod_offset: Additional LOD offset for adaptive quality (higher = lower quality)
             
         Returns:
             List of tile requests submitted
@@ -219,9 +231,15 @@ class ProgressiveTileLoader:
         
         requests = []
         
-        # 1. Request immediate tiles (current view)
+        # Select appropriate LOD based on zoom level
+        # When zoomed out, use lower LOD to reduce computation cost
+        # Apply adaptive quality offset for fast movement
+        base_lod = self._select_lod_for_zoom(zoom_level)
+        effective_lod = min(base_lod + lod_offset, 5)  # Cap at LOD 5
+        
+        # 1. Request immediate tiles (current view) - use effective LOD (with adaptive quality)
         immediate_tiles = self._generate_tile_requests(
-            view_type, time_range, freq_range, zoom_level, TilePriority.IMMEDIATE
+            view_type, time_range, freq_range, effective_lod, TilePriority.IMMEDIATE
         )
         
         for request in immediate_tiles:
@@ -229,33 +247,50 @@ class ProgressiveTileLoader:
             requests.append(request)
             self._submit_request(request)
         
-        # 2. Request adjacent tiles (high priority)
+        # 2. Request adjacent tiles (high priority) - more aggressive prefetch
+        # Expand by 100% instead of 50% for better prefetching
+        # Use effective LOD for adjacent tiles too (faster during movement)
         adjacent_tiles = self._generate_adjacent_tile_requests(
-            view_type, time_range, freq_range, zoom_level, TilePriority.HIGH
+            view_type, time_range, freq_range, effective_lod, TilePriority.HIGH, expand_factor=1.0
         )
         
         for request in adjacent_tiles:
             requests.append(request)
             self._submit_request(request)
         
-        # 3. Request next LOD level (medium priority)
-        if zoom_level > 0:  # If not at highest resolution
-            next_lod_tiles = self._generate_tile_requests(
-                view_type, time_range, freq_range, zoom_level - 1, TilePriority.MEDIUM
+        # 3. Request higher quality LOD if zoomed in (progressive refinement)
+        if zoom_level > 1.0 and base_lod > 0:
+            # Request one level higher quality for smooth zoom-in
+            higher_lod = base_lod - 1
+            higher_quality_tiles = self._generate_tile_requests(
+                view_type, time_range, freq_range, higher_lod, TilePriority.MEDIUM
             )
             
-            for request in next_lod_tiles:
+            for request in higher_quality_tiles:
                 requests.append(request)
                 self._submit_request(request)
         
-        # 4. Predictive prefetch (low priority)
+        # 4. Request lower quality LOD if zoomed out (for faster initial display)
+        if zoom_level < 1.0 and base_lod < 3:
+            # Request one level lower quality for faster display when zoomed out
+            lower_lod = base_lod + 1
+            lower_quality_tiles = self._generate_tile_requests(
+                view_type, time_range, freq_range, lower_lod, TilePriority.MEDIUM
+            )
+            
+            for request in lower_quality_tiles:
+                requests.append(request)
+                self._submit_request(request)
+        
+        # 5. Predictive prefetch (low priority) - more aggressive
         predicted_viewport = self.viewport_tracker.predict_next_viewport()
         if predicted_viewport:
+            predicted_lod = self._select_lod_for_zoom(predicted_viewport['zoom_level'])
             predicted_tiles = self._generate_tile_requests(
                 view_type, 
                 predicted_viewport['time_range'],
                 predicted_viewport['freq_range'],
-                predicted_viewport['zoom_level'],
+                predicted_lod,
                 TilePriority.LOW
             )
             
@@ -264,21 +299,55 @@ class ProgressiveTileLoader:
                 self._submit_request(request)
         
         self.stats['tiles_requested'] += len(requests)
-        logger.debug(f"Requested {len(requests)} tiles for viewport")
+        if lod_offset > 0:
+            logger.debug(f"Requested {len(requests)} tiles for viewport (zoom={zoom_level:.2f}, LOD={effective_lod}, adaptive quality active)")
+        else:
+            logger.debug(f"Requested {len(requests)} tiles for viewport (zoom={zoom_level:.2f}, LOD={effective_lod})")
         
         return requests
+    
+    def _select_lod_for_zoom(self, zoom_level: float) -> int:
+        """Select appropriate LOD level based on zoom.
+        
+        Args:
+            zoom_level: Current zoom level (1.0 = fit to screen, >1.0 = zoomed in, <1.0 = zoomed out)
+        
+        Returns:
+            LOD level (0 = full resolution, higher = more downsampled)
+        """
+        # When zoomed out (zoom_level < 1.0), use lower resolution tiles to reduce computation
+        # When zoomed in (zoom_level > 1.0), use full resolution
+        if zoom_level >= 1.0:
+            return 0  # Full resolution when zoomed in
+        elif zoom_level >= 0.5:
+            return 1  # 2x downsampled
+        elif zoom_level >= 0.25:
+            return 2  # 4x downsampled
+        elif zoom_level >= 0.125:
+            return 3  # 8x downsampled
+        else:
+            return 4  # 16x downsampled for very zoomed out views
     
     def _generate_tile_requests(self, view_type: str, time_range: Tuple[float, float],
                                freq_range: Tuple[float, float], resolution_level: int,
                                priority: TilePriority) -> List[TileRequest]:
-        """Generate tile requests for a given area and resolution."""
+        """Generate tile requests for a given area and resolution.
+        
+        Uses adaptive tile sizing: larger tiles for lower LOD levels to reduce computation.
+        """
         requests = []
         
-        # Calculate tile size based on resolution level
-        base_tile_duration = 60.0  # Base tile: 60 seconds
-        base_tile_freq_range = 4000.0  # Base tile: 4kHz
+        # Adaptive tile sizing based on LOD
+        # Lower LOD (higher resolution_level) = larger tiles = fewer tiles to compute
+        # This reduces computation cost when zoomed out
+        base_tile_duration = 30.0  # Base tile: 30 seconds (smaller for better granularity)
+        base_tile_freq_range = 2000.0  # Base tile: 2kHz
         
         # Scale by resolution level (higher level = larger tiles, lower resolution)
+        # LOD 0: 30s x 2kHz tiles
+        # LOD 1: 60s x 4kHz tiles
+        # LOD 2: 120s x 8kHz tiles
+        # etc.
         tile_duration = base_tile_duration * (2 ** resolution_level)
         tile_freq_span = base_tile_freq_range * (2 ** resolution_level)
         
@@ -315,22 +384,31 @@ class ProgressiveTileLoader:
     
     def _generate_adjacent_tile_requests(self, view_type: str, time_range: Tuple[float, float],
                                         freq_range: Tuple[float, float], resolution_level: int,
-                                        priority: TilePriority) -> List[TileRequest]:
-        """Generate requests for tiles adjacent to current viewport."""
+                                        priority: TilePriority, expand_factor: float = 0.5) -> List[TileRequest]:
+        """Generate requests for tiles adjacent to current viewport.
+        
+        Args:
+            view_type: Type of view
+            time_range: Current time range
+            freq_range: Current frequency range
+            resolution_level: LOD level
+            priority: Request priority
+            expand_factor: How much to expand viewport (0.5 = 50%, 1.0 = 100%)
+        """
         requests = []
         
-        # Expand viewport by 50% in each direction for prefetch
+        # Expand viewport by expand_factor in each direction for prefetch
         time_span = time_range[1] - time_range[0]
         freq_span = freq_range[1] - freq_range[0]
         
         expanded_time_range = (
-            time_range[0] - time_span * 0.5,
-            time_range[1] + time_span * 0.5
+            time_range[0] - time_span * expand_factor,
+            time_range[1] + time_span * expand_factor
         )
         
         expanded_freq_range = (
-            max(0, freq_range[0] - freq_span * 0.5),
-            freq_range[1] + freq_span * 0.5
+            max(0, freq_range[0] - freq_span * expand_factor),
+            freq_range[1] + freq_span * expand_factor
         )
         
         # Generate tiles for expanded area (excluding current viewport)
@@ -377,39 +455,92 @@ class ProgressiveTileLoader:
         self.request_queue.put((priority_value, time.time(), request))
     
     def _worker_loop(self):
-        """Worker thread loop for processing tile requests."""
+        """Worker thread loop for processing tile requests with batching."""
         while self.running:
             try:
-                # Get next request with timeout
+                # Batch processing: collect multiple requests of same priority
+                batch = []
+                batch_priority = None
+                
+                # Get first request
                 try:
-                    priority, timestamp, request = self.request_queue.get(timeout=1.0)
+                    priority, timestamp, request = self.request_queue.get(timeout=0.1)
+                    batch.append(request)
+                    batch_priority = priority
                 except queue.Empty:
                     continue
                 
-                # Process the request
+                # Collect additional requests of same priority (up to 4 tiles per batch)
+                # This allows parallel computation of multiple tiles
+                max_batch_size = 4
+                try:
+                    while len(batch) < max_batch_size:
+                        priority, timestamp, request = self.request_queue.get_nowait()
+                        if priority == batch_priority:
+                            batch.append(request)
+                        else:
+                            # Different priority - put back and process current batch
+                            self.request_queue.put((priority, timestamp, request))
+                            break
+                except queue.Empty:
+                    pass
+                
+                # Process batch
                 start_time = time.time()
-                self._process_request(request)
-                computation_time = time.time() - start_time
+                if len(batch) == 1:
+                    # Single request - process normally
+                    self._process_request(batch[0])
+                    computation_time = time.time() - start_time
+                else:
+                    # Batch processing - process multiple tiles in parallel
+                    self._process_batch(batch)
+                    computation_time = time.time() - start_time
+                    logger.debug(f"Processed batch of {len(batch)} tiles in {computation_time:.3f}s")
                 
                 # Update statistics
-                self.stats['tiles_computed'] += 1
-                if self.stats['tiles_computed'] == 1:
-                    self.stats['avg_computation_time'] = computation_time
+                self.stats['tiles_computed'] += len(batch)
+                if self.stats['tiles_computed'] == len(batch):
+                    self.stats['avg_computation_time'] = computation_time / len(batch)
                 else:
                     # Running average
+                    avg_time_per_tile = computation_time / len(batch)
                     self.stats['avg_computation_time'] = (
                         self.stats['avg_computation_time'] * 0.9 + 
-                        computation_time * 0.1
+                        avg_time_per_tile * 0.1
                     )
                 
                 # Remove from active requests
                 with self.worker_lock:
-                    self.active_requests.discard(request)
-                
-                self.request_queue.task_done()
+                    for request in batch:
+                        self.active_requests.discard(request)
+                        self.request_queue.task_done()
                 
             except Exception as e:
                 logger.error(f"Tile worker error: {e}")
+                # Mark any batch items as done
+                for request in batch:
+                    self.request_queue.task_done()
+    
+    def _process_batch(self, requests: List[TileRequest]):
+        """Process multiple tile requests in batch for better performance.
+        
+        Args:
+            requests: List of tile requests to process
+        """
+        # Group requests by view type for efficient batch processing
+        by_view_type = {}
+        for request in requests:
+            if request.view_type not in by_view_type:
+                by_view_type[request.view_type] = []
+            by_view_type[request.view_type].append(request)
+        
+        # Process each view type's requests
+        for view_type, view_requests in by_view_type.items():
+            # Process in parallel using threads (for CPU-bound work)
+            # For GPU work, batching is handled by the engine
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(view_requests), 4)) as executor:
+                futures = [executor.submit(self._process_request, req) for req in view_requests]
+                concurrent.futures.wait(futures)
     
     def _process_request(self, request: TileRequest):
         """Process a single tile request."""

@@ -417,6 +417,9 @@ class VisPyCanvas(scene.SceneCanvas):
         self.normalized_display_data = None
         self.global_percentiles = None
         self.global_mean_std = None
+        self.local_mean_std = None  # Mean/std for visible region (for STD normalization)
+        self.normalization_mode = 'std'  # 'minmax' or 'std' - default to STD (adaptive to zoom)
+        self.std_scale = 2.5  # Scale factor for STD normalization
         
         # Connect events
         self.view.events.mouse_wheel.connect(self.on_mouse_wheel)
@@ -949,8 +952,18 @@ class VisPyCanvas(scene.SceneCanvas):
                 visible_patch = self.raw_display_data[row_start:row_end, col_start:col_end]
                 finite_vals = visible_patch[np.isfinite(visible_patch)]
                 if finite_vals.size > 10:
-                    clim_min = float(np.percentile(finite_vals, 2))
-                    clim_max = float(np.percentile(finite_vals, 98))
+                    if self.normalization_mode == 'std':
+                        # For STD normalization, compute mean and std from visible region
+                        local_mean = float(np.mean(finite_vals))
+                        local_std = max(float(np.std(finite_vals)), 1e-6)
+                        self.local_mean_std = (local_mean, local_std)
+                        # Still compute clim for fallback, but use local mean/std for normalization
+                        clim_min = float(np.percentile(finite_vals, 2))
+                        clim_max = float(np.percentile(finite_vals, 98))
+                    else:
+                        # Min-Max normalization
+                        clim_min = float(np.percentile(finite_vals, 2))
+                        clim_max = float(np.percentile(finite_vals, 98))
         
         # Fallback
         if clim_min is None or clim_max is None:
@@ -962,11 +975,26 @@ class VisPyCanvas(scene.SceneCanvas):
                 clim_min = float(np.nanmin(self.raw_display_data))
                 clim_max = float(np.nanmax(self.raw_display_data))
         
+        # For STD mode, if we don't have local mean/std, use global
+        if self.normalization_mode == 'std' and self.local_mean_std is None:
+            if self.global_mean_std:
+                self.local_mean_std = self.global_mean_std
+            else:
+                # Compute from all data as fallback
+                finite_all = self.raw_display_data[np.isfinite(self.raw_display_data)]
+                if finite_all.size > 10:
+                    mean = float(np.mean(finite_all))
+                    std = max(float(np.std(finite_all)), 1e-6)
+                    self.local_mean_std = (mean, std)
+                else:
+                    # Last resort fallback
+                    self.local_mean_std = (clim_min, (clim_max - clim_min) / 4.0)
+        
         if clim_max - clim_min < 1e-6:
             clim_max = clim_min + 1.0
         
-        # Apply dB range if set
-        if self.db_range:
+        # Apply dB range if set (only for minmax mode)
+        if self.db_range and self.normalization_mode == 'minmax':
             db_min, db_max = self.db_range
             if db_max > db_min:
                 clim_min = max(clim_min, db_min)
@@ -983,9 +1011,25 @@ class VisPyCanvas(scene.SceneCanvas):
         if self.raw_display_data is None:
             return
         
-        clim_range = max(clim_max - clim_min, 1e-6)
-        normalized = (self.raw_display_data - clim_min) / clim_range
-        normalized = np.clip(normalized, 0.0, 1.0).astype(np.float32)
+        if self.normalization_mode == 'std' and self.local_mean_std is not None:
+            # STD-based normalization using local (visible region) mean/std
+            # This makes it adaptive to zoom level, just like minmax
+            mean, std = self.local_mean_std
+            std = max(std, 1e-6)  # Avoid division by zero
+            
+            # Compute z-scores: (value - mean) / (std * scale)
+            # Maps approximately [-scale, +scale] sigma range
+            z_scores = (self.raw_display_data - mean) / (std * self.std_scale)
+            
+            # Map z-score to [0, 1]: z_score of -scale maps to 0, +scale maps to 1
+            normalized = (z_scores + 1.0) * 0.5
+            normalized = np.clip(normalized, 0.0, 1.0).astype(np.float32)
+        else:
+            # Min-Max normalization (default)
+            clim_range = max(clim_max - clim_min, 1e-6)
+            normalized = (self.raw_display_data - clim_min) / clim_range
+            normalized = np.clip(normalized, 0.0, 1.0).astype(np.float32)
+        
         self.normalized_display_data = normalized
         
         # Preserve transform
@@ -1005,6 +1049,26 @@ class VisPyCanvas(scene.SceneCanvas):
             self.image_visual.transform = current_transform
         
         self.update()
+    
+    def set_normalization_mode(self, mode: str, std_scale: float = 2.5):
+        """Set normalization mode.
+        
+        Args:
+            mode: 'minmax' or 'std'
+            std_scale: Scale factor for STD normalization (typically 2.0-3.0)
+        """
+        if mode not in ('minmax', 'std'):
+            logger.warning(f"Invalid normalization mode: {mode}, using 'minmax'")
+            mode = 'minmax'
+        
+        self.normalization_mode = mode
+        self.std_scale = max(0.5, min(5.0, std_scale))  # Clamp to reasonable range
+        
+        # Re-apply normalization with new mode
+        if self.current_clim is not None:
+            self._apply_normalized_data(self.current_clim[0], self.current_clim[1])
+        
+        logger.debug(f"Normalization mode changed to: {mode} (std_scale={self.std_scale})")
     
     def set_crosshair(self, enabled: bool, pos: tuple = None):
         """Enable/disable crosshair display."""
@@ -1580,4 +1644,65 @@ class VisPyCanvas(scene.SceneCanvas):
         if freq_hz >= 1000:
             return f"{freq_hz/1000:.2f} kHz"
         return f"{freq_hz:.1f} Hz"
+
+    def get_spectrogram_data(self) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Get the current spectrogram data with time and frequency arrays.
+
+        Returns:
+            Tuple of (spectrogram, times, freqs) or None if no data.
+            - spectrogram: 2D array (freq_bins x time_frames)
+            - times: 1D array of time values for each column
+            - freqs: 1D array of frequency values for each row
+        """
+        if self.raw_display_data is None or self.display_extent is None:
+            return None
+
+        time_start, time_end, freq_start, freq_end = self.display_extent
+        n_rows, n_cols = self.raw_display_data.shape
+
+        times = np.linspace(time_start, time_end, n_cols)
+        freqs = np.linspace(freq_start, freq_end, n_rows)
+
+        return self.raw_display_data, times, freqs
+
+    def get_spectrogram_region(self, t_start: float, t_end: float,
+                                f_min: float, f_max: float) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Get spectrogram data for a specific region (e.g., annotation bounds).
+
+        Args:
+            t_start, t_end: Time bounds in seconds
+            f_min, f_max: Frequency bounds in Hz
+
+        Returns:
+            Tuple of (region_spectrogram, region_times, region_freqs) or None.
+            - region_spectrogram: 2D array subset
+            - region_times: 1D array of times for the region
+            - region_freqs: 1D array of frequencies for the region
+        """
+        full_data = self.get_spectrogram_data()
+        if full_data is None:
+            return None
+
+        spectrogram, times, freqs = full_data
+
+        # Find indices for the region
+        t_mask = (times >= t_start) & (times <= t_end)
+        f_mask = (freqs >= f_min) & (freqs <= f_max)
+
+        t_indices = np.where(t_mask)[0]
+        f_indices = np.where(f_mask)[0]
+
+        if len(t_indices) == 0 or len(f_indices) == 0:
+            return None
+
+        t_start_idx = t_indices[0]
+        t_end_idx = t_indices[-1] + 1
+        f_start_idx = f_indices[0]
+        f_end_idx = f_indices[-1] + 1
+
+        region = spectrogram[f_start_idx:f_end_idx, t_start_idx:t_end_idx]
+        region_times = times[t_start_idx:t_end_idx]
+        region_freqs = freqs[f_start_idx:f_end_idx]
+
+        return region, region_times, region_freqs
 
