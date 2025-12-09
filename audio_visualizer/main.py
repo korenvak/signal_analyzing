@@ -35,15 +35,31 @@ def check_dependencies():
     """Check for required dependencies and provide helpful error messages."""
     missing_deps = []
     optional_missing = []
-    
+
     # Required dependencies
     required_deps = {
         'numpy': 'numpy',
-        'scipy': 'scipy', 
+        'scipy': 'scipy',
         'librosa': 'librosa',
         'soundfile': 'soundfile',
-        'PySide6': 'PySide6'
     }
+
+    # Check for Qt binding (PyQt5 or PySide6)
+    qt_available = False
+    try:
+        import PyQt5
+        qt_available = True
+        logger.info("Using PyQt5 for Qt binding")
+    except ImportError:
+        try:
+            import PySide6
+            qt_available = True
+            logger.info("Using PySide6 for Qt binding")
+        except ImportError:
+            pass
+
+    if not qt_available:
+        missing_deps.append('PyQt5 or PySide6')
     
     # Optional but recommended dependencies
     optional_deps = {
@@ -194,25 +210,37 @@ Examples:
     gpu_available = False if args.no_gpu else setup_gpu_acceleration()
     
     try:
-        # Import and start the GUI application
-        from audio_visualizer.ui.main_window import main as start_gui
-        
         logger.info("Launching GUI application...")
-        
+
         # Set initial file if provided
         if args.file:
             if not os.path.exists(args.file):
                 logger.error(f"Audio file not found: {args.file}")
                 return 1
             os.environ['AUDIO_VISUALIZER_INITIAL_FILE'] = args.file
-        
+
         # Set cache configuration
         os.environ['AUDIO_VISUALIZER_CACHE_SIZE'] = str(args.cache_size)
         os.environ['AUDIO_VISUALIZER_GPU_CACHE_SIZE'] = str(args.gpu_cache_size)
         os.environ['AUDIO_VISUALIZER_GPU_ENABLED'] = str(not args.no_gpu and gpu_available)
-        
-        # Start the GUI
-        exit_code = start_gui()
+
+        # IMPORTANT: Create QApplication BEFORE importing any UI modules
+        # This is required because some modules create QWidget subclasses at import time
+        from audio_visualizer.ui.qt_compat import QApplication
+        app = QApplication(sys.argv)
+        app.setApplicationName("Audio Visualizer")
+        app.setApplicationVersion("1.0.0")
+        app.setOrganizationName("Audio Visualization Team")
+
+        # Now safe to import the main window module
+        from audio_visualizer.ui.main_window import MainWindow
+
+        # Create and show main window
+        window = MainWindow()
+        window.show()
+
+        # Start the event loop
+        exit_code = app.exec()
         
         logger.info("Application finished")
         return exit_code

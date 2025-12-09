@@ -8,12 +8,17 @@ from .qt_compat import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
     QWidget, QFrame, QMessageBox, QProgressDialog,
-    Qt, Signal, QColor
+    Qt, Signal, QColor, is_pyqt5
 )
 
 import matplotlib
-matplotlib.use('QtAgg')
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+# Use Qt5Agg for PyQt5, QtAgg for PySide6
+if is_pyqt5():
+    matplotlib.use('Qt5Agg')
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+else:
+    matplotlib.use('QtAgg')
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from audio_visualizer.core.auto_detector import DetectedTrack, AutomaticTrackDetector
