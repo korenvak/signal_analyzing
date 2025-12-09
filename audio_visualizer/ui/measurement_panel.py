@@ -4,10 +4,10 @@ Supports continuous measurement sequences with summary statistics.
 """
 import logging
 from typing import List, Tuple, Optional
-from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, 
-                               QTableWidgetItem, QPushButton, QLabel, QHeaderView,
-                               QFileDialog, QMessageBox, QGroupBox, QGridLayout)
-from PySide6.QtCore import Qt, Signal
+from .qt_compat import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget,
+                        QTableWidgetItem, QPushButton, QLabel, QHeaderView,
+                        QFileDialog, QMessageBox, QGroupBox, QGridLayout,
+                        Qt, Signal)
 import csv
 import numpy as np
 

@@ -3,10 +3,10 @@ Widget for Doppler effect analysis and controls.
 """
 import logging
 import numpy as np
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                              QPushButton, QGroupBox, QFormLayout, QDoubleSpinBox,
-                              QRadioButton, QButtonGroup, QMessageBox, QFileDialog)
-from PySide6.QtCore import Qt, Signal
+from .qt_compat import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                        QPushButton, QGroupBox, QFormLayout, QDoubleSpinBox,
+                        QRadioButton, QButtonGroup, QMessageBox, QFileDialog,
+                        Qt, Signal)
 
 from ..core.doppler_analysis import DopplerAnalyzer, DopplerResult
 

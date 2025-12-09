@@ -1,7 +1,7 @@
 """
 Status widget for displaying performance metrics.
 """
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QProgressBar
+from .qt_compat import QWidget, QHBoxLayout, QLabel, QProgressBar
 
 
 class StatusWidget(QWidget):

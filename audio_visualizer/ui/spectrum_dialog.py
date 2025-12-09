@@ -3,8 +3,7 @@ Pop-up dialog for displaying FFT spectrum of a selected region.
 """
 import logging
 import numpy as np
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, QHBoxLayout
-from PySide6.QtCore import Qt
+from .qt_compat import QDialog, QVBoxLayout, QLabel, QComboBox, QHBoxLayout, Qt
 
 try:
     from vispy import scene

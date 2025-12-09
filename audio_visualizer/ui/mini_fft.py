@@ -3,9 +3,8 @@ Mini FFT Widget for instant spectral analysis of selected regions.
 """
 import logging
 import numpy as np
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QPushButton, 
-                              QCheckBox, QComboBox)
-from PySide6.QtCore import Qt
+from .qt_compat import (QWidget, QVBoxLayout, QLabel, QPushButton,
+                        QCheckBox, QComboBox, Qt)
 
 try:
     from vispy import scene

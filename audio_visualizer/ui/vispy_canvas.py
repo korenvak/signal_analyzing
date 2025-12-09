@@ -6,7 +6,7 @@ import logging
 from typing import Optional, Tuple, Callable
 import numpy as np
 
-from PySide6.QtCore import QTimer, Signal
+from .qt_compat import QTimer, Signal
 
 try:
     from vispy import scene

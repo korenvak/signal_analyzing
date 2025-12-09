@@ -4,10 +4,8 @@ Annotation table widget for displaying and editing annotations.
 import logging
 from typing import Optional, List
 
-from PySide6.QtWidgets import (QTableWidget, QTableWidgetItem, QHeaderView,
-                               QAbstractItemView, QMenu, QMessageBox)
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeyEvent
+from .qt_compat import (QTableWidget, QTableWidgetItem, QHeaderView,
+                        QAbstractItemView, QMenu, QMessageBox, Qt, Signal, QKeyEvent)
 
 from .annotation_data import Annotation
 

@@ -11,7 +11,7 @@ from typing import Optional, Tuple, Callable
 from dataclasses import dataclass
 import numpy as np
 
-from PySide6.QtCore import QObject, Signal
+from .qt_compat import QObject, Signal
 
 try:
     from vispy import scene

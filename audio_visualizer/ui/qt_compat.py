@@ -1,0 +1,92 @@
+"""
+Qt compatibility layer for PySide6/PyQt5.
+
+This module provides a unified interface for Qt imports, allowing the application
+to work with either PySide6 or PyQt5 depending on which is available.
+
+Usage:
+    from .qt_compat import QtWidgets, QtCore, QtGui, Signal, Slot
+"""
+
+import sys
+
+# Try PyQt5 first (for compatibility with older systems), then fall back to PySide6
+QT_BINDING = None
+
+try:
+    from PyQt5 import QtWidgets, QtCore, QtGui
+    from PyQt5.QtCore import pyqtSignal as Signal, pyqtSlot as Slot
+    from PyQt5.QtWidgets import *
+    from PyQt5.QtCore import (
+        Qt, QTimer, QThread, QObject, QEvent, QSize, QPoint, QRect,
+        QPointF, QRectF, QMimeData, QUrl, QByteArray
+    )
+    from PyQt5.QtGui import (
+        QKeySequence, QColor, QPen, QBrush, QPainter, QImage, QPixmap,
+        QFont, QFontMetrics, QCursor, QPalette, QIcon, QDoubleValidator,
+        QIntValidator, QLinearGradient, QRadialGradient, QTransform,
+        QPolygonF, QPainterPath, QDragEnterEvent, QDropEvent, QKeyEvent,
+        QMouseEvent, QWheelEvent, QResizeEvent, QCloseEvent, QPaintEvent
+    )
+    # In PyQt5, QAction is in QtWidgets
+    from PyQt5.QtWidgets import QAction
+    QT_BINDING = 'PyQt5'
+except ImportError:
+    try:
+        from PySide6 import QtWidgets, QtCore, QtGui
+        from PySide6.QtCore import Signal, Slot
+        from PySide6.QtWidgets import *
+        from PySide6.QtCore import (
+            Qt, QTimer, QThread, QObject, QEvent, QSize, QPoint, QRect,
+            QPointF, QRectF, QMimeData, QUrl, QByteArray
+        )
+        from PySide6.QtGui import (
+            QKeySequence, QColor, QPen, QBrush, QPainter, QImage, QPixmap,
+            QFont, QFontMetrics, QCursor, QPalette, QIcon, QDoubleValidator,
+            QIntValidator, QLinearGradient, QRadialGradient, QTransform,
+            QPolygonF, QPainterPath, QDragEnterEvent, QDropEvent, QKeyEvent,
+            QMouseEvent, QWheelEvent, QResizeEvent, QCloseEvent, QPaintEvent
+        )
+        # In PySide6, QAction is in QtGui
+        from PySide6.QtGui import QAction
+        QT_BINDING = 'PySide6'
+    except ImportError:
+        raise ImportError("Neither PyQt5 nor PySide6 is available. Please install one of them.")
+
+# Print which binding is being used (for debugging)
+# print(f"Using Qt binding: {QT_BINDING}")
+
+# Handle differences between PyQt5 and PySide6
+
+# exec() vs exec_() difference
+if QT_BINDING == 'PyQt5':
+    # PyQt5 uses exec_() for compatibility with Python 2
+    # But modern PyQt5 also supports exec()
+    # We'll patch QDialog and QApplication to ensure exec() works
+    _original_dialog_exec = QDialog.exec if hasattr(QDialog, 'exec') else None
+    if not _original_dialog_exec:
+        QDialog.exec = QDialog.exec_
+
+    _original_app_exec = QApplication.exec if hasattr(QApplication, 'exec') else None
+    if not _original_app_exec:
+        QApplication.exec = QApplication.exec_
+
+    # QMessageBox.exec() might also need patching
+    _original_msgbox_exec = QMessageBox.exec if hasattr(QMessageBox, 'exec') else None
+    if not _original_msgbox_exec:
+        QMessageBox.exec = QMessageBox.exec_
+
+
+def get_qt_binding():
+    """Return the name of the Qt binding being used."""
+    return QT_BINDING
+
+
+def is_pyqt5():
+    """Return True if using PyQt5."""
+    return QT_BINDING == 'PyQt5'
+
+
+def is_pyside6():
+    """Return True if using PySide6."""
+    return QT_BINDING == 'PySide6'

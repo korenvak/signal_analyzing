@@ -9,12 +9,12 @@ import numpy as np
 from typing import Optional
 from pathlib import Path
 
-from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
-                              QWidget, QToolBar, QLabel, QPushButton, QFileDialog,
-                              QMessageBox, QSplitter, QFrame, QSizePolicy, QDialog)
-from PySide6.QtCore import QCoreApplication
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from .qt_compat import (
+    QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
+    QWidget, QToolBar, QLabel, QPushButton, QFileDialog,
+    QMessageBox, QSplitter, QFrame, QSizePolicy, QDialog,
+    Qt, QTimer, QAction, QKeySequence, QMenu, QCursor
+)
 
 try:
     from vispy import scene
@@ -58,15 +58,24 @@ from .event_dialog import EventInputDialog, EventEditDialog
 from .event_data import TaggedEvent
 from ..core.filter_manager import FilterManager
 from ..core.filename_parser import parse_pixel_filename
+from .filter_dialog import (
+    GaussianBlurDialog, MedianFilterDialog, ContrastEnhanceDialog,
+    ThresholdDialog, MeijeringDialog, MorphologicalDialog,
+    HorizontalLineRemovalDialog, VerticalLineRemovalDialog,
+    SpectralSubtractionDialog, PCENDialog, AdaptiveNoiseGateDialog,
+    TrackSuppressionDialog, LowPassFilterDialog, HighPassFilterDialog,
+    BandPassFilterDialog, BandStopFilterDialog, WienerFilterDialog,
+    BilateralFilterDialog, HarmonicPercussiveDialog, SpectralGatingDialog,
+    TotalVariationDialog, NonLocalMeansDialog, LocalContrastNormDialog,
+    CLAHEDialog
+)
 from ..core.cutout_analyzer import (
-    extract_spectrogram_cutout, 
-    normalize_cutout, 
-    save_cutout_image, 
-    save_cutout_numpy, 
+    extract_spectrogram_cutout,
+    normalize_cutout,
+    save_cutout_image,
+    save_cutout_numpy,
     write_cutout_metadata
 )
-from PySide6.QtWidgets import QMenu
-from PySide6.QtGui import QCursor
 
 logger = logging.getLogger(__name__)
 
@@ -566,20 +575,137 @@ class MainWindow(QMainWindow):
         help_menu.addAction(shortcuts_action)
     
     def setup_filter_menu(self, menubar):
-        """Setup the Filters menu."""
+        """Setup the Filters menu with all available filters."""
         filter_menu = menubar.addMenu("Filters")
-        
-        apply_meijering_action = QAction("Apply Meijering Filter", self)
-        apply_meijering_action.triggered.connect(self.apply_meijering_filter)
-        filter_menu.addAction(apply_meijering_action)
-        
+
+        # === Basic Filters Submenu ===
+        basic_menu = filter_menu.addMenu("Basic Filters")
+
+        gaussian_action = QAction("Gaussian Blur...", self)
+        gaussian_action.triggered.connect(self.apply_gaussian_blur_filter)
+        basic_menu.addAction(gaussian_action)
+
+        median_action = QAction("Median Filter...", self)
+        median_action.triggered.connect(self.apply_median_filter)
+        basic_menu.addAction(median_action)
+
+        contrast_action = QAction("Contrast Enhancement...", self)
+        contrast_action.triggered.connect(self.apply_contrast_filter)
+        basic_menu.addAction(contrast_action)
+
+        threshold_action = QAction("Threshold...", self)
+        threshold_action.triggered.connect(self.apply_threshold_filter)
+        basic_menu.addAction(threshold_action)
+
+        # === Frequency Domain Submenu ===
+        freq_menu = filter_menu.addMenu("Frequency Domain")
+
+        lowpass_action = QAction("Low-Pass Filter...", self)
+        lowpass_action.triggered.connect(self.apply_lowpass_filter)
+        freq_menu.addAction(lowpass_action)
+
+        highpass_action = QAction("High-Pass Filter...", self)
+        highpass_action.triggered.connect(self.apply_highpass_filter)
+        freq_menu.addAction(highpass_action)
+
+        bandpass_action = QAction("Band-Pass Filter...", self)
+        bandpass_action.triggered.connect(self.apply_bandpass_filter)
+        freq_menu.addAction(bandpass_action)
+
+        bandstop_action = QAction("Band-Stop Filter...", self)
+        bandstop_action.triggered.connect(self.apply_bandstop_filter)
+        freq_menu.addAction(bandstop_action)
+
+        # === Ridge/Edge Detection Submenu ===
+        detection_menu = filter_menu.addMenu("Ridge/Edge Detection")
+
+        meijering_action = QAction("Meijering Ridge Detection...", self)
+        meijering_action.triggered.connect(self.apply_meijering_filter)
+        detection_menu.addAction(meijering_action)
+
+        morphological_action = QAction("Morphological Filter...", self)
+        morphological_action.triggered.connect(self.apply_morphological_filter)
+        detection_menu.addAction(morphological_action)
+
+        # === Noise Removal Submenu ===
+        noise_menu = filter_menu.addMenu("Noise Removal")
+
+        spectral_sub_action = QAction("Spectral Subtraction...", self)
+        spectral_sub_action.triggered.connect(self.apply_spectral_subtraction_filter)
+        noise_menu.addAction(spectral_sub_action)
+
+        pcen_action = QAction("PCEN (Per-Channel Energy Norm)...", self)
+        pcen_action.triggered.connect(self.apply_pcen_filter)
+        noise_menu.addAction(pcen_action)
+
+        adaptive_gate_action = QAction("Adaptive Noise Gate...", self)
+        adaptive_gate_action.triggered.connect(self.apply_adaptive_noise_gate_filter)
+        noise_menu.addAction(adaptive_gate_action)
+
+        spectral_gate_action = QAction("Spectral Gating...", self)
+        spectral_gate_action.triggered.connect(self.apply_spectral_gating_filter)
+        noise_menu.addAction(spectral_gate_action)
+
+        wiener_action = QAction("Wiener Filter...", self)
+        wiener_action.triggered.connect(self.apply_wiener_filter)
+        noise_menu.addAction(wiener_action)
+
+        # === Track Removal Submenu ===
+        track_menu = filter_menu.addMenu("Track/Line Removal")
+
+        h_line_action = QAction("Remove Horizontal Lines (Constant Freq)...", self)
+        h_line_action.triggered.connect(self.apply_horizontal_line_removal_filter)
+        track_menu.addAction(h_line_action)
+
+        v_line_action = QAction("Remove Vertical Lines (Clicks)...", self)
+        v_line_action.triggered.connect(self.apply_vertical_line_removal_filter)
+        track_menu.addAction(v_line_action)
+
+        track_suppress_action = QAction("Track Suppression...", self)
+        track_suppress_action.triggered.connect(self.apply_track_suppression_filter)
+        track_menu.addAction(track_suppress_action)
+
+        hps_action = QAction("Harmonic-Percussive Separation...", self)
+        hps_action.triggered.connect(self.apply_harmonic_percussive_filter)
+        track_menu.addAction(hps_action)
+
+        # === Advanced Denoising Submenu ===
+        advanced_menu = filter_menu.addMenu("Advanced Denoising")
+
+        bilateral_action = QAction("Bilateral Filter (Edge-Preserving)...", self)
+        bilateral_action.triggered.connect(self.apply_bilateral_filter)
+        advanced_menu.addAction(bilateral_action)
+
+        tv_action = QAction("Total Variation Denoising...", self)
+        tv_action.triggered.connect(self.apply_tv_denoise_filter)
+        advanced_menu.addAction(tv_action)
+
+        nlm_action = QAction("Non-Local Means...", self)
+        nlm_action.triggered.connect(self.apply_nlm_filter)
+        advanced_menu.addAction(nlm_action)
+
+        lcn_action = QAction("Local Contrast Normalization...", self)
+        lcn_action.triggered.connect(self.apply_lcn_filter)
+        advanced_menu.addAction(lcn_action)
+
+        clahe_action = QAction("CLAHE (Adaptive Histogram)...", self)
+        clahe_action.triggered.connect(self.apply_clahe_filter)
+        advanced_menu.addAction(clahe_action)
+
         filter_menu.addSeparator()
-        
+
+        # === Undo/Redo ===
         self.undo_filter_action = QAction("Undo Filter", self)
         self.undo_filter_action.setShortcut("Ctrl+Z")
         self.undo_filter_action.triggered.connect(self.undo_filter)
         self.undo_filter_action.setEnabled(False)
         filter_menu.addAction(self.undo_filter_action)
+
+        self.redo_filter_action = QAction("Redo Filter", self)
+        self.redo_filter_action.setShortcut("Ctrl+Y")
+        self.redo_filter_action.triggered.connect(self.redo_filter)
+        self.redo_filter_action.setEnabled(False)
+        filter_menu.addAction(self.redo_filter_action)
 
     def setup_compact_toolbar(self):
         """Setup a compact toolbar with essential controls."""
@@ -2869,57 +2995,398 @@ class MainWindow(QMainWindow):
         self.current_view_range = ((0.0, duration), (0.0, sample_rate / 2))
         self.refresh_current_view()
     
-    def apply_meijering_filter(self):
-        """Apply Meijering filter to the current spectrogram."""
-        # Get current data
+    # =========================================================================
+    # Filter Application Methods
+    # =========================================================================
+
+    def _apply_filter_common(self, filter_func, filter_name: str, **kwargs):
+        """Common filter application logic with undo support.
+
+        Args:
+            filter_func: Filter function to call (from filter_manager)
+            filter_name: Display name for status messages
+            **kwargs: Parameters to pass to filter function
+        """
         full_data, _, _ = self._get_spectrogram_axes()
         if full_data is None:
             QMessageBox.warning(self, "Filter Error", "No spectrogram data available.")
-            return
-            
+            return False
+
         # Push state for Undo
         self.filter_manager.push_state(full_data)
-        self.undo_filter_action.setEnabled(True)
-        
-        # Show processing dialog/message
-        self.statusBar().showMessage("Applying Meijering Filter... Please wait.")
+        self._update_undo_redo_state()
+
+        self.statusBar().showMessage(f"Applying {filter_name}... Please wait.")
         QApplication.processEvents()
-        
-        # Apply filter
+
         try:
-            # Parameters could be adjustable in a dialog, but using defaults for now
-            filtered_data, log_msg = self.filter_manager.apply_meijering(
-                full_data, sigmas=range(1, 4), black_ridges=False, mode='reflect'
-            )
-            
+            filtered_data, log_msg = filter_func(full_data, **kwargs)
+
             # Update cache
             self.spectrogram_cache['data'] = filtered_data
-            
+
             # Update display
             if hasattr(self.spectrogram_canvas, 'update_image'):
-                 self.spectrogram_canvas.update_image(filtered_data)
-            
-            # Show log message
-            QMessageBox.information(self, "Filter Applied", log_msg)
+                self.spectrogram_canvas.update_image(filtered_data)
+
             self.statusBar().showMessage(f"Filter applied: {log_msg}")
-            
+            return True
+
         except Exception as e:
-            logger.exception("Filter application failed")
-            QMessageBox.critical(self, "Filter Error", f"Failed to apply filter: {e}")
-            self.undo_filter() # Revert state
-            
+            logger.exception(f"{filter_name} failed")
+            QMessageBox.critical(self, "Filter Error", f"Failed to apply {filter_name}: {e}")
+            self.undo_filter()
+            return False
+
+    def _update_undo_redo_state(self):
+        """Update undo/redo action enabled states."""
+        self.undo_filter_action.setEnabled(self.filter_manager.can_undo())
+        self.redo_filter_action.setEnabled(self.filter_manager.can_redo())
+
+    # === Basic Filters ===
+
+    def apply_gaussian_blur_filter(self):
+        """Apply Gaussian blur filter with dialog."""
+        dialog = GaussianBlurDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_gaussian_blur,
+                "Gaussian Blur",
+                sigma=params['sigma']
+            )
+
+    def apply_median_filter(self):
+        """Apply median filter with dialog."""
+        dialog = MedianFilterDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_median_filter,
+                "Median Filter",
+                size=params['size']
+            )
+
+    def apply_contrast_filter(self):
+        """Apply contrast enhancement with dialog."""
+        dialog = ContrastEnhanceDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_contrast_enhancement,
+                "Contrast Enhancement",
+                percentile_low=params['percentile_low'],
+                percentile_high=params['percentile_high']
+            )
+
+    def apply_threshold_filter(self):
+        """Apply threshold filter with dialog."""
+        dialog = ThresholdDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_threshold,
+                "Threshold",
+                method=params['method'],
+                value=params['value'],
+                binary=params['binary']
+            )
+
+    # === Ridge/Edge Detection ===
+
+    def apply_meijering_filter(self):
+        """Apply Meijering ridge detection filter with dialog."""
+        dialog = MeijeringDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            sigmas = range(params['sigma_min'], params['sigma_max'] + 1)
+            self._apply_filter_common(
+                self.filter_manager.apply_meijering,
+                "Meijering Ridge Detection",
+                sigmas=sigmas,
+                black_ridges=params['black_ridges']
+            )
+
+    def apply_morphological_filter(self):
+        """Apply morphological filter with dialog."""
+        dialog = MorphologicalDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_morphological,
+                "Morphological Filter",
+                operation=params['operation'],
+                kernel_width=params['kernel_width'],
+                kernel_height=params['kernel_height']
+            )
+
+    # === Noise Removal ===
+
+    def apply_spectral_subtraction_filter(self):
+        """Apply spectral subtraction with dialog."""
+        dialog = SpectralSubtractionDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_spectral_subtraction,
+                "Spectral Subtraction",
+                noise_percentile=params['noise_percentile'],
+                subtraction_factor=params['subtraction_factor'],
+                floor=params['floor']
+            )
+
+    def apply_pcen_filter(self):
+        """Apply PCEN (Per-Channel Energy Normalization) with dialog."""
+        dialog = PCENDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_pcen,
+                "PCEN",
+                time_constant=params['time_constant'],
+                gain=params['gain'],
+                power=params['power'],
+                bias=params['bias'],
+                eps=params['eps']
+            )
+
+    def apply_adaptive_noise_gate_filter(self):
+        """Apply adaptive noise gate with dialog."""
+        dialog = AdaptiveNoiseGateDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_adaptive_noise_gate,
+                "Adaptive Noise Gate",
+                window_time=params['window_time'],
+                window_freq=params['window_freq'],
+                threshold_db=params['threshold_db'],
+                soft_knee=params['soft_knee']
+            )
+
+    # === Track/Line Removal ===
+
+    def apply_horizontal_line_removal_filter(self):
+        """Apply horizontal line removal with dialog."""
+        dialog = HorizontalLineRemovalDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_horizontal_line_removal,
+                "Horizontal Line Removal",
+                threshold_percentile=params['threshold_percentile'],
+                min_width_ratio=params['min_width_ratio'],
+                method=params['method']
+            )
+
+    def apply_vertical_line_removal_filter(self):
+        """Apply vertical line removal with dialog."""
+        dialog = VerticalLineRemovalDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_vertical_line_removal,
+                "Vertical Line Removal",
+                threshold_percentile=params['threshold_percentile'],
+                min_height_ratio=params['min_height_ratio'],
+                method=params['method']
+            )
+
+    def apply_track_suppression_filter(self):
+        """Apply track suppression with dialog."""
+        dialog = TrackSuppressionDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_track_suppression,
+                "Track Suppression",
+                method=params['method'],
+                sigma=params['sigma'],
+                threshold=params['threshold'],
+                suppression_strength=params['suppression_strength'],
+                inpaint=params['inpaint']
+            )
+
+    # === Frequency Domain Filters ===
+
+    def apply_lowpass_filter(self):
+        """Apply low-pass filter with dialog."""
+        dialog = LowPassFilterDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_lowpass_filter,
+                "Low-Pass Filter",
+                cutoff_bin=params['cutoff_bin'],
+                rolloff=params['rolloff']
+            )
+
+    def apply_highpass_filter(self):
+        """Apply high-pass filter with dialog."""
+        dialog = HighPassFilterDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_highpass_filter,
+                "High-Pass Filter",
+                cutoff_bin=params['cutoff_bin'],
+                rolloff=params['rolloff']
+            )
+
+    def apply_bandpass_filter(self):
+        """Apply band-pass filter with dialog."""
+        dialog = BandPassFilterDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_bandpass_filter,
+                "Band-Pass Filter",
+                low_cutoff_bin=params['low_cutoff_bin'],
+                high_cutoff_bin=params['high_cutoff_bin'],
+                rolloff=params['rolloff']
+            )
+
+    def apply_bandstop_filter(self):
+        """Apply band-stop (notch) filter with dialog."""
+        dialog = BandStopFilterDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_bandstop_filter,
+                "Band-Stop Filter",
+                low_cutoff_bin=params['low_cutoff_bin'],
+                high_cutoff_bin=params['high_cutoff_bin'],
+                rolloff=params['rolloff']
+            )
+
+    # === Advanced Denoising Filters ===
+
+    def apply_wiener_filter(self):
+        """Apply Wiener filter with dialog."""
+        dialog = WienerFilterDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_wiener_filter,
+                "Wiener Filter",
+                noise_variance=params['noise_variance'],
+                window_size=params['window_size']
+            )
+
+    def apply_bilateral_filter(self):
+        """Apply bilateral filter with dialog."""
+        dialog = BilateralFilterDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_bilateral_filter,
+                "Bilateral Filter",
+                sigma_spatial=params['sigma_spatial'],
+                sigma_color=params['sigma_color']
+            )
+
+    def apply_harmonic_percussive_filter(self):
+        """Apply harmonic-percussive separation with dialog."""
+        dialog = HarmonicPercussiveDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_harmonic_percussive_separation,
+                "Harmonic-Percussive Separation",
+                kernel_size_harmonic=params['kernel_size_harmonic'],
+                kernel_size_percussive=params['kernel_size_percussive'],
+                output=params['output']
+            )
+
+    def apply_spectral_gating_filter(self):
+        """Apply spectral gating with dialog."""
+        dialog = SpectralGatingDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_spectral_gating,
+                "Spectral Gating",
+                noise_percentile=params['noise_percentile'],
+                threshold_db=params['threshold_db'],
+                smoothing_time=params['smoothing_time'],
+                smoothing_freq=params['smoothing_freq']
+            )
+
+    def apply_tv_denoise_filter(self):
+        """Apply Total Variation denoising with dialog."""
+        dialog = TotalVariationDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_denoise_tv,
+                "Total Variation Denoising",
+                weight=params['weight']
+            )
+
+    def apply_nlm_filter(self):
+        """Apply Non-Local Means denoising with dialog."""
+        dialog = NonLocalMeansDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_non_local_means,
+                "Non-Local Means Denoising",
+                patch_size=params['patch_size'],
+                patch_distance=params['patch_distance'],
+                h=params['h']
+            )
+
+    def apply_lcn_filter(self):
+        """Apply Local Contrast Normalization with dialog."""
+        dialog = LocalContrastNormDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_local_contrast_normalization,
+                "Local Contrast Normalization",
+                window_size=params['window_size'],
+                epsilon=params['epsilon']
+            )
+
+    def apply_clahe_filter(self):
+        """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) with dialog."""
+        dialog = CLAHEDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_values()
+            self._apply_filter_common(
+                self.filter_manager.apply_clahe,
+                "CLAHE",
+                clip_limit=params['clip_limit'],
+                tile_grid_size=params['tile_grid_size']
+            )
+
+    # === Undo/Redo ===
+
     def undo_filter(self):
         """Undo the last filter operation."""
         full_data, _, _ = self._get_spectrogram_axes()
         restored_data = self.filter_manager.undo(full_data)
-        
+
         if restored_data is not None:
             self.spectrogram_cache['data'] = restored_data
             if hasattr(self.spectrogram_canvas, 'update_image'):
-                 self.spectrogram_canvas.update_image(restored_data)
-            
-            self.undo_filter_action.setEnabled(self.filter_manager.can_undo())
+                self.spectrogram_canvas.update_image(restored_data)
             self.statusBar().showMessage("Filter undone.")
+
+        self._update_undo_redo_state()
+
+    def redo_filter(self):
+        """Redo the last undone filter operation."""
+        full_data, _, _ = self._get_spectrogram_axes()
+        restored_data = self.filter_manager.redo(full_data)
+
+        if restored_data is not None:
+            self.spectrogram_cache['data'] = restored_data
+            if hasattr(self.spectrogram_canvas, 'update_image'):
+                self.spectrogram_canvas.update_image(restored_data)
+            self.statusBar().showMessage("Filter redone.")
+
+        self._update_undo_redo_state()
 
     def update_performance_stats(self):
         """Update performance statistics display."""

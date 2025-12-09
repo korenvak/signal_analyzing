@@ -1,10 +1,10 @@
 """
 Controls widget for spectrogram settings.
 """
-from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, 
-                               QComboBox, QPushButton, QFrame, QToolButton,
-                               QMenu, QWidgetAction, QSlider, QSizePolicy)
-from PySide6.QtCore import Qt, Signal
+from .qt_compat import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
+                        QComboBox, QPushButton, QFrame, QToolButton,
+                        QMenu, QWidgetAction, QSlider, QSizePolicy,
+                        Qt, Signal)
 
 
 class ControlsWidget(QWidget):

@@ -7,12 +7,10 @@ import numpy as np
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                              QComboBox, QPushButton, QFileDialog, QFrame,
-                              QGroupBox, QFormLayout, QSpinBox, QDoubleSpinBox,
-                              QMessageBox)
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QImage, QPixmap
+from .qt_compat import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                        QComboBox, QPushButton, QFileDialog, QFrame,
+                        QGroupBox, QFormLayout, QSpinBox, QDoubleSpinBox,
+                        QMessageBox, Qt, Signal, QImage, QPixmap)
 
 from ..core.cutout_analyzer import (
     extract_spectrogram_cutout, 

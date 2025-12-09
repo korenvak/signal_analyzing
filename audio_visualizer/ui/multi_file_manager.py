@@ -8,11 +8,10 @@ import logging
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass
-from PySide6.QtWidgets import (QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, 
-                              QListWidget, QListWidgetItem, QPushButton, QLabel,
-                              QSplitter, QFrame, QFileDialog, QMessageBox)
-from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from .qt_compat import (QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
+                        QListWidget, QListWidgetItem, QPushButton, QLabel,
+                        QSplitter, QFrame, QFileDialog, QMessageBox,
+                        Qt, Signal, QTimer, QDragEnterEvent, QDropEvent)
 
 logger = logging.getLogger(__name__)
 

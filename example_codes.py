@@ -7,9 +7,11 @@ import numpy as np
 from datetime import timedelta
 from functools import lru_cache
 import pyqtgraph as pg
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QToolTip, QApplication
-from PySide6.QtCore import Qt, Signal, QTimer, QRectF, QPointF
-from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QLinearGradient
+from audio_visualizer.ui.qt_compat import (
+    QWidget, QVBoxLayout, QApplication,
+    Qt, Signal, QTimer, QRectF, QPointF,
+    QPainter, QColor, QBrush, QPen
+)
 import matplotlib.cm as cm
 from numba import jit, prange
 

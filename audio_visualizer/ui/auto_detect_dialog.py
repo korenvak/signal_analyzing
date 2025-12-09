@@ -4,22 +4,12 @@ Dialog for selecting detected tracks from automatic track detection.
 import numpy as np
 from typing import List, Optional, Tuple
 
-try:
-    from PySide6.QtWidgets import (
-        QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-        QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
-        QWidget, QFrame, QMessageBox, QProgressDialog
-    )
-    from PySide6.QtCore import Qt, Signal
-    from PySide6.QtGui import QColor
-except ImportError:
-    from PyQt6.QtWidgets import (
-        QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-        QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
-        QWidget, QFrame, QMessageBox, QProgressDialog
-    )
-    from PyQt6.QtCore import Qt, Signal
-    from PyQt6.QtGui import QColor
+from .qt_compat import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
+    QWidget, QFrame, QMessageBox, QProgressDialog,
+    Qt, Signal, QColor
+)
 
 import matplotlib
 matplotlib.use('QtAgg')
