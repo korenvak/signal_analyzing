@@ -400,7 +400,16 @@ class VisPyCanvas(scene.SceneCanvas):
         self._on_curve_updated_callback = None  # Callback(points) when curve changes
         self._on_curve_completed_callback = None  # Callback(points) when Enter pressed when curve changes
         self._on_curve_completed_callback = None  # Callback(points) when user presses Enter
-        
+
+        # Event Tagging Mode (vertical lines for marking events)
+        self.event_mode = False
+        self.event_t1: Optional[float] = None     # First time marker (click 1)
+        self.event_t2: Optional[float] = None     # Second time marker (click 2)
+        self.event_line_1: Optional[scene.visuals.Line] = None
+        self.event_line_2: Optional[scene.visuals.Line] = None
+        self._on_event_created_callback = None    # Callback(t_start, t_end) when both lines placed
+        self._on_event_mode_toggled_callback = None  # Callback(enabled: bool) when mode toggled via E key
+
         # Text readout
         self.text_visual = scene.visuals.Text('', color='white', font_size=11,
                                               pos=(10, 30), parent=self.view.scene)
@@ -516,7 +525,26 @@ class VisPyCanvas(scene.SceneCanvas):
             pass
     
     def on_key_press(self, event):
-        """Handle key press events for zoom controls and measurement."""
+        """Handle key press events for zoom controls, navigation, and modes."""
+        # Arrow keys for navigation - work in ALL modes (annotation, measurement, event, etc.)
+        if event.key == 'Left':
+            self._pan_by_fraction(-0.2, 0)  # Pan left 20% of view
+            event.handled = True
+            return
+        elif event.key == 'Right':
+            self._pan_by_fraction(0.2, 0)  # Pan right 20% of view
+            event.handled = True
+            return
+        elif event.key == 'Up':
+            self._pan_by_fraction(0, 0.2)  # Pan up 20% of view
+            event.handled = True
+            return
+        elif event.key == 'Down':
+            self._pan_by_fraction(0, -0.2)  # Pan down 20% of view
+            event.handled = True
+            return
+
+        # Zoom controls
         if event.key == 'X':
             self.zoom_with_center([2/3, 1.0], None)
         elif event.key == 'x':
@@ -548,9 +576,19 @@ class VisPyCanvas(scene.SceneCanvas):
         elif event.key in ('A', 'a'):
             # Toggle annotation mode
             self.set_annotation_mode(not self.annotation_mode)
+        elif event.key in ('E', 'e'):
+            # Toggle event tagging mode
+            new_state = not self.event_mode
+            self.set_event_mode(new_state)
+            # Notify main window to show/hide event panel
+            if self._on_event_mode_toggled_callback:
+                self._on_event_mode_toggled_callback(new_state)
         elif event.key == 'Escape':
-            # Clear measurement or curve, but DON'T close the window
-            if self.measurement_mode:
+            # Clear measurement, curve, or event markers, but DON'T close the window
+            if self.event_mode:
+                self.clear_event_markers()
+                event.handled = True
+            elif self.measurement_mode:
                 self.clear_measurement()
                 # Don't exit measurement mode, just clear current measurement
                 event.handled = True
@@ -584,6 +622,15 @@ class VisPyCanvas(scene.SceneCanvas):
                 logger.warning(f"Error handling right click: {e}", exc_info=True)
         
         if event.button == 1:
+            # Priority 0: Event Tagging Mode (vertical lines)
+            if self.event_mode:
+                world_pos = self._screen_to_world(event.pos)
+                if world_pos is not None:
+                    time_pos = world_pos[0]
+                    self._add_event_marker(time_pos)
+                    event.handled = True
+                    return
+
             # Priority 1: Curve Drawing Mode
             if self.curve_mode:
                 world_pos = self._screen_to_world(event.pos)
@@ -633,8 +680,8 @@ class VisPyCanvas(scene.SceneCanvas):
                     event.handled = True
                     return
             
-            # Normal panning (only if not in annotation, measurement, or curve mode)
-            if not self.annotation_mode and not self.measurement_mode and not self.curve_mode:
+            # Normal panning (only if not in special modes)
+            if not self.annotation_mode and not self.measurement_mode and not self.curve_mode and not self.event_mode:
                 self.is_panning = True
                 self.last_mouse_pos = event.pos
                 event.handled = True
@@ -807,7 +854,44 @@ class VisPyCanvas(scene.SceneCanvas):
             time_min, time_max, freq_min, freq_max = self.data_bounds
             self.view.camera.rect = (time_min, freq_min, time_max - time_min, freq_max - freq_min)
             self.update_dynamic_clim()
-    
+
+    def _pan_by_fraction(self, dx_fraction: float, dy_fraction: float):
+        """Pan the view by a fraction of the current view size.
+
+        Works in all modes (annotation, measurement, event) - allows navigation
+        while marking regions.
+
+        Args:
+            dx_fraction: Horizontal pan as fraction of view width (positive = right)
+            dy_fraction: Vertical pan as fraction of view height (positive = up)
+        """
+        rect = self.view.camera.rect
+        if rect is None:
+            return
+
+        # Calculate pan amounts
+        dx = dx_fraction * rect.width
+        dy = dy_fraction * rect.height
+
+        # Calculate new position
+        new_left = rect.left + dx
+        new_bottom = rect.bottom + dy
+
+        # Constrain to data bounds if set
+        if self.data_bounds:
+            time_min, time_max, freq_min, freq_max = self.data_bounds
+            # Don't pan beyond data bounds
+            new_left = max(time_min, min(new_left, time_max - rect.width))
+            new_bottom = max(freq_min, min(new_bottom, freq_max - rect.height))
+
+        # Apply new camera rect
+        self.view.camera.rect = (new_left, new_bottom, rect.width, rect.height)
+
+        # Update display
+        self.notify_zoom_changed()
+        self.schedule_auto_recompute()
+        self.update()
+
     def update_image(self, data: np.ndarray, extent: tuple = None, preserve_view: bool = False):
         """Update the displayed image data.
         
@@ -1217,6 +1301,183 @@ class VisPyCanvas(scene.SceneCanvas):
         self.curve_markers.visible = True
         self.curve_markers.order = 300  # Very high order to ensure on top
         logger.info(f"Curve markers set to visible with {len(points)} points at order 300")
+        self.update()
+
+    # ==================== Event Tagging Mode (Vertical Lines) ====================
+
+    def set_event_mode(self, enabled: bool):
+        """Enable or disable event tagging mode.
+
+        In event mode, clicking places vertical lines to mark event boundaries.
+        First click places line 1, second click places line 2 and triggers callback.
+        Lines stay visible until mode is exited.
+
+        Args:
+            enabled: True to enable event mode
+        """
+        was_enabled = self.event_mode
+        self.event_mode = enabled
+
+        if enabled and not was_enabled:
+            # Entering event mode - disable other modes
+            self.annotation_mode = False
+            self.measurement_mode = False
+            self.curve_mode = False
+            # Show existing lines if any
+            self._set_event_lines_visible(True)
+            if self.event_t1 is None:
+                self.update_text_readout("EVENT MODE: Click to place start line", (10, 60))
+            elif self.event_t2 is None:
+                self.update_text_readout(f"EVENT MODE: Start at {self.event_t1:.3f}s | Click for end line | ESC to clear", (10, 60))
+            else:
+                t_start = min(self.event_t1, self.event_t2)
+                t_end = max(self.event_t1, self.event_t2)
+                self.update_text_readout(f"EVENT: {t_start:.3f}s - {t_end:.3f}s | Click to start new event", (10, 60))
+            logger.info("Event mode: ON (Click to place vertical lines)")
+        elif not enabled and was_enabled:
+            # Exiting event mode - hide lines but DON'T delete them
+            self._set_event_lines_visible(False)
+            self.update_text_readout("", (10, 60))
+            logger.info("Event mode: OFF")
+
+        self.update()
+
+    def set_event_created_callback(self, callback):
+        """Set callback for when event region is marked (both lines placed).
+
+        Args:
+            callback: Function(t_start: float, t_end: float) -> None
+        """
+        self._on_event_created_callback = callback
+
+    def set_event_mode_toggled_callback(self, callback):
+        """Set callback for when event mode is toggled via E key.
+
+        Args:
+            callback: Function(enabled: bool) -> None
+        """
+        self._on_event_mode_toggled_callback = callback
+
+    def _add_event_marker(self, time: float):
+        """Add a vertical line at the given time position.
+
+        Args:
+            time: Time position in seconds
+        """
+        if self.event_t1 is None:
+            # First click - place line 1
+            self.event_t1 = time
+            self.event_line_1 = self._create_event_vertical_line(time)
+            self.update_text_readout(f"EVENT MODE: Start at {time:.3f}s | Click for end line | ESC to clear", (10, 60))
+            logger.info(f"Event marker 1 placed at t={time:.3f}s")
+
+        elif self.event_t2 is None:
+            # Second click - place line 2 and trigger callback
+            self.event_t2 = time
+            self.event_line_2 = self._create_event_vertical_line(time)
+
+            # Order times
+            t_start = min(self.event_t1, self.event_t2)
+            t_end = max(self.event_t1, self.event_t2)
+
+            duration = t_end - t_start
+            self.update_text_readout(f"EVENT: {t_start:.3f}s - {t_end:.3f}s ({duration:.3f}s)", (10, 60))
+            logger.info(f"Event marker 2 placed at t={time:.3f}s, event duration: {duration:.3f}s")
+
+            # Trigger callback
+            if self._on_event_created_callback:
+                self._on_event_created_callback(t_start, t_end)
+
+        else:
+            # Both lines already placed - user clicking to start new event
+            # Clear old markers and place first line of new event
+            self.clear_event_markers()
+            self.event_t1 = time
+            self.event_line_1 = self._create_event_vertical_line(time)
+            self.update_text_readout(f"EVENT MODE: Start at {time:.3f}s | Click for end line | ESC to clear", (10, 60))
+            logger.info(f"New event started, marker 1 placed at t={time:.3f}s")
+
+    def _create_event_vertical_line(self, time: float) -> scene.visuals.Line:
+        """Create a vertical line visual at the given time.
+
+        Args:
+            time: Time position for the line
+
+        Returns:
+            The created Line visual
+        """
+        # Get current frequency range from data bounds or camera
+        if self.data_bounds:
+            _, _, f_min, f_max = self.data_bounds
+        else:
+            rect = self.view.camera.rect
+            if rect:
+                f_min = rect.bottom
+                f_max = rect.bottom + rect.height
+            else:
+                f_min, f_max = 0, 22050
+
+        # Create line from bottom to top of frequency range
+        line_data = np.array([[time, f_min], [time, f_max]], dtype=np.float32)
+
+        line = scene.visuals.Line(
+            pos=line_data,
+            color=(0.0, 1.0, 0.0, 0.9),  # Bright green
+            width=2.5,
+            parent=self.view.scene
+        )
+        line.order = 160  # Above spectrogram, visible
+        line.set_gl_state('translucent', depth_test=False)
+
+        self.update()
+        return line
+
+    def clear_event_markers(self):
+        """Clear current event markers (both vertical lines)."""
+        if self.event_line_1 is not None:
+            self.event_line_1.parent = None
+            self.event_line_1 = None
+        if self.event_line_2 is not None:
+            self.event_line_2.parent = None
+            self.event_line_2 = None
+
+        self.event_t1 = None
+        self.event_t2 = None
+
+        if self.event_mode:
+            self.update_text_readout("EVENT MODE: Click to place start line", (10, 60))
+
+        self.update()
+        logger.debug("Event markers cleared")
+
+    def update_event_lines_frequency_range(self):
+        """Update event lines to span current frequency range.
+
+        Call this after zoom/pan to keep lines spanning full visible height.
+        """
+        if self.data_bounds:
+            _, _, f_min, f_max = self.data_bounds
+        else:
+            return
+
+        if self.event_line_1 is not None and self.event_t1 is not None:
+            line_data = np.array([[self.event_t1, f_min], [self.event_t1, f_max]], dtype=np.float32)
+            self.event_line_1.set_data(pos=line_data)
+
+        if self.event_line_2 is not None and self.event_t2 is not None:
+            line_data = np.array([[self.event_t2, f_min], [self.event_t2, f_max]], dtype=np.float32)
+            self.event_line_2.set_data(pos=line_data)
+
+    def _set_event_lines_visible(self, visible: bool):
+        """Show or hide event lines without deleting them.
+
+        Args:
+            visible: True to show lines, False to hide
+        """
+        if self.event_line_1 is not None:
+            self.event_line_1.visible = visible
+        if self.event_line_2 is not None:
+            self.event_line_2.visible = visible
         self.update()
 
     # ==================== Measurement Tool ====================

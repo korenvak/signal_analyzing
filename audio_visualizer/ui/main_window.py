@@ -9,9 +9,9 @@ import numpy as np
 from typing import Optional
 from pathlib import Path
 
-from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
-                              QWidget, QToolBar, QLabel, QPushButton, QFileDialog, 
-                              QMessageBox, QSplitter, QFrame, QSizePolicy)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
+                              QWidget, QToolBar, QLabel, QPushButton, QFileDialog,
+                              QMessageBox, QSplitter, QFrame, QSizePolicy, QDialog)
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
@@ -52,7 +52,12 @@ from .cutout_dialog import CutoutDialog
 from .spectrum_dialog import SpectrumDialog
 from .measurement_panel import MeasurementPanel
 from .auto_detect_dialog import AutoDetectDialog, run_auto_detect_dialog
+from .event_manager import EventManager
+from .event_panel import EventPanel
+from .event_dialog import EventInputDialog, EventEditDialog
+from .event_data import TaggedEvent
 from ..core.filter_manager import FilterManager
+from ..core.filename_parser import parse_pixel_filename
 from ..core.cutout_analyzer import (
     extract_spectrogram_cutout, 
     normalize_cutout, 
@@ -152,7 +157,12 @@ class MainWindow(QMainWindow):
         self.annotation_manager = AnnotationManager()
         self.annotation_renderer = None  # Will be initialized after canvas creation
         self.selected_annotation_id = None
-        
+
+        # Event tagging system (separate from annotations)
+        self.event_manager = EventManager()
+        self.event_panel = None  # Will be initialized in setup_ui
+        self._file_event_markers = {}  # Per-file storage: {file_path: (t1, t2)}
+
         # Measurement panel (floating window)
         self.measurement_panel = None
         
@@ -271,6 +281,10 @@ class MainWindow(QMainWindow):
             
             # Set curve callback
             self.spectrogram_canvas.set_curve_callback(self.on_curve_completed)
+
+            # Set event tagging callbacks
+            self.spectrogram_canvas.set_event_created_callback(self.on_event_region_marked)
+            self.spectrogram_canvas.set_event_mode_toggled_callback(self.on_event_mode_toggled_from_canvas)
             
             # Initialize InteractionManager for coordinate mapping
             self.interaction_manager = InteractionManager(
@@ -299,7 +313,23 @@ class MainWindow(QMainWindow):
             center_layout.addWidget(self.annotation_table)
         else:
             center_layout.addWidget(QLabel("VisPy not available"))
-        
+
+        # Add Event Panel on the right side (hidden by default)
+        self.event_panel = EventPanel(self.event_manager)
+        self.event_panel.setMinimumWidth(280)
+        self.event_panel.setMaximumWidth(400)
+
+        # Connect event panel signals
+        self.event_panel.event_mode_toggled.connect(self.on_event_mode_toggled)
+        self.event_panel.goto_event_requested.connect(self.on_goto_event)
+        self.event_panel.event_table.event_edit_requested.connect(self.on_event_edit_requested)
+
+        self.main_splitter.addWidget(self.event_panel)
+        self.main_splitter.setSizes([220, 1000, 300])  # Playlist, Center, Event Panel
+
+        # Hide event panel by default - user toggles with E key or menu
+        self.event_panel.hide()
+
         main_layout.addWidget(viz_container)
         
         # Connect signals
@@ -475,7 +505,13 @@ class MainWindow(QMainWindow):
         toggle_controls_action.setShortcut("Ctrl+P")
         toggle_controls_action.triggered.connect(lambda: self.controls_widget.setVisible(not self.controls_widget.isVisible()))
         view_menu.addAction(toggle_controls_action)
-        
+
+        # Toggle Event Panel (E key toggles via canvas, this is for menu access)
+        self.toggle_event_panel_action = QAction("Toggle Event Panel (E)", self)
+        self.toggle_event_panel_action.setCheckable(True)
+        self.toggle_event_panel_action.triggered.connect(self.toggle_event_panel)
+        view_menu.addAction(self.toggle_event_panel_action)
+
         # Analysis menu
         analysis_menu = menubar.addMenu("Analysis")
         
@@ -819,6 +855,10 @@ class MainWindow(QMainWindow):
             # PERFORMANCE: Aggressive cleanup before loading new file
             if hasattr(self, 'current_file') and self.current_file is not None:
                 logger.info(f"Switching from {os.path.basename(self.current_file)} to {os.path.basename(file_path)}")
+
+                # Clear event markers when switching files (but keep CSV data)
+                self._clear_event_markers_on_file_switch()
+
                 self.file_switch_manager.cleanup_for_new_file(
                     cache_manager=self.cache_manager,
                     gpu_memory_manager=self.gpu_memory_manager,
@@ -905,7 +945,10 @@ class MainWindow(QMainWindow):
             # Set default normalization mode to STD
             if hasattr(self, 'spectrogram_canvas'):
                 self.spectrogram_canvas.set_normalization_mode('std', std_scale=2.5)
-            
+
+            # Restore event markers for this file if they exist
+            self._restore_event_markers_for_file(file_path)
+
             # Refresh current view
             self.refresh_current_view()
             
@@ -3696,6 +3739,308 @@ class MainWindow(QMainWindow):
         if not self.current_file or self.current_file not in self.file_data:
             return None
         return self.file_data[self.current_file]
+
+    # ========== Event Tagging System Methods ==========
+
+    def on_event_mode_toggled(self, enabled: bool):
+        """Handle event mode toggle from panel."""
+        if hasattr(self, 'spectrogram_canvas'):
+            self.spectrogram_canvas.set_event_mode(enabled)
+            if enabled:
+                self.statusBar().showMessage("Event Mode: Click to place start line")
+            else:
+                self.statusBar().showMessage("Event Mode disabled")
+
+    def on_event_mode_toggled_from_canvas(self, enabled: bool):
+        """Handle event mode toggle from E key press on canvas.
+
+        Shows/hides the event panel and syncs panel toggle button.
+        """
+        if hasattr(self, 'event_panel'):
+            if enabled:
+                self.event_panel.show()
+                self.event_panel.mode_btn.setChecked(True)
+            else:
+                self.event_panel.hide()
+                self.event_panel.mode_btn.setChecked(False)
+
+            # Sync menu action checkbox
+            if hasattr(self, 'toggle_event_panel_action'):
+                self.toggle_event_panel_action.setChecked(enabled)
+
+            if enabled:
+                self.statusBar().showMessage("Event Mode: Click to place start line")
+            else:
+                self.statusBar().showMessage("Event Mode disabled")
+
+    def toggle_event_panel(self):
+        """Toggle the event panel visibility."""
+        if hasattr(self, 'event_panel'):
+            is_visible = self.event_panel.isVisible()
+            if is_visible:
+                self.event_panel.hide()
+                if hasattr(self, 'spectrogram_canvas'):
+                    self.spectrogram_canvas.set_event_mode(False)
+                if hasattr(self, 'toggle_event_panel_action'):
+                    self.toggle_event_panel_action.setChecked(False)
+                self.statusBar().showMessage("Event Mode disabled")
+            else:
+                self.event_panel.show()
+                if hasattr(self, 'spectrogram_canvas'):
+                    self.spectrogram_canvas.set_event_mode(True)
+                if hasattr(self, 'toggle_event_panel_action'):
+                    self.toggle_event_panel_action.setChecked(True)
+                self.statusBar().showMessage("Event Mode: Click to place start line")
+
+    def on_event_region_marked(self, t_start: float, t_end: float):
+        """Handle when user marks an event region with two vertical lines.
+
+        This is called after both lines are placed on the spectrogram.
+        """
+        if not self.event_manager.session_active:
+            QMessageBox.warning(
+                self, "No Event Session",
+                "Please create or load an event session first.\n\n"
+                "Use the Event Panel on the right to start a new session."
+            )
+            self.spectrogram_canvas.clear_event_markers()
+            return
+
+        if not self.current_file:
+            QMessageBox.warning(self, "No File", "No audio file is currently loaded.")
+            self.spectrogram_canvas.clear_event_markers()
+            return
+
+        try:
+            # Get current view's frequency range
+            rect = self.spectrogram_canvas.view.camera.rect
+            if rect:
+                f_min = rect.bottom
+                f_max = rect.bottom + rect.height
+            else:
+                f_min, f_max = 0, 22050
+
+            # Parse filename for absolute times and sensor info
+            parsed = parse_pixel_filename(self.current_file)
+            absolute_start = None
+            absolute_end = None
+            sensor_name = None
+            sensor_id = None
+
+            if parsed:
+                sensor_name = parsed.sensor_name
+                sensor_id = parsed.sensor_id
+                absolute_start = parsed.compute_absolute_time(t_start)
+                absolute_end = parsed.compute_absolute_time(t_end)
+
+            # Estimate SNR from spectrogram data
+            suggested_snr = self._estimate_event_snr(t_start, t_end, f_min, f_max)
+
+            # Show input dialog
+            dialog = EventInputDialog(
+                t_start=t_start,
+                t_end=t_end,
+                f_min=f_min,
+                f_max=f_max,
+                absolute_start=absolute_start,
+                absolute_end=absolute_end,
+                suggested_snr=suggested_snr,
+                sensor_name=sensor_name,
+                sensor_id=sensor_id,
+                parent=self
+            )
+
+            if dialog.exec() == QDialog.Accepted:
+                values = dialog.get_values()
+
+                # Create event
+                event = self.event_manager.add_event(
+                    audio_file=self.current_file,
+                    t_start=t_start,
+                    t_end=t_end,
+                    f_min=values['f_min'],
+                    f_max=values['f_max'],
+                    harmonic_number=values['harmonic_number'],
+                    snr_estimate_db=values['snr_estimate_db'],
+                    notes=values['notes']
+                )
+
+                # Capture image
+                self._capture_event_image(event)
+
+                # Save to CSV
+                self.event_manager.append_event_to_csv(event)
+
+                # Add to table
+                self.event_panel.add_event(event)
+
+                # DON'T clear markers - they stay visible until user clicks to start new event or exits mode
+                self.statusBar().showMessage(f"Event {event.id} saved - click to mark new event")
+            else:
+                # User cancelled - keep markers visible, user can retry or click to start new
+                pass
+
+        except Exception as e:
+            logger.error(f"Error creating event: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to create event:\n{e}")
+            # Keep markers visible - user can retry
+
+    def _estimate_event_snr(self, t_start: float, t_end: float,
+                           f_min: float, f_max: float) -> Optional[float]:
+        """Estimate SNR for an event region from cached spectrogram data.
+
+        Returns:
+            Estimated SNR in dB, or None if estimation fails
+        """
+        try:
+            S, freqs, times = self._get_spectrogram_axes()
+            if S is None or freqs is None or times is None:
+                return None
+
+            return self.event_manager.estimate_snr(S, times, freqs, t_start, t_end, f_min, f_max)
+
+        except Exception as e:
+            logger.debug(f"SNR estimation failed: {e}")
+            return None
+
+    def _capture_event_image(self, event: TaggedEvent):
+        """Capture spectrogram image for an event.
+
+        Args:
+            event: Event to capture image for
+        """
+        try:
+            S, freqs, times = self._get_spectrogram_axes()
+            if S is None or freqs is None or times is None:
+                logger.warning("No spectrogram data available for image capture")
+                return
+
+            # Get current colormap from controls widget
+            colormap = 'plasma'
+            if hasattr(self, 'controls_widget') and hasattr(self.controls_widget, 'colormap_combo'):
+                colormap = self.controls_widget.colormap_combo.currentText() or 'plasma'
+                # Check if inverted
+                if hasattr(self.controls_widget, 'invert_colormap') and self.controls_widget.invert_colormap.isChecked():
+                    colormap = colormap + '_r' if not colormap.endswith('_r') else colormap[:-2]
+
+            # Capture image
+            image_path = self.event_manager.capture_event_image(
+                event, S, times, freqs, colormap=colormap
+            )
+
+            if image_path:
+                # Update event with image path and save
+                self.event_manager._save_all_to_csv()
+                logger.info(f"Event {event.id} image captured: {image_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to capture event image: {e}", exc_info=True)
+
+    def on_event_edit_requested(self, event_id: int):
+        """Handle request to edit an event."""
+        event = self.event_manager.get_event(event_id)
+        if not event:
+            return
+
+        dialog = EventEditDialog(
+            event_id=event.id,
+            harmonic_number=event.harmonic_number,
+            snr_estimate_db=event.snr_estimate_db,
+            notes=event.notes,
+            parent=self
+        )
+
+        if dialog.exec() == QDialog.Accepted:
+            values = dialog.get_values()
+            self.event_manager.update_event(
+                event_id,
+                harmonic_number=values['harmonic_number'],
+                snr_estimate_db=values['snr_estimate_db'],
+                notes=values['notes']
+            )
+            # Update table
+            updated_event = self.event_manager.get_event(event_id)
+            if updated_event:
+                self.event_panel.update_event(updated_event)
+            self.statusBar().showMessage(f"Event {event_id} updated")
+
+    def on_goto_event(self, t_center: float, f_center: float):
+        """Navigate the spectrogram view to center on an event.
+
+        Args:
+            t_center: Time center of the event
+            f_center: Frequency center of the event
+        """
+        if not hasattr(self, 'spectrogram_canvas'):
+            return
+
+        try:
+            rect = self.spectrogram_canvas.view.camera.rect
+            if rect is None:
+                return
+
+            # Keep current view size, just change center
+            new_left = t_center - rect.width / 2
+            new_bottom = f_center - rect.height / 2
+
+            # Apply bounds
+            if self.spectrogram_canvas.data_bounds:
+                t_min, t_max, f_min, f_max = self.spectrogram_canvas.data_bounds
+                new_left = max(t_min, min(new_left, t_max - rect.width))
+                new_bottom = max(f_min, min(new_bottom, f_max - rect.height))
+
+            self.spectrogram_canvas.view.camera.rect = (
+                new_left, new_bottom, rect.width, rect.height
+            )
+            self.spectrogram_canvas.update()
+
+        except Exception as e:
+            logger.error(f"Failed to navigate to event: {e}")
+
+    def _clear_event_markers_on_file_switch(self):
+        """Save and clear event markers when switching files.
+
+        Stores current markers for this file so they can be restored later.
+        """
+        if hasattr(self, 'spectrogram_canvas') and self.current_file:
+            canvas = self.spectrogram_canvas
+            # Save current markers for this file before clearing
+            if canvas.event_t1 is not None or canvas.event_t2 is not None:
+                self._file_event_markers[self.current_file] = (canvas.event_t1, canvas.event_t2)
+            # Clear visual markers
+            canvas.clear_event_markers()
+        if hasattr(self, 'event_panel'):
+            self.event_panel.on_file_switched()
+
+    def _restore_event_markers_for_file(self, file_path: str):
+        """Restore event markers when switching back to a file.
+
+        Args:
+            file_path: The file to restore markers for
+        """
+        if file_path in self._file_event_markers and hasattr(self, 'spectrogram_canvas'):
+            t1, t2 = self._file_event_markers[file_path]
+            canvas = self.spectrogram_canvas
+
+            # Restore marker times
+            canvas.event_t1 = t1
+            canvas.event_t2 = t2
+
+            # Recreate visual lines if times exist
+            if t1 is not None:
+                canvas.event_line_1 = canvas._create_event_vertical_line(t1)
+                # If not in event mode, hide the line
+                if not canvas.event_mode:
+                    canvas.event_line_1.visible = False
+
+            if t2 is not None:
+                canvas.event_line_2 = canvas._create_event_vertical_line(t2)
+                # If not in event mode, hide the line
+                if not canvas.event_mode:
+                    canvas.event_line_2.visible = False
+
+            logger.debug(f"Restored event markers for {os.path.basename(file_path)}: t1={t1}, t2={t2}")
+
 
 def main():
     """Main application entry point."""
