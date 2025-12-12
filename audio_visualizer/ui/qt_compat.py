@@ -76,6 +76,102 @@ if QT_BINDING == 'PyQt5':
     if not _original_msgbox_exec:
         QMessageBox.exec = QMessageBox.exec_
 
+    # PyQt5 enum compatibility - PySide6 uses Qt.Orientation.Horizontal, PyQt5 uses Qt.Horizontal
+    # Create compatibility namespace classes
+    # Create a metaclass that dynamically forwards attribute access to Qt
+    class _QtEnumProxyMeta(type):
+        """Metaclass for dynamic Qt enum attribute access."""
+        def __getattr__(cls, name):
+            return getattr(Qt, name)
+
+    # Create proxy classes for all enum-style accesses
+    class _QtOrientation(metaclass=_QtEnumProxyMeta):
+        Horizontal = Qt.Horizontal
+        Vertical = Qt.Vertical
+
+    class _QtKey(metaclass=_QtEnumProxyMeta):
+        """Dynamic proxy for Qt.Key enum values."""
+        pass
+
+    class _QtWindowType(metaclass=_QtEnumProxyMeta):
+        Window = Qt.Window
+        WindowStaysOnTopHint = Qt.WindowStaysOnTopHint
+        Dialog = Qt.Dialog
+        FramelessWindowHint = Qt.FramelessWindowHint
+
+    class _QtAlignmentFlag(metaclass=_QtEnumProxyMeta):
+        AlignLeft = Qt.AlignLeft
+        AlignRight = Qt.AlignRight
+        AlignCenter = Qt.AlignCenter
+        AlignTop = Qt.AlignTop
+        AlignBottom = Qt.AlignBottom
+        AlignVCenter = Qt.AlignVCenter
+        AlignHCenter = Qt.AlignHCenter
+
+    class _QtItemFlag(metaclass=_QtEnumProxyMeta):
+        ItemIsEnabled = Qt.ItemIsEnabled
+        ItemIsSelectable = Qt.ItemIsSelectable
+        ItemIsEditable = Qt.ItemIsEditable
+        ItemIsUserCheckable = Qt.ItemIsUserCheckable
+
+    class _QtCheckState(metaclass=_QtEnumProxyMeta):
+        Unchecked = Qt.Unchecked
+        Checked = Qt.Checked
+        PartiallyChecked = Qt.PartiallyChecked
+
+    class _QtMouseButton(metaclass=_QtEnumProxyMeta):
+        LeftButton = Qt.LeftButton
+        RightButton = Qt.RightButton
+        MiddleButton = Qt.MiddleButton
+        NoButton = Qt.NoButton
+
+    class _QtKeyboardModifier(metaclass=_QtEnumProxyMeta):
+        NoModifier = Qt.NoModifier
+        ShiftModifier = Qt.ShiftModifier
+        ControlModifier = Qt.ControlModifier
+        AltModifier = Qt.AltModifier
+        MetaModifier = Qt.MetaModifier
+
+    class _QtTextFormat(metaclass=_QtEnumProxyMeta):
+        PlainText = Qt.PlainText
+        RichText = Qt.RichText
+        AutoText = Qt.AutoText
+
+    class _QtCursorShape(metaclass=_QtEnumProxyMeta):
+        ArrowCursor = Qt.ArrowCursor
+        CrossCursor = Qt.CrossCursor
+        WaitCursor = Qt.WaitCursor
+        PointingHandCursor = Qt.PointingHandCursor
+
+    class _QtFocusPolicy(metaclass=_QtEnumProxyMeta):
+        NoFocus = Qt.NoFocus
+        TabFocus = Qt.TabFocus
+        ClickFocus = Qt.ClickFocus
+        StrongFocus = Qt.StrongFocus
+        WheelFocus = Qt.WheelFocus
+
+    class _QtScrollBarPolicy(metaclass=_QtEnumProxyMeta):
+        ScrollBarAsNeeded = Qt.ScrollBarAsNeeded
+        ScrollBarAlwaysOff = Qt.ScrollBarAlwaysOff
+        ScrollBarAlwaysOn = Qt.ScrollBarAlwaysOn
+
+    class _QtSizePolicy(metaclass=_QtEnumProxyMeta):
+        pass  # QSizePolicy is a class, not enum on Qt
+
+    # Patch Qt to add PySide6-style enum access
+    Qt.Orientation = _QtOrientation
+    Qt.Key = _QtKey
+    Qt.WindowType = _QtWindowType
+    Qt.AlignmentFlag = _QtAlignmentFlag
+    Qt.ItemFlag = _QtItemFlag
+    Qt.CheckState = _QtCheckState
+    Qt.MouseButton = _QtMouseButton
+    Qt.KeyboardModifier = _QtKeyboardModifier
+    Qt.TextFormat = _QtTextFormat
+    Qt.CursorShape = _QtCursorShape
+    Qt.FocusPolicy = _QtFocusPolicy
+    Qt.ScrollBarPolicy = _QtScrollBarPolicy
+
 
 def get_qt_binding():
     """Return the name of the Qt binding being used."""
