@@ -158,6 +158,20 @@ if QT_BINDING == 'PyQt5':
     class _QtSizePolicy(metaclass=_QtEnumProxyMeta):
         pass  # QSizePolicy is a class, not enum on Qt
 
+    class _QtContextMenuPolicy(metaclass=_QtEnumProxyMeta):
+        CustomContextMenu = Qt.CustomContextMenu
+        NoContextMenu = Qt.NoContextMenu
+        DefaultContextMenu = Qt.DefaultContextMenu
+        ActionsContextMenu = Qt.ActionsContextMenu
+        PreventContextMenu = Qt.PreventContextMenu
+
+    class _QtItemDataRole(metaclass=_QtEnumProxyMeta):
+        UserRole = Qt.UserRole
+        DisplayRole = Qt.DisplayRole
+        EditRole = Qt.EditRole
+        DecorationRole = Qt.DecorationRole
+        ToolTipRole = Qt.ToolTipRole
+
     # Patch Qt to add PySide6-style enum access
     Qt.Orientation = _QtOrientation
     Qt.Key = _QtKey
@@ -171,6 +185,75 @@ if QT_BINDING == 'PyQt5':
     Qt.CursorShape = _QtCursorShape
     Qt.FocusPolicy = _QtFocusPolicy
     Qt.ScrollBarPolicy = _QtScrollBarPolicy
+    Qt.ContextMenuPolicy = _QtContextMenuPolicy
+    Qt.ItemDataRole = _QtItemDataRole
+
+    # Create enum proxies for widget classes that use PySide6-style enum namespacing
+    # QHeaderView.ResizeMode
+    class _QHeaderViewResizeMode:
+        Interactive = QHeaderView.Interactive
+        Fixed = QHeaderView.Fixed
+        Stretch = QHeaderView.Stretch
+        ResizeToContents = QHeaderView.ResizeToContents
+    QHeaderView.ResizeMode = _QHeaderViewResizeMode
+
+    # QAbstractItemView enums (also used by QTableWidget, QListWidget, QTreeWidget)
+    class _QAbstractItemViewSelectionBehavior:
+        SelectItems = QAbstractItemView.SelectItems
+        SelectRows = QAbstractItemView.SelectRows
+        SelectColumns = QAbstractItemView.SelectColumns
+    QAbstractItemView.SelectionBehavior = _QAbstractItemViewSelectionBehavior
+
+    class _QAbstractItemViewSelectionMode:
+        SingleSelection = QAbstractItemView.SingleSelection
+        MultiSelection = QAbstractItemView.MultiSelection
+        ExtendedSelection = QAbstractItemView.ExtendedSelection
+        ContiguousSelection = QAbstractItemView.ContiguousSelection
+        NoSelection = QAbstractItemView.NoSelection
+    QAbstractItemView.SelectionMode = _QAbstractItemViewSelectionMode
+
+    class _QAbstractItemViewDragDropMode:
+        NoDragDrop = QAbstractItemView.NoDragDrop
+        DragOnly = QAbstractItemView.DragOnly
+        DropOnly = QAbstractItemView.DropOnly
+        DragDrop = QAbstractItemView.DragDrop
+        InternalMove = QAbstractItemView.InternalMove
+    QAbstractItemView.DragDropMode = _QAbstractItemViewDragDropMode
+
+    class _QAbstractItemViewEditTrigger:
+        NoEditTriggers = QAbstractItemView.NoEditTriggers
+        CurrentChanged = QAbstractItemView.CurrentChanged
+        DoubleClicked = QAbstractItemView.DoubleClicked
+        SelectedClicked = QAbstractItemView.SelectedClicked
+        EditKeyPressed = QAbstractItemView.EditKeyPressed
+        AnyKeyPressed = QAbstractItemView.AnyKeyPressed
+        AllEditTriggers = QAbstractItemView.AllEditTriggers
+    QAbstractItemView.EditTrigger = _QAbstractItemViewEditTrigger
+
+    # Also add to subclasses that might use these
+    QTableWidget.SelectionBehavior = _QAbstractItemViewSelectionBehavior
+    QTableWidget.SelectionMode = _QAbstractItemViewSelectionMode
+    QTableWidget.DragDropMode = _QAbstractItemViewDragDropMode
+    QTableWidget.EditTrigger = _QAbstractItemViewEditTrigger
+
+    QListWidget.SelectionBehavior = _QAbstractItemViewSelectionBehavior
+    QListWidget.SelectionMode = _QAbstractItemViewSelectionMode
+    QListWidget.DragDropMode = _QAbstractItemViewDragDropMode
+
+    QTreeWidget.SelectionBehavior = _QAbstractItemViewSelectionBehavior
+    QTreeWidget.SelectionMode = _QAbstractItemViewSelectionMode
+    QTreeWidget.DragDropMode = _QAbstractItemViewDragDropMode
+
+    # QSizePolicy enum
+    class _QSizePolicyPolicy:
+        Fixed = QSizePolicy.Fixed
+        Minimum = QSizePolicy.Minimum
+        Maximum = QSizePolicy.Maximum
+        Preferred = QSizePolicy.Preferred
+        Expanding = QSizePolicy.Expanding
+        MinimumExpanding = QSizePolicy.MinimumExpanding
+        Ignored = QSizePolicy.Ignored
+    QSizePolicy.Policy = _QSizePolicyPolicy
 
 
 def get_qt_binding():

@@ -3940,6 +3940,95 @@ class MainWindow(QMainWindow):
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
                 width: 0px;
             }
+
+            /* Table Widget - Fix header visibility for PyQt5 */
+            QTableWidget {
+                background: rgba(20, 20, 35, 0.95);
+                color: rgba(255, 255, 255, 0.9);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 4px;
+                gridline-color: rgba(255, 255, 255, 0.1);
+            }
+
+            QTableWidget::item {
+                padding: 4px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            }
+
+            QTableWidget::item:selected {
+                background: rgba(99, 102, 241, 0.3);
+                color: rgba(255, 255, 255, 0.95);
+            }
+
+            QHeaderView::section {
+                background: rgba(40, 40, 60, 0.95);
+                color: rgba(255, 255, 255, 0.9);
+                padding: 6px;
+                border: none;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+                border-right: 1px solid rgba(255, 255, 255, 0.08);
+                font-weight: bold;
+            }
+
+            QHeaderView::section:hover {
+                background: rgba(60, 60, 80, 0.95);
+            }
+
+            /* List Widget - Similar styling */
+            QListWidget {
+                background: rgba(20, 20, 35, 0.95);
+                color: rgba(255, 255, 255, 0.9);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 4px;
+            }
+
+            QListWidget::item {
+                padding: 6px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            }
+
+            QListWidget::item:selected {
+                background: rgba(99, 102, 241, 0.3);
+                color: rgba(255, 255, 255, 0.95);
+            }
+
+            QListWidget::item:hover {
+                background: rgba(255, 255, 255, 0.05);
+            }
+
+            /* Tree Widget */
+            QTreeWidget {
+                background: rgba(20, 20, 35, 0.95);
+                color: rgba(255, 255, 255, 0.9);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 4px;
+            }
+
+            QTreeWidget::item {
+                padding: 4px;
+            }
+
+            QTreeWidget::item:selected {
+                background: rgba(99, 102, 241, 0.3);
+                color: rgba(255, 255, 255, 0.95);
+            }
+
+            /* Splitter handles */
+            QSplitter::handle {
+                background: rgba(255, 255, 255, 0.1);
+            }
+
+            QSplitter::handle:horizontal {
+                width: 2px;
+            }
+
+            QSplitter::handle:vertical {
+                height: 2px;
+            }
+
+            QSplitter::handle:hover {
+                background: rgba(99, 102, 241, 0.5);
+            }
         """)
     
     def show_keyboard_shortcuts(self):
