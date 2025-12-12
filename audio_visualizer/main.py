@@ -226,11 +226,23 @@ Examples:
 
         # IMPORTANT: Create QApplication BEFORE importing any UI modules
         # This is required because some modules create QWidget subclasses at import time
-        from audio_visualizer.ui.qt_compat import QApplication
+        from audio_visualizer.ui.qt_compat import QApplication, is_pyqt5
         app = QApplication(sys.argv)
         app.setApplicationName("Audio Visualizer")
         app.setApplicationVersion("1.0.0")
         app.setOrganizationName("Audio Visualization Team")
+
+        # Configure VisPy to use the correct Qt backend BEFORE importing any VisPy modules
+        try:
+            import vispy
+            if is_pyqt5():
+                vispy.use('pyqt5')
+                logger.info("Configured VisPy to use PyQt5 backend")
+            else:
+                vispy.use('pyside6')
+                logger.info("Configured VisPy to use PySide6 backend")
+        except Exception as e:
+            logger.warning(f"Could not configure VisPy backend: {e}")
 
         # Now safe to import the main window module
         from audio_visualizer.ui.main_window import MainWindow
