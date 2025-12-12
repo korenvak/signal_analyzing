@@ -154,19 +154,22 @@ class MainWindow(QMainWindow):
             self.atlas_renderers['spectrogram'] = AtlasRenderer(atlas)
         
         logger.info(f"Initialized {len(self.atlas_renderers)} atlas renderers")
-        
-        
+
+        logger.info("DEBUG: Starting state initialization...")
+
         # Multi-file state
         self.current_file = None  # Currently active file
         self.file_data = {}  # file_path -> {audio_data, sample_rate, duration, view_range}
         # Default view range (will be updated when file is loaded)
         self.current_view_range = ((0.0, 10.0), (0.0, 22050.0))  # (time, freq)
-        
+
+        logger.info("DEBUG: Creating AnnotationManager...")
         # Annotation system
         self.annotation_manager = AnnotationManager()
         self.annotation_renderer = None  # Will be initialized after canvas creation
         self.selected_annotation_id = None
 
+        logger.info("DEBUG: Creating EventManager...")
         # Event tagging system (separate from annotations)
         self.event_manager = EventManager()
         self.event_panel = None  # Will be initialized in setup_ui
@@ -174,10 +177,11 @@ class MainWindow(QMainWindow):
 
         # Measurement panel (floating window)
         self.measurement_panel = None
-        
+
+        logger.info("DEBUG: Creating FilterManager...")
         # Filter manager
         self.filter_manager = FilterManager()
-        
+
         # Spectrogram cache to avoid recomputation
         self.spectrogram_cache = {
             'time_range': None,
@@ -187,7 +191,8 @@ class MainWindow(QMainWindow):
             'data': None,
             'extent': None
         }
-        
+
+        logger.info("DEBUG: Calling setup_ui...")
         # Setup UI
         self.setup_ui()
         self.setup_menu_bar()
@@ -206,23 +211,28 @@ class MainWindow(QMainWindow):
         
     def setup_ui(self):
         """Setup the main user interface with improved layout and containers."""
+        logger.info("DEBUG setup_ui: Creating central widget...")
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
+        logger.info("DEBUG setup_ui: Creating main layout...")
         # Main layout with NO padding to maximize canvas space
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        
+
+        logger.info("DEBUG setup_ui: Setting up compact toolbar...")
         # Add compact toolbar at the top
         self.setup_compact_toolbar()
         main_layout.addWidget(self.toolbar)
-        
+
+        logger.info("DEBUG setup_ui: Creating ControlsWidget...")
         # Minimal controls at the top (hidden by default, toggle with Ctrl+P)
         self.controls_widget = ControlsWidget()
         self.controls_widget.setVisible(False)  # Hidden by default
         main_layout.addWidget(self.controls_widget)
-        
+
+        logger.info("DEBUG setup_ui: Creating viz container...")
         # Container for visualization - glassmorphic card style
         viz_container = QFrame()
         viz_container.setObjectName("viz_container")
@@ -230,11 +240,13 @@ class MainWindow(QMainWindow):
         viz_layout = QHBoxLayout(viz_container)
         viz_layout.setContentsMargins(0, 0, 0, 0)  # NO MARGINS!
         viz_layout.setSpacing(0)
-        
+
+        logger.info("DEBUG setup_ui: Creating main splitter...")
         # Splitter for playlist and canvas
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         viz_layout.addWidget(self.main_splitter)
-        
+
+        logger.info("DEBUG setup_ui: Creating PlaylistWidget...")
         # Simple playlist on the left (single panel, no tabs)
         self.playlist_widget = PlaylistWidget()
         self.playlist_widget.setMaximumWidth(220)
@@ -709,8 +721,8 @@ class MainWindow(QMainWindow):
 
     def setup_compact_toolbar(self):
         """Setup a compact toolbar with essential controls."""
-        from PySide6.QtWidgets import QToolBar, QWidget, QLabel, QSizePolicy
-        
+        # QToolBar, QWidget, QLabel, QSizePolicy already imported from qt_compat
+
         self.toolbar = QToolBar()
         self.toolbar.setMovable(False)
         self.toolbar.setMaximumHeight(32)
@@ -961,8 +973,8 @@ class MainWindow(QMainWindow):
     
     def open_audio_file(self):
         """Open file dialog to select audio file."""
-        from PySide6.QtWidgets import QFileDialog
-        
+        # QFileDialog already imported from qt_compat
+
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Audio File",
@@ -4007,8 +4019,8 @@ class MainWindow(QMainWindow):
     
     def new_project(self):
         """Create a new project."""
-        from PySide6.QtWidgets import QInputDialog, QFileDialog
-        
+        # QInputDialog, QFileDialog already imported from qt_compat
+
         # Get project name
         name, ok = QInputDialog.getText(
             self, "New Project", "Project Name:",
@@ -4041,7 +4053,7 @@ class MainWindow(QMainWindow):
     
     def open_project(self):
         """Open an existing project."""
-        from PySide6.QtWidgets import QFileDialog
+        # QFileDialog already imported from qt_compat
 
         project_dir = QFileDialog.getExistingDirectory(
             self, "Open Project", "",
@@ -4112,9 +4124,9 @@ class MainWindow(QMainWindow):
                 "No project is currently loaded."
             )
             return
-        
-        from PySide6.QtWidgets import QFileDialog
-        
+
+        # QFileDialog already imported from qt_compat
+
         # Get export directory
         export_dir = QFileDialog.getExistingDirectory(
             self, "Select Export Directory", ""
