@@ -410,6 +410,9 @@ class VisPyCanvas(scene.SceneCanvas):
         self._on_event_created_callback = None    # Callback(t_start, t_end) when both lines placed
         self._on_event_mode_toggled_callback = None  # Callback(enabled: bool) when mode toggled via E key
 
+        # Detected Doppler Tracks (from full spectrogram detection)
+        self.detected_track_visuals = []  # List of Line visuals for detected tracks
+
         # Text readout
         self.text_visual = scene.visuals.Text('', color='white', font_size=11,
                                               pos=(10, 30), parent=self.view.scene)
@@ -429,7 +432,11 @@ class VisPyCanvas(scene.SceneCanvas):
         self.local_mean_std = None  # Mean/std for visible region (for STD normalization)
         self.normalization_mode = 'std'  # 'minmax' or 'std' - default to STD (adaptive to zoom)
         self.std_scale = 2.5  # Scale factor for STD normalization
-        
+
+        # Trackpad zoom accumulator for smooth pinch-to-zoom
+        self._trackpad_zoom_accumulator = 0.0
+        self._trackpad_zoom_threshold = 30.0  # Accumulated delta before zooming
+
         # Connect events
         self.view.events.mouse_wheel.connect(self.on_mouse_wheel)
         self.events.key_press.connect(self.on_key_press)
@@ -440,9 +447,9 @@ class VisPyCanvas(scene.SceneCanvas):
         self.freeze()
     
     def on_mouse_wheel(self, event):
-        """Handle mouse wheel for axis-specific zoom."""
+        """Handle mouse wheel for axis-specific zoom (supports trackpad pinch-to-zoom)."""
         event.handled = True
-        
+
         # Get modifiers
         modifiers = []
         try:
@@ -452,21 +459,45 @@ class VisPyCanvas(scene.SceneCanvas):
                 modifiers = event.mouse_event.modifiers or []
         except AttributeError:
             modifiers = []
-        
+
         mod_strings = [str(mod).lower() for mod in modifiers]
         shift_pressed = any('shift' in s for s in mod_strings)
         ctrl_pressed = any('ctrl' in s or 'control' in s for s in mod_strings)
-        
-        # 15% zoom per scroll
-        factor = 1.15 if event.delta[1] > 0 else 0.87
-        
+
+        # Get delta - trackpad sends smaller, more frequent deltas
+        delta = event.delta[1] if hasattr(event, 'delta') and event.delta is not None else 0
+
+        # Detect if this is likely a trackpad (small delta values)
+        # Mouse wheel typically gives ~120 per notch, trackpads give smaller values
+        is_trackpad = abs(delta) < 50
+
+        if is_trackpad:
+            # Accumulate trackpad deltas for smoother zooming
+            self._trackpad_zoom_accumulator += delta
+
+            # Only zoom when accumulated enough delta
+            if abs(self._trackpad_zoom_accumulator) < self._trackpad_zoom_threshold:
+                return
+
+            # Calculate zoom factor based on accumulated delta
+            # Smoother zoom for trackpad - smaller increments
+            zoom_amount = self._trackpad_zoom_accumulator / 120.0  # Normalize to mouse wheel units
+            factor = 1.0 + (0.1 * zoom_amount)  # 10% zoom per mouse wheel unit
+            factor = max(0.5, min(2.0, factor))  # Clamp to reasonable range
+
+            # Reset accumulator
+            self._trackpad_zoom_accumulator = 0.0
+        else:
+            # Standard mouse wheel - 15% zoom per scroll notch
+            factor = 1.15 if delta > 0 else 0.87
+
         if shift_pressed:
             scale_factors = [factor, 1.0]  # Time only
         elif ctrl_pressed:
             scale_factors = [1.0, factor]  # Freq only
         else:
             scale_factors = [factor, factor]  # Both
-        
+
         self.zoom_with_center(scale_factors, event.pos)
     
     def zoom_with_center(self, scale_factors, mouse_pos):
@@ -1966,4 +1997,66 @@ class VisPyCanvas(scene.SceneCanvas):
         region_freqs = freqs[f_start_idx:f_end_idx]
 
         return region, region_times, region_freqs
+
+    # ==================== Detected Tracks Visualization ====================
+
+    def add_detected_track(self, times: list, freqs: list, track_id: int = 0,
+                          color: tuple = (1.0, 0.3, 0.3, 0.8)):
+        """Add a detected Doppler track to the visualization.
+
+        Args:
+            times: List of time values in seconds
+            freqs: List of frequency values in Hz
+            track_id: Unique identifier for this track
+            color: RGBA color tuple for the track line
+        """
+        if len(times) < 2 or len(freqs) < 2:
+            return
+
+        # Create points array
+        points = np.column_stack([times, freqs]).astype(np.float32)
+
+        # Create a new Line visual for this track
+        track_visual = scene.visuals.Line(parent=self.view.scene, method='gl')
+        track_visual.set_data(pos=points, color=color, width=2.5)
+        track_visual.visible = True
+        track_visual.order = 160  # Above spectrogram, below annotations
+        track_visual.set_gl_state('translucent', depth_test=False)
+
+        # Store reference
+        self.detected_track_visuals.append({
+            'visual': track_visual,
+            'track_id': track_id,
+            'times': times,
+            'freqs': freqs
+        })
+
+        logger.debug(f"Added detected track {track_id} with {len(times)} points")
+
+    def clear_detected_tracks(self):
+        """Remove all detected track visuals from the display."""
+        for track_data in self.detected_track_visuals:
+            visual = track_data['visual']
+            if visual is not None:
+                visual.parent = None  # Remove from scene
+
+        self.detected_track_visuals = []
+        self.update()
+        logger.debug("Cleared all detected track visuals")
+
+    def set_detected_tracks_visible(self, visible: bool):
+        """Show or hide all detected track visuals.
+
+        Args:
+            visible: True to show, False to hide
+        """
+        for track_data in self.detected_track_visuals:
+            visual = track_data['visual']
+            if visual is not None:
+                visual.visible = visible
+        self.update()
+
+    def get_detected_track_count(self) -> int:
+        """Get the number of detected tracks currently displayed."""
+        return len(self.detected_track_visuals)
 

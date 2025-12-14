@@ -1031,3 +1031,144 @@ class CLAHEDialog(FilterParameterDialog):
             },
             parent
         )
+
+
+# ============================================================================
+# Koren's Filter Dialog (Exactly as V11.py)
+# ============================================================================
+
+class KorenFilterDialog(FilterParameterDialog):
+    """Dialog for Koren's multi-stage filter pipeline parameters (V11.py)."""
+
+    def __init__(self, parent=None):
+        super().__init__(
+            "Koren's Filter (V11.py - Multi-Stage Enhancement)",
+            {
+                'hpss_margin': {
+                    'type': 'float',
+                    'label': 'HPSS Margin',
+                    'default': 3.0,
+                    'min': 1.0,
+                    'max': 10.0,
+                    'step': 0.5,
+                    'tooltip': 'HPSS margin for harmonic/percussive separation (librosa)'
+                },
+                'pcen_gain': {
+                    'type': 'float',
+                    'label': 'PCEN Gain',
+                    'default': 0.8,
+                    'min': 0.1,
+                    'max': 1.0,
+                    'step': 0.05,
+                    'tooltip': 'PCEN AGC strength'
+                },
+                'pcen_power': {
+                    'type': 'float',
+                    'label': 'PCEN Power',
+                    'default': 0.5,
+                    'min': 0.1,
+                    'max': 1.0,
+                    'step': 0.05,
+                    'tooltip': 'PCEN compression exponent'
+                },
+                'pcen_time_constant': {
+                    'type': 'float',
+                    'label': 'PCEN Time Constant',
+                    'default': 0.1,
+                    'min': 0.01,
+                    'max': 1.0,
+                    'step': 0.01,
+                    'decimals': 2,
+                    'tooltip': 'PCEN smoothing time constant'
+                },
+                'pcen_bias': {
+                    'type': 'float',
+                    'label': 'PCEN Bias',
+                    'default': 10.0,
+                    'min': 1.0,
+                    'max': 50.0,
+                    'step': 1.0,
+                    'tooltip': 'PCEN bias value'
+                },
+                'low_cut_bins': {
+                    'type': 'int',
+                    'label': 'Low Freq Cut (bins)',
+                    'default': 5,
+                    'min': 0,
+                    'max': 50,
+                    'step': 1,
+                    'tooltip': 'Number of low frequency bins to zero (DC/rumble removal)'
+                },
+                'smooth_sigma': {
+                    'type': 'float',
+                    'label': 'Smoothing Sigma',
+                    'default': 1.5,
+                    'min': 0.0,
+                    'max': 10.0,
+                    'step': 0.5,
+                    'tooltip': 'Horizontal Gaussian smoothing sigma (0 = disabled)'
+                },
+                'sigmoid_std_factor': {
+                    'type': 'float',
+                    'label': 'Sigmoid Threshold Factor',
+                    'default': 0.5,
+                    'min': 0.0,
+                    'max': 3.0,
+                    'step': 0.1,
+                    'tooltip': 'Factor for sigmoid threshold (mean + factor * std)'
+                },
+                'sigmoid_gain': {
+                    'type': 'float',
+                    'label': 'Sigmoid Gain',
+                    'default': 10.0,
+                    'min': 1.0,
+                    'max': 50.0,
+                    'step': 1.0,
+                    'tooltip': 'Sigmoid steepness for mask'
+                },
+                'tv_weight': {
+                    'type': 'float',
+                    'label': 'TV Denoise Weight',
+                    'default': 0.1,
+                    'min': 0.01,
+                    'max': 1.0,
+                    'step': 0.01,
+                    'decimals': 2,
+                    'tooltip': 'Total Variation denoising weight (cleans speckles)'
+                },
+                'contrast_power': {
+                    'type': 'float',
+                    'label': 'Contrast Power',
+                    'default': 0.6,
+                    'min': 0.1,
+                    'max': 2.0,
+                    'step': 0.1,
+                    'tooltip': 'Final contrast boost power (< 1 = enhance dark)'
+                },
+                'skip_hpss': {
+                    'type': 'bool',
+                    'label': 'Skip HPSS',
+                    'default': False,
+                    'tooltip': 'Skip Harmonic-Percussive Source Separation'
+                },
+                'skip_pcen': {
+                    'type': 'bool',
+                    'label': 'Skip PCEN',
+                    'default': False,
+                    'tooltip': 'Skip Per-Channel Energy Normalization'
+                },
+                'skip_meijering': {
+                    'type': 'bool',
+                    'label': 'Skip Meijering',
+                    'default': False,
+                    'tooltip': 'Skip Meijering ridge detection'
+                },
+                'skip_tv': {
+                    'type': 'bool',
+                    'label': 'Skip TV Denoise',
+                    'default': False,
+                    'tooltip': 'Skip Total Variation denoising'
+                }
+            },
+            parent
+        )

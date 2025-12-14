@@ -2,15 +2,16 @@
 Automatic track detection using Meijering ridge filter and DBSCAN clustering.
 
 Adapted from doppler_physics_v2.py for integration with the audio visualizer.
+Enhanced with gap bridging and track merging for handling discontinuous tracks.
 """
 import numpy as np
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict
 import logging
 
 try:
     from skimage.filters import meijering
-    from skimage.morphology import binary_closing, binary_opening, skeletonize
+    from skimage.morphology import binary_closing, binary_opening, skeletonize, binary_dilation, binary_erosion
     from skimage.measure import label, regionprops
     SKIMAGE_AVAILABLE = True
 except ImportError:
@@ -26,6 +27,7 @@ except ImportError:
 try:
     from scipy.signal import savgol_filter
     from scipy.ndimage import median_filter
+    from scipy.interpolate import interp1d
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
@@ -55,11 +57,13 @@ class DetectedTrack:
     duration: float  # Duration in seconds
     freq_range: Tuple[float, float]  # (f_min, f_max)
     point_count: int  # Number of points in the track
+    merged_from: List[int] = field(default_factory=list)  # Track indices that were merged into this
 
     def __repr__(self):
+        merged_info = f", merged={len(self.merged_from)}" if self.merged_from else ""
         return (f"DetectedTrack(score={self.score:.2f}, duration={self.duration:.2f}s, "
                 f"freq_range={self.freq_range[0]:.0f}-{self.freq_range[1]:.0f}Hz, "
-                f"points={self.point_count})")
+                f"points={self.point_count}{merged_info})")
 
 
 class AutomaticTrackDetector:
@@ -83,17 +87,33 @@ class AutomaticTrackDetector:
     """
 
     def __init__(self):
-        # Parameters matching doppler_physics_v2.py exactly
-        self.meijering_sigmas = range(1, 4)  # Same as doppler_physics_v2.py
-        self.dbscan_eps = 0.18  # Same as doppler_physics_v2.py
-        self.dbscan_min_samples = 15  # Same as doppler_physics_v2.py
-        self.min_track_duration_sec = 0.15  # Same as doppler_physics_v2.py
-        self.min_track_points = 25  # Same as doppler_physics_v2.py
-        self.high_pass_hz = 100.0  # Same as doppler_physics_v2.py
-        self.threshold_percentile = 99.6  # Same as doppler_physics_v2.py
-        self.savgol_window = 11  # Same as doppler_physics_v2.py
+        # Parameters - tuned for Doppler track detection
+        # Using wider sigma range to capture both steep and shallow ridges
+        self.meijering_sigmas = range(1, 6)  # Extended range for steep ridges
+        self.dbscan_eps = 0.25  # Increased for better connectivity on steep slopes
+        self.dbscan_min_samples = 8  # Reduced to capture more ridge points
+        self.min_track_duration_sec = 0.10  # Reduced for partial track detection
+        self.min_track_points = 15  # Reduced for smaller segments
+        self.high_pass_hz = 50.0  # Lowered to catch lower frequency tracks
+        self.threshold_percentile = 97.0  # Lowered to capture more ridge pixels (was 99.6)
+        self.savgol_window = 11
         self.savgol_poly = 2
-        self.min_skeleton_length = 30  # min_length_pixels in extract_tracks_morphology
+        self.min_skeleton_length = 20  # Reduced for smaller segments
+
+        # Gap bridging parameters - more aggressive for Doppler tracks
+        self.gap_threshold_sec = 1.0  # Increased to bridge larger gaps
+        self.gap_freq_tolerance_hz = 300.0  # Increased for steep Doppler slopes
+        self.gap_slope_tolerance = 1500.0  # Much higher for steep Doppler curves (can be 50+ Hz/s)
+        self.enable_gap_bridging = True
+
+        # Morphological gap bridging - use both horizontal and diagonal
+        self.morph_close_width = 9  # Wider for better horizontal bridging
+        self.morph_close_height = 3  # Add some vertical extent for diagonal bridging
+
+        # Track merging parameters
+        self.merge_similar_tracks = True
+        self.merge_freq_tolerance = 150.0  # Increased tolerance
+        self.merge_slope_tolerance = 800.0  # Increased for steep tracks
 
         # Check dependencies
         if not SKIMAGE_AVAILABLE:
@@ -264,8 +284,8 @@ class AutomaticTrackDetector:
             return []
 
         # 8. Smooth tracks and convert to world coordinates
-        tracks = []
-        for coords in skeleton_tracks:
+        raw_tracks = []
+        for i, coords in enumerate(skeleton_tracks):
             # coords is (freq_idx, time_idx) pairs sorted by time
             # Convert to world coordinates
             centerline = self._coords_to_world(coords, region_times, region_freqs)
@@ -293,9 +313,24 @@ class AutomaticTrackDetector:
                 score=score,
                 duration=duration,
                 freq_range=freq_range,
-                point_count=len(smoothed)
+                point_count=len(smoothed),
+                merged_from=[i]  # Track original index
             )
-            tracks.append(track)
+            raw_tracks.append(track)
+
+        logger.info(f"Raw tracks before gap bridging: {len(raw_tracks)}")
+
+        # 9. Bridge gaps between track segments (new step)
+        if self.enable_gap_bridging and len(raw_tracks) > 1:
+            tracks = self._bridge_track_gaps(raw_tracks)
+            logger.info(f"After gap bridging: {len(tracks)} tracks")
+        else:
+            tracks = raw_tracks
+
+        # 10. Merge similar parallel tracks (optional)
+        if self.merge_similar_tracks and len(tracks) > 1:
+            tracks = self._merge_similar_tracks(tracks)
+            logger.info(f"After merging similar tracks: {len(tracks)} tracks")
 
         # Sort by score (highest first)
         tracks.sort(key=lambda t: t.score, reverse=True)
@@ -376,14 +411,17 @@ class AutomaticTrackDetector:
         return processed
 
     def _detect_ridges(self, processed: np.ndarray) -> np.ndarray:
-        """Apply Meijering ridge filter."""
+        """Apply Meijering ridge filter - simple and robust approach."""
         if not SKIMAGE_AVAILABLE:
             logger.warning("skimage not available, skipping Meijering filter")
             return processed
 
         try:
             logger.info(f"Running Meijering filter with sigmas={list(self.meijering_sigmas)}")
+
+            # Apply Meijering filter - it detects ridges at all orientations
             ridges = meijering(processed, sigmas=self.meijering_sigmas, black_ridges=False)
+
             # Normalize
             ridges = (ridges - ridges.min()) / (ridges.max() - ridges.min() + 1e-10)
             logger.info(f"Meijering output: value range=[{ridges.min():.4f}, {ridges.max():.4f}]")
@@ -394,16 +432,18 @@ class AutomaticTrackDetector:
 
     def _threshold(self, ridges: np.ndarray) -> np.ndarray:
         """Apply adaptive thresholding based on region size."""
-        # For small regions, use a lower percentile threshold
         n_pixels = ridges.size
 
-        # Adaptive threshold: lower percentile for smaller regions
+        # Adaptive threshold based on region size
+        # Larger regions can use higher percentile (more selective)
         if n_pixels < 5000:
-            percentile = 95.0  # More lenient for small regions
+            percentile = 95.0  # Lenient for small regions
         elif n_pixels < 20000:
             percentile = 97.0
+        elif n_pixels < 50000:
+            percentile = 98.0
         else:
-            percentile = self.threshold_percentile  # 99.6 for large regions
+            percentile = 99.0  # More selective for large regions
 
         thresh = np.percentile(ridges, percentile)
         binary_mask = ridges > thresh
@@ -423,24 +463,24 @@ class AutomaticTrackDetector:
 
         # Try DBSCAN first if available
         if SKLEARN_AVAILABLE:
-            # Scale points for DBSCAN
+            # Scale points for DBSCAN - use separate scaling for freq and time
+            # to handle steep Doppler tracks better
             scaler = StandardScaler()
             points_scaled = scaler.fit_transform(points)
 
             # Adaptive eps based on number of points
-            # More points usually means denser clusters, can use smaller eps
             if len(points) < 50:
-                eps = 0.5  # Very lenient for few points
+                eps = 0.5  # Lenient for few points
                 min_samples = 3
             elif len(points) < 200:
-                eps = 0.35  # Lenient for moderate points
+                eps = 0.35
                 min_samples = 5
             elif len(points) < 500:
                 eps = 0.25
-                min_samples = 10
+                min_samples = 8
             else:
-                eps = self.dbscan_eps  # 0.18
-                min_samples = self.dbscan_min_samples  # 15
+                eps = 0.18  # Original value
+                min_samples = 15
 
             logger.info(f"DBSCAN params: eps={eps}, min_samples={min_samples}, n_points={len(points)}")
 
@@ -487,7 +527,7 @@ class AutomaticTrackDetector:
     def _extract_tracks_morphology(self, clean_mask: np.ndarray, min_length: int = None) -> List[np.ndarray]:
         """
         Extract tracks from clean binary mask using morphology.
-        Same as doppler_physics_v2.py extract_tracks_morphology.
+        Enhanced from doppler_physics_v2.py with configurable gap bridging.
 
         Args:
             clean_mask: Binary mask of valid ridge pixels
@@ -506,15 +546,22 @@ class AutomaticTrackDetector:
         try:
             logger.info(f"Morphology input: clean_mask has {clean_mask.sum()} pixels")
 
-            # Morphological operations (same as doppler_physics_v2.py)
-            selem = make_rect(1, 5)  # horizontal structuring element
-            mask_closed = binary_closing(clean_mask, selem)
-            mask_open = binary_opening(mask_closed, selem)
+            # Simple morphological operations - same as doppler_physics_v2.py
+            # Use horizontal structuring element for closing/opening
+            selem = make_rect(1, 5)
 
-            logger.info(f"After morphology: {mask_open.sum()} pixels")
+            # Binary closing to bridge small horizontal gaps
+            mask_closed = binary_closing(clean_mask, selem)
+            logger.info(f"After closing: {mask_closed.sum()} pixels")
+
+            # Binary opening to remove noise
+            mask_open = binary_opening(mask_closed, selem)
+            logger.info(f"After opening: {mask_open.sum()} pixels")
+
+            mask_final = mask_open
 
             # Skeletonize
-            skel = skeletonize(mask_open)
+            skel = skeletonize(mask_final)
             logger.info(f"Skeleton: {skel.sum()} pixels")
 
             # Label connected components
@@ -632,6 +679,295 @@ class AutomaticTrackDetector:
         except Exception as e:
             logger.warning(f"Smoothing failed: {e}")
             return centerline
+
+    def _get_track_endpoints(self, track: DetectedTrack) -> Tuple[Tuple[float, float], Tuple[float, float], float]:
+        """
+        Get track start/end points and slope.
+
+        Returns:
+            (start_point, end_point, slope) where points are (time, freq) tuples
+        """
+        points = track.points
+        if len(points) < 2:
+            return (points[0], points[0], 0.0) if points else ((0, 0), (0, 0), 0.0)
+
+        # Start and end points
+        start = points[0]
+        end = points[-1]
+
+        # Calculate average slope (Hz/s)
+        t_vals = np.array([p[0] for p in points])
+        f_vals = np.array([p[1] for p in points])
+
+        dt = t_vals[-1] - t_vals[0]
+        if dt > 0:
+            slope = (f_vals[-1] - f_vals[0]) / dt
+        else:
+            slope = 0.0
+
+        return (start, end, slope)
+
+    def _can_bridge_tracks(self, track1: DetectedTrack, track2: DetectedTrack) -> Tuple[bool, float]:
+        """
+        Check if two tracks can be bridged (connected).
+
+        Track1 should end before track2 starts.
+
+        Returns:
+            (can_bridge, gap_score) - gap_score is lower for better matches
+        """
+        start1, end1, slope1 = self._get_track_endpoints(track1)
+        start2, end2, slope2 = self._get_track_endpoints(track2)
+
+        # Check time ordering: track1 should end before track2 starts
+        t_gap = start2[0] - end1[0]
+
+        # Must have positive gap (track1 ends before track2 starts)
+        if t_gap < 0:
+            return False, float('inf')
+
+        # Check gap is within threshold
+        if t_gap > self.gap_threshold_sec:
+            return False, float('inf')
+
+        # Check frequency difference at gap
+        # Extrapolate track1's end frequency to track2's start time
+        expected_freq = end1[1] + slope1 * t_gap
+        actual_freq = start2[1]
+        freq_diff = abs(expected_freq - actual_freq)
+
+        if freq_diff > self.gap_freq_tolerance_hz:
+            return False, float('inf')
+
+        # Check slope compatibility
+        slope_diff = abs(slope1 - slope2)
+        if slope_diff > self.gap_slope_tolerance:
+            return False, float('inf')
+
+        # Calculate gap score (lower is better)
+        gap_score = (
+            0.4 * (t_gap / self.gap_threshold_sec) +
+            0.4 * (freq_diff / self.gap_freq_tolerance_hz) +
+            0.2 * (slope_diff / self.gap_slope_tolerance)
+        )
+
+        logger.debug(f"Can bridge: gap={t_gap:.3f}s, freq_diff={freq_diff:.1f}Hz, "
+                    f"slope_diff={slope_diff:.1f}Hz/s, score={gap_score:.3f}")
+
+        return True, gap_score
+
+    def _merge_two_tracks(self, track1: DetectedTrack, track2: DetectedTrack) -> DetectedTrack:
+        """
+        Merge two tracks by interpolating across the gap.
+
+        Track1 should end before track2 starts.
+        """
+        points1 = track1.points
+        points2 = track2.points
+
+        # Get endpoints
+        end1 = points1[-1]
+        start2 = points2[0]
+
+        # Interpolate gap if needed
+        gap_points = []
+        t_gap = start2[0] - end1[0]
+
+        if t_gap > 0.01:  # Only interpolate if gap is significant
+            # Number of interpolation points based on gap size
+            n_interp = max(2, int(t_gap / 0.01))  # ~100 points per second
+
+            t_interp = np.linspace(end1[0], start2[0], n_interp + 2)[1:-1]
+            f_interp = np.linspace(end1[1], start2[1], n_interp + 2)[1:-1]
+
+            gap_points = [(float(t), float(f)) for t, f in zip(t_interp, f_interp)]
+
+        # Combine all points
+        merged_points = points1 + gap_points + points2
+
+        # Recalculate properties
+        t_vals = [p[0] for p in merged_points]
+        f_vals = [p[1] for p in merged_points]
+
+        duration = max(t_vals) - min(t_vals)
+        freq_range = (min(f_vals), max(f_vals))
+
+        # Combine merged_from lists
+        merged_from = track1.merged_from + track2.merged_from
+
+        # Recalculate score
+        score = self._calculate_track_score(merged_points)
+
+        return DetectedTrack(
+            points=merged_points,
+            score=score,
+            duration=duration,
+            freq_range=freq_range,
+            point_count=len(merged_points),
+            merged_from=merged_from
+        )
+
+    def _bridge_track_gaps(self, tracks: List[DetectedTrack]) -> List[DetectedTrack]:
+        """
+        Bridge gaps between track segments that appear to be from the same trajectory.
+
+        This connects short breaks in tracks caused by noise or interference.
+        """
+        if len(tracks) < 2:
+            return tracks
+
+        # Sort tracks by start time
+        sorted_tracks = sorted(tracks, key=lambda t: t.points[0][0])
+
+        # Track which tracks have been merged
+        merged = [False] * len(sorted_tracks)
+        result = []
+
+        i = 0
+        while i < len(sorted_tracks):
+            if merged[i]:
+                i += 1
+                continue
+
+            current = sorted_tracks[i]
+            merged[i] = True
+
+            # Try to extend current track by bridging gaps
+            changed = True
+            while changed:
+                changed = False
+                best_match_idx = -1
+                best_score = float('inf')
+
+                # Look for tracks that can be bridged to current
+                for j in range(i + 1, len(sorted_tracks)):
+                    if merged[j]:
+                        continue
+
+                    can_bridge, score = self._can_bridge_tracks(current, sorted_tracks[j])
+                    if can_bridge and score < best_score:
+                        best_score = score
+                        best_match_idx = j
+
+                if best_match_idx >= 0:
+                    # Merge the best match
+                    logger.info(f"Bridging track {i} with track {best_match_idx} (score={best_score:.3f})")
+                    current = self._merge_two_tracks(current, sorted_tracks[best_match_idx])
+                    merged[best_match_idx] = True
+                    changed = True
+
+            result.append(current)
+            i += 1
+
+        # Add any remaining un-merged tracks
+        for i, track in enumerate(sorted_tracks):
+            if not merged[i]:
+                result.append(track)
+
+        return result
+
+    def _merge_similar_tracks(self, tracks: List[DetectedTrack]) -> List[DetectedTrack]:
+        """
+        Merge tracks that are very similar (nearly parallel, same time range).
+
+        This handles cases where a single track was split into parallel segments.
+        Note: This is different from gap bridging - this merges overlapping tracks.
+        """
+        if len(tracks) < 2:
+            return tracks
+
+        # Calculate track properties
+        track_props = []
+        for track in tracks:
+            points = track.points
+            t_vals = np.array([p[0] for p in points])
+            f_vals = np.array([p[1] for p in points])
+
+            t_start, t_end = t_vals[0], t_vals[-1]
+            f_mean = np.mean(f_vals)
+
+            # Calculate slope
+            if t_end > t_start:
+                slope = (f_vals[-1] - f_vals[0]) / (t_end - t_start)
+            else:
+                slope = 0.0
+
+            track_props.append({
+                'track': track,
+                't_start': t_start,
+                't_end': t_end,
+                'f_mean': f_mean,
+                'slope': slope
+            })
+
+        # Find similar tracks
+        merged = [False] * len(tracks)
+        result = []
+
+        for i in range(len(tracks)):
+            if merged[i]:
+                continue
+
+            current = track_props[i]
+            merged[i] = True
+
+            # Find similar tracks to merge
+            similar_indices = [i]
+
+            for j in range(i + 1, len(tracks)):
+                if merged[j]:
+                    continue
+
+                other = track_props[j]
+
+                # Check time overlap
+                overlap_start = max(current['t_start'], other['t_start'])
+                overlap_end = min(current['t_end'], other['t_end'])
+
+                if overlap_end <= overlap_start:
+                    continue  # No overlap
+
+                # Check frequency similarity
+                freq_diff = abs(current['f_mean'] - other['f_mean'])
+                if freq_diff > self.merge_freq_tolerance:
+                    continue
+
+                # Check slope similarity
+                slope_diff = abs(current['slope'] - other['slope'])
+                if slope_diff > self.merge_slope_tolerance:
+                    continue
+
+                # Similar enough to merge
+                similar_indices.append(j)
+                merged[j] = True
+
+            if len(similar_indices) == 1:
+                # No merge needed
+                result.append(tracks[i])
+            else:
+                # Merge similar tracks - keep the one with highest score
+                # (or could combine points, but keeping best avoids duplicates)
+                best_idx = max(similar_indices, key=lambda idx: tracks[idx].score)
+                best_track = tracks[best_idx]
+
+                # Update merged_from to include all merged tracks
+                all_merged = []
+                for idx in similar_indices:
+                    all_merged.extend(tracks[idx].merged_from)
+
+                merged_track = DetectedTrack(
+                    points=best_track.points,
+                    score=best_track.score,
+                    duration=best_track.duration,
+                    freq_range=best_track.freq_range,
+                    point_count=best_track.point_count,
+                    merged_from=all_merged
+                )
+                result.append(merged_track)
+
+                logger.info(f"Merged {len(similar_indices)} similar tracks")
+
+        return result
 
 
 def check_dependencies() -> dict:

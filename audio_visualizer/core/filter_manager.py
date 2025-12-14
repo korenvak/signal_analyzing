@@ -25,6 +25,13 @@ except ImportError:
 from scipy import ndimage as ndi_cpu
 from skimage.filters import meijering as meijering_cpu
 
+# Import Koren filter
+try:
+    from .koren_filter import KorenFilter
+    KOREN_FILTER_AVAILABLE = True
+except ImportError:
+    KOREN_FILTER_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -1296,5 +1303,102 @@ class FilterManager:
             clip_limit=clip_limit / 100.0  # skimage uses 0-1 range
         )
         return result.astype(np.float32)
+
+    # =========================================================================
+    # Koren's Filter (Multi-Stage Enhancement Pipeline)
+    # =========================================================================
+
+    def apply_koren_filter(self, data: np.ndarray,
+                          hpss_margin: float = 3.0,
+                          pcen_gain: float = 0.8,
+                          pcen_power: float = 0.5,
+                          pcen_time_constant: float = 0.1,
+                          pcen_bias: float = 10.0,
+                          low_cut_bins: int = 5,
+                          meijering_sigmas: tuple = (1, 2, 3),
+                          smooth_sigma: float = 1.5,
+                          sigmoid_std_factor: float = 0.5,
+                          sigmoid_gain: float = 10.0,
+                          tv_weight: float = 0.1,
+                          contrast_power: float = 0.6,
+                          sr: int = 44100,
+                          hop_length: int = 512,
+                          skip_hpss: bool = False,
+                          skip_pcen: bool = False,
+                          skip_meijering: bool = False,
+                          skip_tv: bool = False) -> Tuple[np.ndarray, str]:
+        """
+        Apply Koren's multi-stage filter pipeline for Doppler track enhancement.
+        Exactly matches V11.py implementation using librosa HPSS and PCEN.
+
+        Pipeline stages:
+        1. HPSS (librosa) - removes vertical/percussive noise
+        2. PCEN (librosa) - flattens background
+        3. Low frequency cut - removes DC offset / rumble
+        4. Meijering ridge detection - enhances ridge-like structures
+        5. Directional smoothing - smooths along time axis
+        6. Sigmoid fusion - mask applied to harmonic base
+        7. TV denoising - final polish
+        8. Contrast boost - enhance visibility
+
+        Args:
+            data: Input spectrogram (freq x time)
+            hpss_margin: HPSS margin parameter (default 3.0)
+            pcen_gain: PCEN AGC gain (default 0.8)
+            pcen_power: PCEN compression power (default 0.5)
+            pcen_time_constant: PCEN time constant (default 0.1)
+            pcen_bias: PCEN bias value (default 10.0)
+            low_cut_bins: Number of low frequency bins to zero
+            meijering_sigmas: Scales for Meijering filter
+            smooth_sigma: Gaussian smoothing sigma
+            sigmoid_std_factor: Factor for sigmoid threshold
+            sigmoid_gain: Sigmoid steepness
+            tv_weight: Total variation denoising weight
+            contrast_power: Final contrast power boost
+            sr: Sample rate for PCEN
+            hop_length: Hop length for PCEN
+            skip_hpss: Skip HPSS step
+            skip_pcen: Skip PCEN step
+            skip_meijering: Skip Meijering step
+            skip_tv: Skip TV denoising step
+
+        Returns:
+            (filtered_data, log_message)
+        """
+        if not KOREN_FILTER_AVAILABLE:
+            return data, "Koren filter not available (missing dependencies)"
+
+        if data is None or data.size == 0:
+            return data, "No data to filter"
+
+        data_cpu = _ensure_cpu(data)
+
+        # Create and apply Koren filter (exactly as V11.py)
+        koren = KorenFilter(
+            hpss_margin=hpss_margin,
+            pcen_gain=pcen_gain,
+            pcen_power=pcen_power,
+            pcen_time_constant=pcen_time_constant,
+            pcen_bias=pcen_bias,
+            low_cut_bins=low_cut_bins,
+            meijering_sigmas=meijering_sigmas,
+            smooth_sigma=smooth_sigma,
+            sigmoid_std_factor=sigmoid_std_factor,
+            sigmoid_gain=sigmoid_gain,
+            tv_weight=tv_weight,
+            contrast_power=contrast_power,
+            sr=sr,
+            hop_length=hop_length
+        )
+
+        result, log_msg = koren.apply(
+            data_cpu,
+            skip_hpss=skip_hpss,
+            skip_pcen=skip_pcen,
+            skip_meijering=skip_meijering,
+            skip_tv=skip_tv
+        )
+
+        return result, log_msg
 
 

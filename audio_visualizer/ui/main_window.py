@@ -69,6 +69,8 @@ from .filter_dialog import (
     TotalVariationDialog, NonLocalMeansDialog, LocalContrastNormDialog,
     CLAHEDialog
 )
+from .detector_dialog import DetectorParamsDialog
+from ..core.spectrogram_detector import SpectrogramDetector, DopplerTrack
 from ..core.cutout_analyzer import (
     extract_spectrogram_cutout,
     normalize_cutout,
@@ -181,6 +183,11 @@ class MainWindow(QMainWindow):
         logger.info("DEBUG: Creating FilterManager...")
         # Filter manager
         self.filter_manager = FilterManager()
+
+        # Doppler track detector
+        self.spectrogram_detector = SpectrogramDetector()
+        self.detected_tracks = []  # List of DopplerTrack objects
+        self.detected_tracks_undo_stack = []  # For Ctrl+Z undo of tracks
 
         # Spectrogram cache to avoid recomputation
         self.spectrogram_cache = {
@@ -703,6 +710,25 @@ class MainWindow(QMainWindow):
         clahe_action = QAction("CLAHE (Adaptive Histogram)...", self)
         clahe_action.triggered.connect(self.apply_clahe_filter)
         advanced_menu.addAction(clahe_action)
+
+        # === Koren's Filter (Multi-Stage Enhancement) ===
+        filter_menu.addSeparator()
+        koren_action = QAction("Koren's Filter (Adaptive Enhancement)", self)
+        koren_action.triggered.connect(self.apply_koren_filter)
+        filter_menu.addAction(koren_action)
+
+        filter_menu.addSeparator()
+
+        # === Doppler Track Detection ===
+        detect_menu = filter_menu.addMenu("Doppler Detection")
+
+        detect_full_action = QAction("Detect Tracks in Full Spectrogram...", self)
+        detect_full_action.triggered.connect(self.detect_doppler_tracks_full)
+        detect_menu.addAction(detect_full_action)
+
+        detect_clear_action = QAction("Clear Detected Tracks", self)
+        detect_clear_action.triggered.connect(self.clear_detected_tracks)
+        detect_menu.addAction(detect_clear_action)
 
         filter_menu.addSeparator()
 
@@ -3371,6 +3397,119 @@ class MainWindow(QMainWindow):
                 clip_limit=params['clip_limit'],
                 tile_grid_size=params['tile_grid_size']
             )
+
+    def apply_koren_filter(self):
+        """Apply Koren's multi-stage filter pipeline (V11.py) - fully adaptive, no parameters needed."""
+        # Koren's filter is fully adaptive - uses optimal parameters from V11.py
+        # No dialog needed - just apply with default parameters
+        self._apply_filter_common(
+            self.filter_manager.apply_koren_filter,
+            "Koren's Filter"
+        )
+
+    # === Doppler Track Detection ===
+
+    def detect_doppler_tracks_full(self):
+        """Detect Doppler tracks in the full spectrogram."""
+        # Get spectrogram data
+        full_data, times, freqs = self._get_spectrogram_axes()
+        if full_data is None:
+            QMessageBox.warning(self, "Warning", "No spectrogram data available. Load a file first.")
+            return
+
+        # Show parameters dialog
+        dialog = DetectorParamsDialog(self, self.spectrogram_detector)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        # Apply parameters to detector
+        dialog.apply_to_detector(self.spectrogram_detector)
+
+        # Save current tracks for undo
+        if self.detected_tracks:
+            self.detected_tracks_undo_stack.append(self.detected_tracks.copy())
+            # Limit undo stack size
+            if len(self.detected_tracks_undo_stack) > 10:
+                self.detected_tracks_undo_stack.pop(0)
+
+        # Run detection
+        self.statusBar().showMessage("Detecting Doppler tracks...")
+        QApplication.processEvents()
+
+        try:
+            def progress_callback(progress, message):
+                self.statusBar().showMessage(message)
+                QApplication.processEvents()
+
+            tracks = self.spectrogram_detector.detect(
+                full_data, freqs, times,
+                progress_callback=progress_callback
+            )
+
+            self.detected_tracks = tracks
+            logger.info(f"Detected {len(tracks)} Doppler tracks")
+
+            # Draw tracks on spectrogram
+            self._draw_detected_tracks()
+
+            self.statusBar().showMessage(f"Detected {len(tracks)} Doppler tracks")
+        except Exception as e:
+            logger.error(f"Track detection failed: {e}")
+            QMessageBox.critical(self, "Error", f"Track detection failed: {e}")
+            self.statusBar().showMessage("Track detection failed")
+
+    def clear_detected_tracks(self):
+        """Clear all detected tracks from the display."""
+        if not self.detected_tracks:
+            self.statusBar().showMessage("No detected tracks to clear")
+            return
+
+        # Save for undo
+        self.detected_tracks_undo_stack.append(self.detected_tracks.copy())
+        if len(self.detected_tracks_undo_stack) > 10:
+            self.detected_tracks_undo_stack.pop(0)
+
+        self.detected_tracks = []
+        self._draw_detected_tracks()
+        self.statusBar().showMessage("Detected tracks cleared")
+
+    def undo_detected_tracks(self):
+        """Undo the last track detection or clear operation."""
+        if not self.detected_tracks_undo_stack:
+            self.statusBar().showMessage("No track changes to undo")
+            return
+
+        # Restore previous tracks
+        self.detected_tracks = self.detected_tracks_undo_stack.pop()
+        self._draw_detected_tracks()
+        self.statusBar().showMessage(f"Restored {len(self.detected_tracks)} tracks")
+
+    def _draw_detected_tracks(self):
+        """Draw detected tracks on the spectrogram canvas."""
+        if not hasattr(self, 'spectrogram_canvas'):
+            return
+
+        # Clear existing track visuals
+        if hasattr(self.spectrogram_canvas, 'clear_detected_tracks'):
+            self.spectrogram_canvas.clear_detected_tracks()
+
+        if not self.detected_tracks:
+            return
+
+        # Draw each track
+        for i, track in enumerate(self.detected_tracks):
+            if hasattr(self.spectrogram_canvas, 'add_detected_track'):
+                # Pass track data to canvas for rendering
+                self.spectrogram_canvas.add_detected_track(
+                    times=track.times,
+                    freqs=track.freqs,
+                    track_id=i,
+                    color=(1.0, 0.3, 0.3, 0.8)  # Red-ish color
+                )
+
+        # Trigger redraw
+        if hasattr(self.spectrogram_canvas, 'update'):
+            self.spectrogram_canvas.update()
 
     # === Undo/Redo ===
 
