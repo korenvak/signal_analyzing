@@ -433,10 +433,6 @@ class VisPyCanvas(scene.SceneCanvas):
         self.normalization_mode = 'std'  # 'minmax' or 'std' - default to STD (adaptive to zoom)
         self.std_scale = 2.5  # Scale factor for STD normalization
 
-        # Trackpad zoom accumulator for smooth pinch-to-zoom
-        self._trackpad_zoom_accumulator = 0.0
-        self._trackpad_zoom_threshold = 30.0  # Accumulated delta before zooming
-
         # Connect events
         self.view.events.mouse_wheel.connect(self.on_mouse_wheel)
         self.events.key_press.connect(self.on_key_press)
@@ -447,7 +443,7 @@ class VisPyCanvas(scene.SceneCanvas):
         self.freeze()
     
     def on_mouse_wheel(self, event):
-        """Handle mouse wheel for axis-specific zoom (supports trackpad pinch-to-zoom)."""
+        """Handle mouse wheel for axis-specific zoom (supports both mouse and trackpad)."""
         event.handled = True
 
         # Get modifiers
@@ -464,32 +460,18 @@ class VisPyCanvas(scene.SceneCanvas):
         shift_pressed = any('shift' in s for s in mod_strings)
         ctrl_pressed = any('ctrl' in s or 'control' in s for s in mod_strings)
 
-        # Get delta - trackpad sends smaller, more frequent deltas
+        # Get delta - works for both mouse wheel and trackpad
         delta = event.delta[1] if hasattr(event, 'delta') and event.delta is not None else 0
 
-        # Detect if this is likely a trackpad (small delta values)
-        # Mouse wheel typically gives ~120 per notch, trackpads give smaller values
-        is_trackpad = abs(delta) < 50
+        if delta == 0:
+            return
 
-        if is_trackpad:
-            # Accumulate trackpad deltas for smoother zooming
-            self._trackpad_zoom_accumulator += delta
-
-            # Only zoom when accumulated enough delta
-            if abs(self._trackpad_zoom_accumulator) < self._trackpad_zoom_threshold:
-                return
-
-            # Calculate zoom factor based on accumulated delta
-            # Smoother zoom for trackpad - smaller increments
-            zoom_amount = self._trackpad_zoom_accumulator / 120.0  # Normalize to mouse wheel units
-            factor = 1.0 + (0.1 * zoom_amount)  # 10% zoom per mouse wheel unit
-            factor = max(0.5, min(2.0, factor))  # Clamp to reasonable range
-
-            # Reset accumulator
-            self._trackpad_zoom_accumulator = 0.0
-        else:
-            # Standard mouse wheel - 15% zoom per scroll notch
-            factor = 1.15 if delta > 0 else 0.87
+        # Calculate zoom factor proportional to delta
+        # This works for both mouse wheel (~120 per notch) and trackpad (smaller values)
+        # Use a continuous formula instead of discrete steps
+        zoom_speed = 0.001  # Adjust sensitivity
+        factor = 1.0 + (delta * zoom_speed)
+        factor = max(0.5, min(2.0, factor))  # Clamp to reasonable range
 
         if shift_pressed:
             scale_factors = [factor, 1.0]  # Time only
