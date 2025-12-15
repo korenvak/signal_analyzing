@@ -443,7 +443,7 @@ class VisPyCanvas(scene.SceneCanvas):
         self.freeze()
     
     def on_mouse_wheel(self, event):
-        """Handle mouse wheel for axis-specific zoom (supports both mouse and trackpad)."""
+        """Handle mouse wheel for axis-specific zoom."""
         event.handled = True
 
         # Get modifiers
@@ -460,18 +460,8 @@ class VisPyCanvas(scene.SceneCanvas):
         shift_pressed = any('shift' in s for s in mod_strings)
         ctrl_pressed = any('ctrl' in s or 'control' in s for s in mod_strings)
 
-        # Get delta - works for both mouse wheel and trackpad
-        delta = event.delta[1] if hasattr(event, 'delta') and event.delta is not None else 0
-
-        if delta == 0:
-            return
-
-        # Calculate zoom factor proportional to delta
-        # This works for both mouse wheel (~120 per notch) and trackpad (smaller values)
-        # Use a continuous formula instead of discrete steps
-        zoom_speed = 0.001  # Adjust sensitivity
-        factor = 1.0 + (delta * zoom_speed)
-        factor = max(0.5, min(2.0, factor))  # Clamp to reasonable range
+        # 15% zoom per scroll
+        factor = 1.15 if event.delta[1] > 0 else 0.87
 
         if shift_pressed:
             scale_factors = [factor, 1.0]  # Time only
