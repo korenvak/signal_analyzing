@@ -3400,11 +3400,18 @@ class MainWindow(QMainWindow):
 
     def apply_koren_filter(self):
         """Apply Koren's multi-stage filter pipeline (V11.py) - fully adaptive, no parameters needed."""
+        # Get actual sample rate and hop length from spectrogram engine
+        sr = getattr(self.spectrogram_engine, 'sample_rate', 44100)
+        hop_length = self.spectrogram_cache.get('hop_length',
+                     getattr(self.spectrogram_engine, 'hop_length', 512))
+
         # Koren's filter is fully adaptive - uses optimal parameters from V11.py
         # No dialog needed - just apply with default parameters
         self._apply_filter_common(
             self.filter_manager.apply_koren_filter,
-            "Koren's Filter"
+            "Koren's Filter",
+            sr=sr,
+            hop_length=hop_length
         )
 
     # === Doppler Track Detection ===
