@@ -244,6 +244,19 @@ if QT_BINDING == 'PyQt5':
     QTreeWidget.SelectionMode = _QAbstractItemViewSelectionMode
     QTreeWidget.DragDropMode = _QAbstractItemViewDragDropMode
 
+    # QTabWidget enums
+    class _QTabWidgetTabPosition:
+        North = QTabWidget.North
+        South = QTabWidget.South
+        West = QTabWidget.West
+        East = QTabWidget.East
+    QTabWidget.TabPosition = _QTabWidgetTabPosition
+
+    class _QTabWidgetTabShape:
+        Rounded = QTabWidget.Rounded
+        Triangular = QTabWidget.Triangular
+    QTabWidget.TabShape = _QTabWidgetTabShape
+
     # QSizePolicy enum
     class _QSizePolicyPolicy:
         Fixed = QSizePolicy.Fixed

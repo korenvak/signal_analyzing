@@ -1,5 +1,5 @@
 """
-Filter manager for applying image filters to spectrograms.
+Filter manager for applying image filters to spectrograms and waterfalls.
 Supports GPU acceleration via CuPy.
 
 Includes:
@@ -7,11 +7,106 @@ Includes:
 - Advanced track removal: horizontal/vertical line removal, PCEN, spectral subtraction
 - Morphological operations
 - Adaptive noise gate
+
+Filter Compatibility:
+- 'universal': Works on both spectrogram and waterfall views
+- 'spectrogram': Only applicable to spectrogram (frequency-based)
+- 'waterfall': Only applicable to waterfall (sensor-based)
 """
 import numpy as np
 import logging
 import time
 from typing import Optional, List, Tuple, Union, Dict, Any
+from enum import Enum
+
+
+class FilterCompatibility(Enum):
+    """Which views a filter is compatible with."""
+    UNIVERSAL = "universal"       # Works on any 2D data
+    SPECTROGRAM = "spectrogram"   # Frequency-domain specific
+    WATERFALL = "waterfall"       # Sensor-domain specific
+
+
+# Filter compatibility mapping
+# Filters marked UNIVERSAL work on any 2D matrix
+# Filters marked SPECTROGRAM only make sense for frequency data
+FILTER_COMPATIBILITY: Dict[str, FilterCompatibility] = {
+    # Universal filters (work on any 2D data)
+    'gaussian_blur': FilterCompatibility.UNIVERSAL,
+    'median_filter': FilterCompatibility.UNIVERSAL,
+    'contrast_enhancement': FilterCompatibility.UNIVERSAL,
+    'threshold': FilterCompatibility.UNIVERSAL,
+    'morphological': FilterCompatibility.UNIVERSAL,
+    'bilateral_filter': FilterCompatibility.UNIVERSAL,
+    'denoise_tv': FilterCompatibility.UNIVERSAL,
+    'non_local_means': FilterCompatibility.UNIVERSAL,
+    'local_contrast_normalization': FilterCompatibility.UNIVERSAL,
+    'clahe': FilterCompatibility.UNIVERSAL,
+    'meijering': FilterCompatibility.UNIVERSAL,  # Ridge detection works on any data
+    'wiener_filter': FilterCompatibility.UNIVERSAL,
+
+    # Spectrogram-only filters (frequency-domain specific)
+    'horizontal_line_removal': FilterCompatibility.SPECTROGRAM,  # Removes freq bands
+    'vertical_line_removal': FilterCompatibility.SPECTROGRAM,    # Removes time slices
+    'spectral_subtraction': FilterCompatibility.SPECTROGRAM,     # Noise profile in freq
+    'pcen': FilterCompatibility.SPECTROGRAM,                     # Designed for spectrograms
+    'adaptive_noise_gate': FilterCompatibility.SPECTROGRAM,      # Freq-based gating
+    'track_suppression': FilterCompatibility.SPECTROGRAM,        # Track detection in freq
+    'harmonic_percussive_separation': FilterCompatibility.SPECTROGRAM,  # Audio-specific
+    'spectral_gating': FilterCompatibility.SPECTROGRAM,          # Freq-based gating
+    'lowpass_filter': FilterCompatibility.SPECTROGRAM,           # Frequency filter
+    'highpass_filter': FilterCompatibility.SPECTROGRAM,          # Frequency filter
+    'bandpass_filter': FilterCompatibility.SPECTROGRAM,          # Frequency filter
+    'bandstop_filter': FilterCompatibility.SPECTROGRAM,          # Frequency filter
+    'notch_filter': FilterCompatibility.SPECTROGRAM,             # Frequency notch
+    'koren_filter': FilterCompatibility.SPECTROGRAM,             # Adaptive freq filter
+}
+
+
+def get_filter_compatibility(filter_name: str) -> FilterCompatibility:
+    """Get the compatibility type for a filter."""
+    return FILTER_COMPATIBILITY.get(filter_name, FilterCompatibility.UNIVERSAL)
+
+
+def is_filter_compatible(filter_name: str, view_type: str) -> bool:
+    """
+    Check if a filter is compatible with a view type.
+
+    Args:
+        filter_name: Name of the filter (e.g., 'gaussian_blur')
+        view_type: 'spectrogram' or 'waterfall'
+
+    Returns:
+        True if the filter can be used with the view type
+    """
+    compat = get_filter_compatibility(filter_name)
+
+    if compat == FilterCompatibility.UNIVERSAL:
+        return True
+    elif compat == FilterCompatibility.SPECTROGRAM:
+        return view_type == 'spectrogram'
+    elif compat == FilterCompatibility.WATERFALL:
+        return view_type == 'waterfall'
+    return False
+
+
+def get_compatible_filters(view_type: str) -> List[str]:
+    """
+    Get list of filters compatible with a view type.
+
+    Args:
+        view_type: 'spectrogram' or 'waterfall'
+
+    Returns:
+        List of compatible filter names
+    """
+    compatible = []
+    for name, compat in FILTER_COMPATIBILITY.items():
+        if compat == FilterCompatibility.UNIVERSAL:
+            compatible.append(name)
+        elif compat.value == view_type:
+            compatible.append(name)
+    return compatible
 
 try:
     import cupy as cp

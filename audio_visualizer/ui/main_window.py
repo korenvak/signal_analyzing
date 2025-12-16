@@ -13,7 +13,7 @@ from .qt_compat import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QWidget, QToolBar, QLabel, QPushButton, QFileDialog,
     QMessageBox, QSplitter, QFrame, QSizePolicy, QDialog,
-    Qt, QTimer, QAction, QKeySequence, QMenu, QCursor
+    Qt, QTimer, QAction, QKeySequence, QMenu, QCursor, QTabWidget
 )
 
 try:
@@ -78,6 +78,17 @@ from ..core.cutout_analyzer import (
     save_cutout_numpy,
     write_cutout_metadata
 )
+
+# DAS Multi-channel tab (lazy import to avoid circular deps)
+DASTab = None
+
+def _get_das_tab_class():
+    """Lazy import of DASTab to avoid circular imports."""
+    global DASTab
+    if DASTab is None:
+        from .das_tab import DASTab as _DASTab
+        DASTab = _DASTab
+    return DASTab
 
 logger = logging.getLogger(__name__)
 
@@ -261,14 +272,43 @@ class MainWindow(QMainWindow):
         self.connect_playlist_signals()
         self.main_splitter.addWidget(self.playlist_widget)
         
-        # Center container for spectrogram canvas
-        center_container = QWidget()
-        center_layout = QVBoxLayout(center_container)
-        center_layout.setContentsMargins(0, 0, 0, 0)
-        center_layout.setSpacing(0)
-        self.main_splitter.addWidget(center_container)
+        # Main tab widget for different visualization modes
+        logger.info("DEBUG setup_ui: Creating main tab widget...")
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setDocumentMode(True)
+        self.main_tabs.setTabPosition(QTabWidget.TabPosition.North)
+        self.main_tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: none;
+                background: transparent;
+            }
+            QTabBar::tab {
+                padding: 8px 20px;
+                margin-right: 2px;
+                background: rgba(30, 30, 46, 0.8);
+                border: 1px solid #333;
+                border-bottom: none;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+            }
+            QTabBar::tab:selected {
+                background: rgba(50, 50, 70, 0.95);
+                border-bottom: 2px solid #4a9eff;
+            }
+            QTabBar::tab:hover:!selected {
+                background: rgba(40, 40, 60, 0.9);
+            }
+        """)
+        self.main_splitter.addWidget(self.main_tabs)
         self.main_splitter.setSizes([260, 1200])
-        
+
+        # ============ TAB 1: Single Channel Spectrogram ============
+        logger.info("DEBUG setup_ui: Creating Single Channel tab...")
+        single_channel_tab = QWidget()
+        single_channel_layout = QVBoxLayout(single_channel_tab)
+        single_channel_layout.setContentsMargins(0, 0, 0, 0)
+        single_channel_layout.setSpacing(0)
+
         if HAS_VISPY:
             spec_container = QFrame()
             spec_container.setFrameShape(QFrame.NoFrame)
@@ -294,7 +334,7 @@ class MainWindow(QMainWindow):
                 on_context_menu=self.on_annotation_context_menu
             )
             
-            center_layout.addWidget(spec_container, 1)
+            single_channel_layout.addWidget(spec_container, 1)
             
             # Connect callbacks for status bar updates
             self.spectrogram_canvas.on_zoom_changed_callback = self.on_zoom_level_changed
@@ -336,11 +376,29 @@ class MainWindow(QMainWindow):
         self.annotation_table.annotation_visibility_changed.connect(self.on_annotation_visibility_changed)
         self.annotation_table.doppler_visibility_changed.connect(self.on_doppler_visibility_changed)
         
-        # Add table to center layout (below spectrogram)
+        # Add table to single channel layout (below spectrogram)
         if HAS_VISPY:
-            center_layout.addWidget(self.annotation_table)
+            single_channel_layout.addWidget(self.annotation_table)
         else:
-            center_layout.addWidget(QLabel("VisPy not available"))
+            single_channel_layout.addWidget(QLabel("VisPy not available"))
+
+        # Add single channel tab to main tabs
+        self.main_tabs.addTab(single_channel_tab, "Single Channel")
+
+        # ============ TAB 2: DAS Multi-Channel ============
+        logger.info("DEBUG setup_ui: Creating DAS Multi-Channel tab...")
+        try:
+            DASTabClass = _get_das_tab_class()
+            self.das_tab = DASTabClass(parent=self)
+            self.das_tab.status_message.connect(self._on_das_status_message)
+            self.main_tabs.addTab(self.das_tab, "DAS Multi-Channel")
+            logger.info("DAS Multi-Channel tab created successfully")
+        except Exception as e:
+            logger.error(f"Failed to create DAS tab: {e}")
+            das_placeholder = QLabel("DAS Multi-Channel tab failed to load.\nCheck logs for details.")
+            das_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.main_tabs.addTab(das_placeholder, "DAS Multi-Channel")
+            self.das_tab = None
 
         # Add Event Panel on the right side (hidden by default)
         self.event_panel = EventPanel(self.event_manager)
@@ -367,9 +425,28 @@ class MainWindow(QMainWindow):
         self.controls_widget.refresh_requested.connect(self.refresh_current_view)
         self.controls_widget.interpolation_changed.connect(self.on_interpolation_changed)
         self.controls_widget.normalization_mode_changed.connect(self.on_normalization_mode_changed)
-        
-        # No tab changes; visualization is always spectrogram
+
+        # Connect tab change signal
+        self.main_tabs.currentChanged.connect(self._on_main_tab_changed)
     
+    def _on_main_tab_changed(self, index: int):
+        """Handle main tab change."""
+        tab_name = self.main_tabs.tabText(index)
+        logger.info(f"Switched to tab: {tab_name}")
+
+        # Update window title based on active tab
+        if index == 0:  # Single Channel
+            if self.current_file:
+                self.setWindowTitle(f"Audio Visualizer - {Path(self.current_file).name}")
+            else:
+                self.setWindowTitle("GPU-Accelerated Audio Visualizer")
+        elif index == 1:  # DAS Multi-Channel
+            self.setWindowTitle("DAS Multi-Channel Visualizer")
+
+    def _on_das_status_message(self, message: str):
+        """Handle status messages from DAS tab."""
+        self.statusBar().showMessage(message, 5000)
+
     def connect_playlist_signals(self):
         """Connect signals from playlist widget."""
         self.playlist_widget.file_selected.connect(self.on_file_selected_from_playlist)

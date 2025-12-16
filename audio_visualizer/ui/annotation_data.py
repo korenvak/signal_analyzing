@@ -1,24 +1,40 @@
 """
 Annotation data model for rectangle-based annotations with harmonic linking.
+
+Supports both spectrogram (time × frequency) and waterfall (sensor × time) views.
 """
 from dataclasses import dataclass, field
 from typing import Optional, Any, Dict, List, Tuple
 from pathlib import Path
+from enum import Enum
+
+
+class CoordinateSystem(Enum):
+    """Coordinate system for annotations."""
+    SPECTROGRAM = "spectrogram"  # X=time(s), Y=frequency(Hz)
+    WATERFALL = "waterfall"      # X=sensor(int), Y=time(sample_idx)
 
 
 @dataclass
 class Annotation:
-    """Represents a single annotation rectangle on the spectrogram.
-    
+    """Represents a single annotation rectangle on the spectrogram or waterfall.
+
     Supports harmonic linking: annotations can be linked to parent annotations
     and have associated ridge (track) data.
+
+    Coordinate systems:
+    - SPECTROGRAM: x1/x2 = time (seconds), y1/y2 = frequency (Hz)
+    - WATERFALL: x1/x2 = sensor ID (int), y1/y2 = time (sample index)
     """
     id: int
     file_name: str
-    t_start: float  # Start time in seconds
-    t_end: float    # End time in seconds
-    f_min: float    # Lower frequency in Hz
-    f_max: float    # Upper frequency in Hz
+    t_start: float  # Start time in seconds (spectrogram) OR start sensor (waterfall)
+    t_end: float    # End time in seconds (spectrogram) OR end sensor (waterfall)
+    f_min: float    # Lower frequency in Hz (spectrogram) OR start time index (waterfall)
+    f_max: float    # Upper frequency in Hz (spectrogram) OR end time index (waterfall)
+
+    # Coordinate system - determines how x1,x2,y1,y2 are interpreted
+    coord_system: CoordinateSystem = CoordinateSystem.SPECTROGRAM
     
     # Harmonic linking fields
     harmonic_index: Optional[int] = None      # Deprecated, use harmonic_order
@@ -64,6 +80,7 @@ class Annotation:
             't_end': self.t_end,
             'f_min': self.f_min,
             'f_max': self.f_max,
+            'coord_system': self.coord_system.value,  # Store as string
             'harmonic_index': self.harmonic_index,
             'harmonic_order': self.harmonic_order,
             'parent_rect_id': self.parent_rect_id,
@@ -89,6 +106,13 @@ class Annotation:
     @classmethod
     def from_dict(cls, data: dict) -> 'Annotation':
         """Create annotation from dictionary (for JSON deserialization)."""
+        # Parse coordinate system (default to spectrogram for backward compatibility)
+        coord_str = data.get('coord_system', 'spectrogram')
+        try:
+            coord_system = CoordinateSystem(coord_str)
+        except ValueError:
+            coord_system = CoordinateSystem.SPECTROGRAM
+
         ann = cls(
             id=data['id'],
             file_name=data.get('file_name', ''),
@@ -96,6 +120,7 @@ class Annotation:
             t_end=data['t_end'],
             f_min=data['f_min'],
             f_max=data['f_max'],
+            coord_system=coord_system,
             harmonic_index=data.get('harmonic_index'),
             harmonic_order=data.get('harmonic_order'),
             parent_rect_id=data.get('parent_rect_id'),
@@ -121,17 +146,60 @@ class Annotation:
     
     @property
     def width(self) -> float:
-        """Width of the annotation in time (seconds)."""
+        """Width of the annotation (time for spectrogram, sensors for waterfall)."""
         return abs(self.t_end - self.t_start)
-    
+
     @property
     def height(self) -> float:
-        """Height of the annotation in frequency (Hz)."""
+        """Height of the annotation (frequency for spectrogram, time for waterfall)."""
         return abs(self.f_max - self.f_min)
-    
-    def contains_point(self, time: float, freq: float) -> bool:
-        """Check if a point (time, freq) is inside this annotation."""
-        t_min, t_max = min(self.t_start, self.t_end), max(self.t_start, self.t_end)
-        f_min, f_max = min(self.f_min, self.f_max), max(self.f_min, self.f_max)
-        return (t_min <= time <= t_max) and (f_min <= freq <= f_max)
+
+    # Waterfall-specific accessors (aliases for clarity)
+    @property
+    def sensor_start(self) -> int:
+        """Start sensor ID (waterfall mode). Alias for t_start."""
+        return int(self.t_start)
+
+    @property
+    def sensor_end(self) -> int:
+        """End sensor ID (waterfall mode). Alias for t_end."""
+        return int(self.t_end)
+
+    @property
+    def time_start_idx(self) -> int:
+        """Start time sample index (waterfall mode). Alias for f_min."""
+        return int(self.f_min)
+
+    @property
+    def time_end_idx(self) -> int:
+        """End time sample index (waterfall mode). Alias for f_max."""
+        return int(self.f_max)
+
+    @property
+    def is_spectrogram(self) -> bool:
+        """Check if this annotation uses spectrogram coordinates."""
+        return self.coord_system == CoordinateSystem.SPECTROGRAM
+
+    @property
+    def is_waterfall(self) -> bool:
+        """Check if this annotation uses waterfall coordinates."""
+        return self.coord_system == CoordinateSystem.WATERFALL
+
+    def contains_point(self, x: float, y: float) -> bool:
+        """Check if a point (x, y) is inside this annotation.
+
+        For spectrogram: x=time, y=freq
+        For waterfall: x=sensor, y=time_idx
+        """
+        x_min, x_max = min(self.t_start, self.t_end), max(self.t_start, self.t_end)
+        y_min, y_max = min(self.f_min, self.f_max), max(self.f_min, self.f_max)
+        return (x_min <= x <= x_max) and (y_min <= y <= y_max)
+
+    def contains_point_spectrogram(self, time: float, freq: float) -> bool:
+        """Check if a point (time, freq) is inside this annotation (spectrogram mode)."""
+        return self.contains_point(time, freq)
+
+    def contains_point_waterfall(self, sensor: int, time_idx: int) -> bool:
+        """Check if a point (sensor, time_idx) is inside this annotation (waterfall mode)."""
+        return self.contains_point(float(sensor), float(time_idx))
 
