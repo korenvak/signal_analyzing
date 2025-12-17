@@ -120,17 +120,22 @@ class RangeSelectorWidget(QWidget):
         sensor_group = QGroupBox("Sensor Range")
         sensor_layout = QGridLayout(sensor_group)
 
-        sensor_layout.addWidget(QLabel("Start:"), 0, 0)
+        # Available range info
+        self.sensor_available_label = QLabel("Available: --")
+        self.sensor_available_label.setStyleSheet("color: #4a9eff; font-size: 11px; font-weight: bold;")
+        sensor_layout.addWidget(self.sensor_available_label, 0, 0, 1, 4)
+
+        sensor_layout.addWidget(QLabel("Start:"), 1, 0)
         self.sensor_start = QSpinBox()
         self.sensor_start.setRange(0, 100000)
         self.sensor_start.valueChanged.connect(self._on_range_changed)
-        sensor_layout.addWidget(self.sensor_start, 0, 1)
+        sensor_layout.addWidget(self.sensor_start, 1, 1)
 
-        sensor_layout.addWidget(QLabel("End:"), 0, 2)
+        sensor_layout.addWidget(QLabel("End:"), 1, 2)
         self.sensor_end = QSpinBox()
         self.sensor_end.setRange(0, 100000)
         self.sensor_end.valueChanged.connect(self._on_range_changed)
-        sensor_layout.addWidget(self.sensor_end, 0, 3)
+        sensor_layout.addWidget(self.sensor_end, 1, 3)
 
         # Quick select buttons
         quick_layout = QHBoxLayout()
@@ -146,7 +151,7 @@ class RangeSelectorWidget(QWidget):
         self.first_500_btn.clicked.connect(lambda: self._select_sensor_range(0, 500))
         quick_layout.addWidget(self.first_500_btn)
 
-        sensor_layout.addLayout(quick_layout, 1, 0, 1, 4)
+        sensor_layout.addLayout(quick_layout, 2, 0, 1, 4)
 
         layout.addWidget(sensor_group)
 
@@ -154,15 +159,20 @@ class RangeSelectorWidget(QWidget):
         time_group = QGroupBox("Time Range")
         time_layout = QGridLayout(time_group)
 
-        time_layout.addWidget(QLabel("Start:"), 0, 0)
+        # Available time info
+        self.time_available_label = QLabel("Available: --")
+        self.time_available_label.setStyleSheet("color: #4a9eff; font-size: 11px; font-weight: bold;")
+        time_layout.addWidget(self.time_available_label, 0, 0, 1, 2)
+
+        time_layout.addWidget(QLabel("Start:"), 1, 0)
         self.time_start = TimeRangeEdit()
         self.time_start.value_changed.connect(self._on_range_changed)
-        time_layout.addWidget(self.time_start, 0, 1)
+        time_layout.addWidget(self.time_start, 1, 1)
 
-        time_layout.addWidget(QLabel("End:"), 1, 0)
+        time_layout.addWidget(QLabel("End:"), 2, 0)
         self.time_end = TimeRangeEdit()
         self.time_end.value_changed.connect(self._on_range_changed)
-        time_layout.addWidget(self.time_end, 1, 1)
+        time_layout.addWidget(self.time_end, 2, 1)
 
         # Time quick select
         time_quick_layout = QHBoxLayout()
@@ -178,7 +188,7 @@ class RangeSelectorWidget(QWidget):
         self.all_time_btn.clicked.connect(self._select_all_time)
         time_quick_layout.addWidget(self.all_time_btn)
 
-        time_layout.addLayout(time_quick_layout, 2, 0, 1, 2)
+        time_layout.addLayout(time_quick_layout, 3, 0, 1, 2)
 
         layout.addWidget(time_group)
 
@@ -253,11 +263,17 @@ class RangeSelectorWidget(QWidget):
         self._metadata = metadata
         self._time_formatter = TimeFormatter(sample_rate=metadata.sample_rate)
 
-        # Update sensor range limits
+        # Update sensor range limits and display
         self.sensor_start.setRange(metadata.sensor_range[0], metadata.sensor_range[1])
         self.sensor_end.setRange(metadata.sensor_range[0], metadata.sensor_range[1])
         self.sensor_start.setValue(metadata.sensor_range[0])
         self.sensor_end.setValue(min(metadata.sensor_range[1], metadata.sensor_range[0] + 500))
+
+        # Update sensor available label
+        self.sensor_available_label.setText(
+            f"Available: {metadata.sensor_range[0]} - {metadata.sensor_range[1]} "
+            f"({metadata.n_sensors} sensors)"
+        )
 
         # Update frequency max based on sample rate (Nyquist)
         nyquist = metadata.sample_rate / 2
@@ -265,12 +281,35 @@ class RangeSelectorWidget(QWidget):
         self.freq_max.setValue(nyquist)
 
         # Set default time range (first available segment, first 5 minutes)
+        total_duration = 0
         if metadata.time_ranges:
             first_start, first_end = metadata.time_ranges[0]
             max_duration = min(300, (first_end - first_start).total_seconds())  # Max 5 min
 
             self.time_start.set_total_seconds(0)
             self.time_end.set_total_seconds(max_duration)
+
+            # Calculate total duration
+            total_duration = metadata.total_duration_seconds
+
+            # Update time available label
+            hours = int(total_duration // 3600)
+            minutes = int((total_duration % 3600) // 60)
+            seconds = int(total_duration % 60)
+
+            if hours > 0:
+                time_str = f"{hours}h {minutes}m {seconds}s"
+            elif minutes > 0:
+                time_str = f"{minutes}m {seconds}s"
+            else:
+                time_str = f"{seconds}s"
+
+            self.time_available_label.setText(
+                f"Available: {time_str} ({len(metadata.time_ranges)} segment(s))"
+            )
+
+            # Show sample rate info
+            self.freq_group.setTitle(f"Frequency Filter (Nyquist: {nyquist:.0f} Hz)")
 
         self._update_size_estimate()
 

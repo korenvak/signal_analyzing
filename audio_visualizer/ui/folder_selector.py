@@ -20,6 +20,7 @@ from .qt_compat import (
 from ..core.das_data_provider import (
     DASDataProvider, DASFolderMetadata, MockDASDataProvider
 )
+from ..core.file_das_provider import FileDASProvider
 from ..core.time_formatter import TimeFormatter
 
 logger = logging.getLogger(__name__)
@@ -181,7 +182,7 @@ class FolderSelectorWidget(QWidget):
                 self.meta_input.setText(filepath)
 
     def _load_metadata(self):
-        """Load metadata from selected folder."""
+        """Load metadata from selected folder using FileDASProvider."""
         folder = self.folder_input.text().strip()
         meta_file = self.meta_input.text().strip() or "metadata.json"
 
@@ -201,34 +202,65 @@ class FolderSelectorWidget(QWidget):
             return
 
         try:
-            # For now, create a mock provider since user will implement real one
-            # In the future, this will use a factory based on metadata format
-            self.info_text.setPlainText("Loading metadata...\n\n(User-provided DASDataProvider required)")
+            self.info_text.setPlainText("Loading data folder...")
 
-            # Try to load and display the JSON metadata
-            with open(meta_path, 'r') as f:
-                meta_json = json.load(f)
+            # Use FileDASProvider to load the data
+            provider = FileDASProvider()
+            metadata = provider.load_folder(str(folder_path), meta_file)
+            self._provider = provider
 
-            # Display raw metadata info
-            info_lines = ["Metadata file loaded:\n"]
-            for key, value in meta_json.items():
-                if isinstance(value, list) and len(value) > 3:
-                    info_lines.append(f"  {key}: [{len(value)} items]")
-                else:
-                    info_lines.append(f"  {key}: {value}")
+            # Display metadata info
+            info_lines = [
+                "DATA LOADED SUCCESSFULLY",
+                "=" * 30,
+                f"",
+                f"Sensors: {metadata.sensor_range[0]} - {metadata.sensor_range[1]}",
+                f"Total sensors: {metadata.n_sensors}",
+                f"Sample rate: {metadata.sample_rate:.0f} Hz",
+                f"Duration: {metadata.total_duration_seconds:.1f}s",
+                f"Files: {len(metadata.files)}",
+            ]
 
-            info_lines.append("\n\nNote: Implement DASDataProvider for your")
-            info_lines.append("specific file format to enable data loading.")
+            if metadata.sensor_spacing:
+                info_lines.append(f"Sensor spacing: {metadata.sensor_spacing} m")
+
+            info_lines.append(f"Units: {metadata.units}")
+            info_lines.append(f"")
+            info_lines.append("Time ranges:")
+
+            formatter = TimeFormatter(sample_rate=metadata.sample_rate)
+            for i, (start, end) in enumerate(metadata.time_ranges):
+                duration = (end - start).total_seconds()
+                info_lines.append(
+                    f"  {i+1}. {start.strftime('%H:%M:%S')} - {end.strftime('%H:%M:%S')} "
+                    f"({formatter.format_duration(duration)})"
+                )
+
+            if len(metadata.time_ranges) > 1:
+                info_lines.append("")
+                info_lines.append("Note: Gap between ranges indicates missing data")
+
+            # Show file sizes
+            info_lines.append("")
+            info_lines.append("Data files:")
+            for fi in metadata.files:
+                size_mb = fi.file_size_bytes / 1024 / 1024
+                info_lines.append(f"  - {fi.filename}: {size_mb:.1f} MB")
 
             self.info_text.setPlainText("\n".join(info_lines))
 
-            logger.info(f"Metadata loaded from {meta_path}")
+            # Emit success signal
+            self.folder_loaded.emit(metadata, provider)
+
+            logger.info(f"DAS data loaded from {folder_path}")
 
         except json.JSONDecodeError as e:
             self.load_error.emit(f"Invalid JSON: {e}")
+        except FileNotFoundError as e:
+            self.load_error.emit(f"File not found: {e}")
         except Exception as e:
-            self.load_error.emit(f"Error loading metadata: {e}")
-            logger.error(f"Metadata load error: {e}")
+            self.load_error.emit(f"Error loading data: {e}")
+            logger.error(f"Data load error: {e}")
 
     def _load_mock_data(self):
         """Load mock data for testing the UI."""
