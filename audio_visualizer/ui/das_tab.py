@@ -173,16 +173,19 @@ class DASTab(QWidget):
         self.sensor_select_label.hide()
         self.sensor_combo.hide()
 
-        # Colormap selector (placeholder)
+        # Colormap selector
         layout.addWidget(QLabel("Colormap:"))
         self.colormap_combo = QComboBox()
         self.colormap_combo.addItems(["viridis", "plasma", "inferno", "magma", "cividis", "turbo"])
+        self.colormap_combo.currentIndexChanged.connect(self._on_colormap_changed)
         layout.addWidget(self.colormap_combo)
 
-        # Normalization (placeholder)
+        # Normalization
         layout.addWidget(QLabel("Normalization:"))
         self.norm_combo = QComboBox()
         self.norm_combo.addItems(["MinMax", "STD (Adaptive)", "Percentile"])
+        self.norm_combo.setCurrentIndex(1)  # Default to STD (most robust for DAS data)
+        self.norm_combo.currentIndexChanged.connect(self._on_normalization_changed)
         layout.addWidget(self.norm_combo)
 
         layout.addStretch()
@@ -191,14 +194,19 @@ class DASTab(QWidget):
 
     def _setup_main_display(self):
         """Setup the main display area."""
+        from .qt_compat import QStackedWidget
+
         display_container = QFrame()
         display_container.setObjectName("das_display_container")
         display_layout = QVBoxLayout(display_container)
         display_layout.setContentsMargins(0, 0, 0, 0)
         display_layout.setSpacing(0)
 
-        # Placeholder for waterfall canvas
-        # Will be replaced with actual WaterfallCanvas once implemented
+        # Stacked widget for switching between waterfall and spectrogram views
+        self.display_stack = QStackedWidget()
+        display_layout.addWidget(self.display_stack)
+
+        # Page 0: Placeholder (initial state)
         self.display_placeholder = QLabel(
             "DAS Waterfall Display\n\n"
             "1. Select a data folder in the 'Data' tab\n"
@@ -216,7 +224,60 @@ class DASTab(QWidget):
                 padding: 40px;
             }
         """)
-        display_layout.addWidget(self.display_placeholder)
+        self.display_stack.addWidget(self.display_placeholder)
+
+        # Page 1: Waterfall canvas
+        self._waterfall_canvas = None
+        self._waterfall_container = QFrame()
+        waterfall_layout = QVBoxLayout(self._waterfall_container)
+        waterfall_layout.setContentsMargins(0, 0, 0, 0)
+
+        try:
+            from .waterfall_canvas import WaterfallCanvas
+            self._waterfall_canvas = WaterfallCanvas()
+            self._waterfall_canvas.on_cursor_moved_callback = self._on_waterfall_cursor_moved
+            waterfall_layout.addWidget(self._waterfall_canvas.native)
+            logger.info("WaterfallCanvas created successfully")
+        except ImportError as e:
+            logger.warning(f"Could not create WaterfallCanvas: {e}")
+            fallback = QLabel("Waterfall visualization requires VisPy")
+            fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            waterfall_layout.addWidget(fallback)
+
+        self.display_stack.addWidget(self._waterfall_container)
+
+        # Page 2: Single-sensor spectrogram (reuse existing VisPyCanvas)
+        self._spectrogram_container = QFrame()
+        spec_layout = QVBoxLayout(self._spectrogram_container)
+        spec_layout.setContentsMargins(0, 0, 0, 0)
+
+        try:
+            from .vispy_canvas import VisPyCanvas
+            self._sensor_spectrogram_canvas = VisPyCanvas('spectrogram')
+            self._sensor_spectrogram_canvas.native.setMinimumSize(400, 300)
+            spec_layout.addWidget(self._sensor_spectrogram_canvas.native)
+            logger.info("Single-sensor spectrogram canvas created")
+        except ImportError as e:
+            logger.warning(f"Could not create spectrogram canvas: {e}")
+            fallback = QLabel("Spectrogram visualization requires VisPy")
+            fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            spec_layout.addWidget(fallback)
+            self._sensor_spectrogram_canvas = None
+
+        self.display_stack.addWidget(self._spectrogram_container)
+
+        # Info bar at bottom
+        self.info_bar = QLabel("")
+        self.info_bar.setStyleSheet("""
+            QLabel {
+                background-color: rgba(30, 30, 46, 0.9);
+                color: #aaa;
+                padding: 4px 8px;
+                font-size: 11px;
+                font-family: monospace;
+            }
+        """)
+        display_layout.addWidget(self.info_bar)
 
         self.splitter.addWidget(display_container)
 
@@ -275,28 +336,68 @@ class DASTab(QWidget):
         self.status_label.setText("Computing waterfall...")
         self.status_message.emit("Computing waterfall...")
 
-        # TODO: Implement actual waterfall computation
-        # For now, show a message
         try:
             # Get data chunk from provider
             data = self._provider.get_data_chunk(request)
             self._current_waterfall_data = data
+            self._current_request = request
 
-            # Update display placeholder with info
-            self.display_placeholder.setText(
-                f"Waterfall Data Ready\n\n"
-                f"Shape: {data.shape[0]} time samples × {data.shape[1]} sensors\n"
-                f"Data range: [{data.min():.3f}, {data.max():.3f}]\n\n"
-                f"(Waterfall canvas implementation pending)"
+            # Store extent information
+            self._current_sensor_start = request.sensor_start
+            self._current_sensor_end = request.sensor_end
+            self._current_time_start = request.time_start
+            self._current_time_end = request.time_end
+
+            # Update waterfall display
+            self._update_waterfall_display()
+
+            self.status_label.setText(
+                f"Computed: {data.shape[0]} × {data.shape[1]} "
+                f"({data.shape[0] * data.shape[1] * 4 / 1024 / 1024:.1f} MB)"
             )
-
-            self.status_label.setText(f"Computed: {data.shape}")
             self.waterfall_computed.emit(data)
+
+            # Switch to display tab
+            self.sidebar_tabs.setCurrentIndex(2)
 
         except Exception as e:
             logger.error(f"Waterfall computation failed: {e}")
             QMessageBox.critical(self, "Computation Error", str(e))
             self.status_label.setText(f"Error: {e}")
+
+    def _update_waterfall_display(self):
+        """Update waterfall canvas with current data."""
+        if self._current_waterfall_data is None:
+            return
+
+        if self._waterfall_canvas is not None:
+            # Set data on canvas
+            self._waterfall_canvas.set_data(
+                data=self._current_waterfall_data,
+                sensor_start=getattr(self, '_current_sensor_start', 0),
+                sensor_end=getattr(self, '_current_sensor_end', None),
+                time_start=getattr(self, '_current_time_start', 0),
+                time_end=getattr(self, '_current_time_end', None),
+                time_formatter=self._time_formatter
+            )
+
+            # Apply current colormap
+            colormap = self.colormap_combo.currentText()
+            self._waterfall_canvas.set_colormap(colormap)
+
+            # Switch to waterfall view
+            self.display_stack.setCurrentIndex(1)
+            logger.info("Waterfall display updated")
+        else:
+            # Fallback to placeholder
+            data = self._current_waterfall_data
+            self.display_placeholder.setText(
+                f"Waterfall Data Ready\n\n"
+                f"Shape: {data.shape[0]} time samples × {data.shape[1]} sensors\n"
+                f"Data range: [{data.min():.3f}, {data.max():.3f}]\n\n"
+                f"(Waterfall canvas not available)"
+            )
+            self.display_stack.setCurrentIndex(0)
 
     # ==================== View Mode ====================
 
@@ -306,6 +407,12 @@ class DASTab(QWidget):
             self._view_mode = 'waterfall'
             self.sensor_select_label.hide()
             self.sensor_combo.hide()
+
+            # Switch to waterfall view if data exists
+            if self._current_waterfall_data is not None and self._waterfall_canvas is not None:
+                self.display_stack.setCurrentIndex(1)  # Waterfall canvas
+            else:
+                self.display_stack.setCurrentIndex(0)  # Placeholder
         else:
             self._view_mode = 'spectrogram'
             self.sensor_select_label.show()
@@ -329,12 +436,91 @@ class DASTab(QWidget):
             self.sensor_selected.emit(sensor_id)
             self.status_message.emit(f"Selected sensor {sensor_id} for spectrogram")
 
-            # Update display placeholder
+            # Compute and display single-sensor spectrogram
+            self._compute_sensor_spectrogram(sensor_id)
+
+    def _compute_sensor_spectrogram(self, sensor_id: int):
+        """
+        Compute and display spectrogram for a single sensor.
+
+        Args:
+            sensor_id: The sensor ID to display spectrogram for
+        """
+        if self._current_waterfall_data is None:
             self.display_placeholder.setText(
                 f"Single Sensor Spectrogram\n\n"
                 f"Sensor ID: {sensor_id}\n\n"
-                f"(Spectrogram computation pending)"
+                f"(No waterfall data loaded - compute waterfall first)"
             )
+            self.display_stack.setCurrentIndex(0)
+            return
+
+        try:
+            # Get sensor column from current data
+            sensor_start = getattr(self, '_current_sensor_start', 0)
+            local_sensor_idx = sensor_id - sensor_start
+
+            if local_sensor_idx < 0 or local_sensor_idx >= self._current_waterfall_data.shape[1]:
+                self.display_placeholder.setText(
+                    f"Sensor {sensor_id} not in current range\n\n"
+                    f"Current range: {sensor_start} - {sensor_start + self._current_waterfall_data.shape[1]}"
+                )
+                self.display_stack.setCurrentIndex(0)
+                return
+
+            # Extract single sensor time series
+            sensor_data = self._current_waterfall_data[:, local_sensor_idx]
+
+            # Compute spectrogram using waterfall engine
+            from ..engines.waterfall_engine import get_waterfall_engine
+            engine = get_waterfall_engine()
+
+            sample_rate = self._metadata.sample_rate if self._metadata else 1000.0
+            spectrogram, freqs, times = engine.process_for_spectrogram(
+                sensor_data,
+                sample_rate=sample_rate,
+                fft_size=1024,
+                hop_length=256
+            )
+
+            # Display in spectrogram canvas
+            if self._sensor_spectrogram_canvas is not None:
+                # Spectrogram is (freq, time) - need to display with time on x-axis, freq on y-axis
+                # update_image expects extent as (time_start, time_end, freq_start, freq_end)
+                time_max = times[-1] if len(times) > 0 else 1.0
+                extent = (0, time_max, freqs[0], freqs[-1])
+
+                self._sensor_spectrogram_canvas.update_image(
+                    spectrogram.T,  # Transpose: (freq, time) -> (time, freq) for display
+                    extent=extent,
+                    preserve_view=False
+                )
+                # Set data bounds for proper zoom behavior
+                self._sensor_spectrogram_canvas.set_data_bounds(0, time_max, freqs[0], freqs[-1])
+                self._sensor_spectrogram_canvas.reset_camera_to_data_bounds()
+
+                self.display_stack.setCurrentIndex(2)  # Spectrogram canvas
+                self.info_bar.setText(f"Sensor {sensor_id} spectrogram | {len(freqs)} freq bins | {len(times)} time frames")
+                logger.info(f"Displayed spectrogram for sensor {sensor_id}")
+            else:
+                # Fallback
+                self.display_placeholder.setText(
+                    f"Single Sensor Spectrogram\n\n"
+                    f"Sensor ID: {sensor_id}\n"
+                    f"Shape: {spectrogram.shape}\n"
+                    f"Freq range: {freqs[0]:.1f} - {freqs[-1]:.1f} Hz\n\n"
+                    f"(Spectrogram canvas not available)"
+                )
+                self.display_stack.setCurrentIndex(0)
+
+        except Exception as e:
+            logger.error(f"Failed to compute sensor spectrogram: {e}")
+            self.display_placeholder.setText(
+                f"Error computing spectrogram\n\n"
+                f"Sensor ID: {sensor_id}\n"
+                f"Error: {str(e)}"
+            )
+            self.display_stack.setCurrentIndex(0)
 
     # ==================== Public API ====================
 
@@ -360,3 +546,54 @@ class DASTab(QWidget):
         mock_provider = MockDASDataProvider()
         metadata = mock_provider.load_folder("mock_folder", "mock_metadata.json")
         self._on_folder_loaded(metadata, mock_provider)
+
+    # ==================== Waterfall Callbacks ====================
+
+    def _on_waterfall_cursor_moved(self, info: Dict[str, Any]):
+        """
+        Handle cursor movement over the waterfall canvas.
+
+        Updates the info bar with sensor ID, time, and value.
+
+        Args:
+            info: Dictionary with 'sensor', 'time_idx', 'time_str', 'value'
+        """
+        sensor = info.get('sensor', 0)
+        time_str = info.get('time_str', '')
+        value = info.get('value')
+
+        if value is not None:
+            self.info_bar.setText(
+                f"Sensor: {sensor}  |  Time: {time_str}  |  Value: {value:.4f}"
+            )
+        else:
+            self.info_bar.setText(f"Sensor: {sensor}  |  Time: {time_str}")
+
+    def _on_colormap_changed(self, index: int):
+        """Handle colormap selection change."""
+        colormap = self.colormap_combo.currentText()
+        if self._waterfall_canvas is not None:
+            self._waterfall_canvas.set_colormap(colormap)
+        logger.debug(f"Colormap changed to: {colormap}")
+
+    def _on_normalization_changed(self, index: int):
+        """Handle normalization mode change."""
+        from ..engines.waterfall_engine import NormalizationMode, WaterfallParams
+
+        mode_map = {
+            0: NormalizationMode.MINMAX,
+            1: NormalizationMode.STD,
+            2: NormalizationMode.PERCENTILE,
+        }
+        mode = mode_map.get(index, NormalizationMode.STD)
+
+        # If we have current data, reprocess it
+        if self._current_waterfall_data is not None and self._waterfall_canvas is not None:
+            from ..engines.waterfall_engine import get_waterfall_engine
+            engine = get_waterfall_engine()
+            engine.params.normalization = mode
+
+            # Reprocess and update canvas
+            self._update_waterfall_display()
+
+        logger.debug(f"Normalization changed to: {mode.value}")
