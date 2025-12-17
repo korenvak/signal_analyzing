@@ -280,19 +280,25 @@ class RangeSelectorWidget(QWidget):
         self.freq_max.setRange(0, nyquist)
         self.freq_max.setValue(nyquist)
 
-        # Set default time range (first available segment, first 5 minutes)
+        # Set default time range (first available segment)
         total_duration = 0
         if metadata.time_ranges:
             first_start, first_end = metadata.time_ranges[0]
-            max_duration = min(300, (first_end - first_start).total_seconds())  # Max 5 min
+            first_segment_duration = (first_end - first_start).total_seconds()
+
+            # Default to first segment or 5 minutes, whichever is smaller
+            default_duration = min(300, first_segment_duration)
 
             self.time_start.set_total_seconds(0)
-            self.time_end.set_total_seconds(max_duration)
+            self.time_end.set_total_seconds(default_duration)
 
             # Calculate total duration
             total_duration = metadata.total_duration_seconds
 
-            # Update time available label
+            # Store max duration for validation
+            self._max_time_seconds = total_duration
+
+            # Update time available label with segment info
             hours = int(total_duration // 3600)
             minutes = int((total_duration % 3600) // 60)
             seconds = int(total_duration % 60)
@@ -304,9 +310,17 @@ class RangeSelectorWidget(QWidget):
             else:
                 time_str = f"{seconds}s"
 
-            self.time_available_label.setText(
-                f"Available: {time_str} ({len(metadata.time_ranges)} segment(s))"
-            )
+            # Show first segment duration if multiple segments
+            if len(metadata.time_ranges) > 1:
+                seg1_dur = int(first_segment_duration)
+                self.time_available_label.setText(
+                    f"Available: {time_str} total ({len(metadata.time_ranges)} segments)\n"
+                    f"First segment: {seg1_dur}s"
+                )
+            else:
+                self.time_available_label.setText(
+                    f"Available: {time_str} ({len(metadata.time_ranges)} segment)"
+                )
 
             # Show sample rate info
             self.freq_group.setTitle(f"Frequency Filter (Nyquist: {nyquist:.0f} Hz)")

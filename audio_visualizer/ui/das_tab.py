@@ -371,13 +371,21 @@ class DASTab(QWidget):
             return
 
         if self._waterfall_canvas is not None:
-            # Set data on canvas
+            # Convert datetime to sample indices for display
+            # time_start/time_end in set_data are sample indices, not datetime
+            n_time_samples = self._current_waterfall_data.shape[0]
+            sensor_start = getattr(self, '_current_sensor_start', 0)
+            sensor_end = getattr(self, '_current_sensor_end', None)
+            if sensor_end is None:
+                sensor_end = sensor_start + self._current_waterfall_data.shape[1]
+
+            # Set data on canvas with sample indices (0 to n_samples)
             self._waterfall_canvas.set_data(
                 data=self._current_waterfall_data,
-                sensor_start=getattr(self, '_current_sensor_start', 0),
-                sensor_end=getattr(self, '_current_sensor_end', None),
-                time_start=getattr(self, '_current_time_start', 0),
-                time_end=getattr(self, '_current_time_end', None),
+                sensor_start=sensor_start,
+                sensor_end=sensor_end,
+                time_start=0,
+                time_end=n_time_samples,
                 time_formatter=self._time_formatter
             )
 
