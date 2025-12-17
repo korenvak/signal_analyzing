@@ -7,6 +7,7 @@ Processes DAS matrix data for waterfall display:
 - Optional filtering (time-domain)
 - dB conversion (optional)
 - Colormap application
+- GPU memory management for large datasets
 """
 
 import numpy as np
@@ -23,12 +24,33 @@ try:
     import cupy as cp
     from cupyx.scipy import ndimage as ndi_gpu
     HAS_GPU = True
+
+    # Get GPU memory info
+    def get_gpu_memory_info() -> Tuple[int, int]:
+        """Get GPU memory (free, total) in bytes."""
+        mempool = cp.get_default_memory_pool()
+        device = cp.cuda.Device()
+        free, total = device.mem_info
+        return free, total
+
 except ImportError:
     cp = None
     ndi_gpu = None
     HAS_GPU = False
 
+    def get_gpu_memory_info() -> Tuple[int, int]:
+        return 0, 0
+
 from scipy import ndimage as ndi_cpu
+
+
+@dataclass
+class GPUMemoryConfig:
+    """GPU memory management configuration."""
+    max_usage_fraction: float = 0.7   # Max fraction of GPU memory to use
+    chunk_size_mb: float = 256.0      # Process in chunks of this size
+    auto_fallback: bool = True        # Fallback to CPU if GPU OOM
+    clear_cache_threshold: float = 0.9  # Clear cache when usage exceeds this
 
 
 class NormalizationMode(Enum):
@@ -66,16 +88,27 @@ class WaterfallEngine:
     The waterfall display shows:
     - X-axis: Sensors (columns)
     - Y-axis: Time (rows, top = earlier, bottom = later)
+
+    Features:
+    - Automatic GPU/CPU selection based on memory availability
+    - Chunked processing for large datasets
+    - Memory-efficient operations
     """
 
-    def __init__(self, use_gpu: bool = True):
+    def __init__(
+        self,
+        use_gpu: bool = True,
+        gpu_config: Optional[GPUMemoryConfig] = None
+    ):
         """
         Initialize waterfall engine.
 
         Args:
             use_gpu: Whether to use GPU acceleration if available
+            gpu_config: GPU memory management configuration
         """
         self.use_gpu = use_gpu and HAS_GPU
+        self._gpu_config = gpu_config or GPUMemoryConfig()
         self._params = WaterfallParams()
 
         # Cache for reusing allocations
@@ -83,8 +116,16 @@ class WaterfallEngine:
 
         # Statistics
         self._last_process_time: float = 0.0
+        self._last_gpu_memory_mb: float = 0.0
+        self._fallback_to_cpu: bool = False
 
-        logger.info(f"WaterfallEngine initialized (GPU: {self.use_gpu})")
+        # Check GPU memory on init
+        if self.use_gpu:
+            free, total = get_gpu_memory_info()
+            logger.info(f"WaterfallEngine initialized (GPU: {self.use_gpu}, "
+                       f"VRAM: {free/1e9:.1f}/{total/1e9:.1f} GB free)")
+        else:
+            logger.info(f"WaterfallEngine initialized (CPU mode)")
 
     @property
     def params(self) -> WaterfallParams:
@@ -97,7 +138,8 @@ class WaterfallEngine:
     def process(
         self,
         data: np.ndarray,
-        params: Optional[WaterfallParams] = None
+        params: Optional[WaterfallParams] = None,
+        progress_callback: Optional[Callable[[float, str], None]] = None
     ) -> Tuple[np.ndarray, Dict[str, float]]:
         """
         Process DAS matrix data for waterfall display.
@@ -105,6 +147,7 @@ class WaterfallEngine:
         Args:
             data: Input matrix of shape (n_time, n_sensors), float32
             params: Processing parameters (uses default if None)
+            progress_callback: Optional callback for progress updates
 
         Returns:
             Tuple of:
@@ -120,22 +163,85 @@ class WaterfallEngine:
         if data.dtype != np.float32:
             data = data.astype(np.float32)
 
-        # Move to GPU if enabled
-        if self.use_gpu:
-            data = cp.asarray(data)
-            xp = cp
-            ndi = ndi_gpu
-        else:
-            xp = np
-            ndi = ndi_cpu
+        # Calculate memory requirements
+        data_size_mb = data.nbytes / (1024 * 1024)
+        use_gpu_for_this = self.use_gpu
 
-        # Step 1: Take absolute value if requested (common for phase derivatives)
+        # Check if data fits in GPU memory
+        if use_gpu_for_this:
+            use_gpu_for_this = self._check_gpu_memory(data_size_mb * 3)  # 3x for processing overhead
+
+        if use_gpu_for_this:
+            try:
+                result, stats = self._process_gpu(data, params, progress_callback)
+            except (cp.cuda.memory.OutOfMemoryError, MemoryError) as e:
+                logger.warning(f"GPU OOM, falling back to CPU: {e}")
+                self._fallback_to_cpu = True
+                result, stats = self._process_cpu(data, params, progress_callback)
+        else:
+            # Check if we should process in chunks for very large data
+            if data_size_mb > self._gpu_config.chunk_size_mb:
+                result, stats = self._process_chunked_cpu(data, params, progress_callback)
+            else:
+                result, stats = self._process_cpu(data, params, progress_callback)
+
+        self._last_process_time = time.time() - start_time
+        stats['process_time_ms'] = self._last_process_time * 1000
+        stats['used_gpu'] = use_gpu_for_this and not self._fallback_to_cpu
+
+        return result, stats
+
+    def _check_gpu_memory(self, required_mb: float) -> bool:
+        """Check if there's enough GPU memory for processing."""
+        if not self.use_gpu:
+            return False
+
+        free, total = get_gpu_memory_info()
+        free_mb = free / (1024 * 1024)
+
+        # Check against threshold
+        max_available = total * self._gpu_config.max_usage_fraction / (1024 * 1024)
+
+        if required_mb > min(free_mb, max_available):
+            logger.debug(f"Insufficient GPU memory: need {required_mb:.1f}MB, "
+                        f"have {free_mb:.1f}MB free ({max_available:.1f}MB max)")
+            return False
+
+        # Clear cache if memory usage is high
+        usage_fraction = 1 - (free / total)
+        if usage_fraction > self._gpu_config.clear_cache_threshold:
+            logger.debug("Clearing GPU cache due to high memory usage")
+            self.clear_cache()
+
+        return True
+
+    def _process_gpu(
+        self,
+        data: np.ndarray,
+        params: WaterfallParams,
+        progress_callback: Optional[Callable[[float, str], None]] = None
+    ) -> Tuple[np.ndarray, Dict[str, float]]:
+        """Process data on GPU."""
+        if progress_callback:
+            progress_callback(0.1, "Transferring to GPU...")
+
+        data = cp.asarray(data)
+        xp = cp
+        ndi = ndi_gpu
+
+        if progress_callback:
+            progress_callback(0.2, "Processing on GPU...")
+
+        # Step 1: Take absolute value if requested
         if params.use_abs:
             data = xp.abs(data)
 
         # Step 2: Decimate if requested
         if params.decimate_time > 1 or params.decimate_sensor > 1:
             data = self._decimate(data, params.decimate_time, params.decimate_sensor, xp)
+
+        if progress_callback:
+            progress_callback(0.4, "Applying filters...")
 
         # Step 3: Smooth if requested
         if params.smooth_sigma > 0:
@@ -145,17 +251,186 @@ class WaterfallEngine:
         if params.normalization == NormalizationMode.DB:
             data = self._to_db(data, params.db_reference, params.db_floor, xp)
 
+        if progress_callback:
+            progress_callback(0.6, "Normalizing...")
+
         # Step 5: Normalize
         data, stats = self._normalize(data, params, xp)
 
-        # Move back to CPU
-        if self.use_gpu:
-            data = cp.asnumpy(data)
+        if progress_callback:
+            progress_callback(0.8, "Transferring to CPU...")
 
-        self._last_process_time = time.time() - start_time
-        stats['process_time_ms'] = self._last_process_time * 1000
+        # Track GPU memory usage
+        mempool = cp.get_default_memory_pool()
+        self._last_gpu_memory_mb = mempool.used_bytes() / (1024 * 1024)
+        stats['gpu_memory_mb'] = self._last_gpu_memory_mb
+
+        # Move back to CPU
+        result = cp.asnumpy(data)
+
+        if progress_callback:
+            progress_callback(1.0, "Done")
+
+        return result, stats
+
+    def _process_cpu(
+        self,
+        data: np.ndarray,
+        params: WaterfallParams,
+        progress_callback: Optional[Callable[[float, str], None]] = None
+    ) -> Tuple[np.ndarray, Dict[str, float]]:
+        """Process data on CPU."""
+        if progress_callback:
+            progress_callback(0.1, "Processing on CPU...")
+
+        xp = np
+        ndi = ndi_cpu
+
+        # Make a copy to avoid modifying input
+        data = data.copy()
+
+        # Step 1: Take absolute value if requested
+        if params.use_abs:
+            data = xp.abs(data)
+
+        # Step 2: Decimate if requested
+        if params.decimate_time > 1 or params.decimate_sensor > 1:
+            data = self._decimate(data, params.decimate_time, params.decimate_sensor, xp)
+
+        if progress_callback:
+            progress_callback(0.4, "Applying filters...")
+
+        # Step 3: Smooth if requested
+        if params.smooth_sigma > 0:
+            data = ndi.gaussian_filter(data, sigma=params.smooth_sigma)
+
+        # Step 4: Convert to dB if requested
+        if params.normalization == NormalizationMode.DB:
+            data = self._to_db(data, params.db_reference, params.db_floor, xp)
+
+        if progress_callback:
+            progress_callback(0.7, "Normalizing...")
+
+        # Step 5: Normalize
+        data, stats = self._normalize(data, params, xp)
+
+        if progress_callback:
+            progress_callback(1.0, "Done")
 
         return data, stats
+
+    def _process_chunked_cpu(
+        self,
+        data: np.ndarray,
+        params: WaterfallParams,
+        progress_callback: Optional[Callable[[float, str], None]] = None
+    ) -> Tuple[np.ndarray, Dict[str, float]]:
+        """Process large data in chunks on CPU to manage memory."""
+        if progress_callback:
+            progress_callback(0.0, "Processing in chunks...")
+
+        n_time, n_sensors = data.shape
+        chunk_size_samples = int(self._gpu_config.chunk_size_mb * 1024 * 1024 / (n_sensors * 4))
+        chunk_size_samples = max(1000, chunk_size_samples)  # At least 1000 samples
+
+        n_chunks = (n_time + chunk_size_samples - 1) // chunk_size_samples
+        logger.info(f"Processing {n_time}x{n_sensors} in {n_chunks} chunks")
+
+        xp = np
+        ndi = ndi_cpu
+
+        # First pass: compute global statistics for normalization
+        if progress_callback:
+            progress_callback(0.1, "Computing statistics...")
+
+        global_min = np.inf
+        global_max = -np.inf
+        global_sum = 0.0
+        global_sq_sum = 0.0
+        total_samples = 0
+
+        for i in range(n_chunks):
+            start = i * chunk_size_samples
+            end = min(start + chunk_size_samples, n_time)
+            chunk = data[start:end, :]
+
+            if params.use_abs:
+                chunk = np.abs(chunk)
+
+            global_min = min(global_min, chunk.min())
+            global_max = max(global_max, chunk.max())
+            global_sum += chunk.sum()
+            global_sq_sum += (chunk ** 2).sum()
+            total_samples += chunk.size
+
+        global_mean = global_sum / total_samples
+        global_std = np.sqrt(global_sq_sum / total_samples - global_mean ** 2)
+
+        # Calculate normalization bounds
+        if params.normalization == NormalizationMode.STD:
+            norm_min = global_mean - params.std_scale * global_std
+            norm_max = global_mean + params.std_scale * global_std
+        elif params.normalization == NormalizationMode.MINMAX:
+            norm_min, norm_max = global_min, global_max
+        else:
+            norm_min, norm_max = global_min, global_max
+
+        # Second pass: process and normalize chunks
+        output = np.zeros_like(data)
+
+        for i in range(n_chunks):
+            start = i * chunk_size_samples
+            end = min(start + chunk_size_samples, n_time)
+
+            if progress_callback:
+                progress_callback(0.2 + 0.7 * (i / n_chunks), f"Processing chunk {i+1}/{n_chunks}...")
+
+            chunk = data[start:end, :].copy()
+
+            # Apply processing
+            if params.use_abs:
+                chunk = np.abs(chunk)
+
+            if params.decimate_time > 1 or params.decimate_sensor > 1:
+                chunk = self._decimate(chunk, params.decimate_time, params.decimate_sensor, xp)
+
+            if params.smooth_sigma > 0:
+                chunk = ndi.gaussian_filter(chunk, sigma=params.smooth_sigma)
+
+            if params.normalization == NormalizationMode.DB:
+                chunk = self._to_db(chunk, params.db_reference, params.db_floor, xp)
+
+            # Normalize using global bounds
+            if norm_max - norm_min > 1e-10:
+                chunk = (chunk - norm_min) / (norm_max - norm_min)
+            else:
+                chunk = np.zeros_like(chunk)
+
+            chunk = np.clip(chunk, 0.0, 1.0)
+
+            # Handle decimation affecting output size
+            if params.decimate_time > 1:
+                out_start = start // params.decimate_time
+                out_end = out_start + len(chunk)
+                if out_end <= output.shape[0]:
+                    output[out_start:out_end, :chunk.shape[1]] = chunk
+            else:
+                output[start:end, :] = chunk
+
+        if progress_callback:
+            progress_callback(1.0, "Done")
+
+        stats = {
+            'raw_min': float(global_min),
+            'raw_max': float(global_max),
+            'raw_mean': float(global_mean),
+            'raw_std': float(global_std),
+            'norm_min': float(norm_min),
+            'norm_max': float(norm_max),
+            'processed_chunks': n_chunks
+        }
+
+        return output, stats
 
     def _decimate(
         self,
