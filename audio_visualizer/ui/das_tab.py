@@ -605,3 +605,74 @@ class DASTab(QWidget):
             self._update_waterfall_display()
 
         logger.debug(f"Normalization changed to: {mode.value}")
+
+    # ==================== Memory Management ====================
+
+    def cleanup_memory(self):
+        """
+        Clean up memory resources.
+
+        Call this when:
+        - Switching away from the DAS tab
+        - Loading new data
+        - Closing the application
+        """
+        import gc
+        from ..engines.waterfall_engine import cleanup_waterfall_engine
+
+        # Clear waterfall data
+        self._current_waterfall_data = None
+
+        # Clean up waterfall canvas
+        if self._waterfall_canvas is not None:
+            self._waterfall_canvas.cleanup_memory()
+
+        # Clean up spectrogram canvas
+        if hasattr(self, '_sensor_spectrogram_canvas') and self._sensor_spectrogram_canvas is not None:
+            if hasattr(self._sensor_spectrogram_canvas, 'cleanup_memory'):
+                self._sensor_spectrogram_canvas.cleanup_memory()
+
+        # Clean up waterfall engine (GPU memory)
+        cleanup_waterfall_engine()
+
+        # Close provider if it has a close method
+        if self._provider is not None and hasattr(self._provider, 'close'):
+            self._provider.close()
+
+        # Force garbage collection
+        gc.collect()
+
+        logger.info("DASTab memory cleaned up")
+
+    def close_provider(self):
+        """Close the data provider and release file handles."""
+        if self._provider is not None:
+            if hasattr(self._provider, 'close'):
+                self._provider.close()
+            self._provider = None
+        logger.debug("DAS provider closed")
+
+    def closeEvent(self, event):
+        """Handle tab close event."""
+        self.cleanup_memory()
+        super().closeEvent(event)
+
+    def hideEvent(self, event):
+        """
+        Handle tab hide event (when switching to another tab).
+
+        Optionally clear canvas memory to reduce footprint while hidden.
+        """
+        # Only clear the canvas display, keep the data
+        if self._waterfall_canvas is not None:
+            self._waterfall_canvas.clear()
+
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        """Handle tab show event (when switching back to this tab)."""
+        # Restore waterfall display if data exists
+        if self._current_waterfall_data is not None and self._view_mode == 'waterfall':
+            self._update_waterfall_display()
+
+        super().showEvent(event)

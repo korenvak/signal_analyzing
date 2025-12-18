@@ -641,3 +641,11 @@ def get_waterfall_engine() -> WaterfallEngine:
     if _waterfall_engine is None:
         _waterfall_engine = WaterfallEngine()
     return _waterfall_engine
+
+
+def cleanup_waterfall_engine():
+    """Clean up waterfall engine resources (free GPU memory)."""
+    global _waterfall_engine
+    if _waterfall_engine is not None:
+        _waterfall_engine.clear_cache()
+        logger.debug("Waterfall engine cleaned up")

@@ -440,8 +440,14 @@ class MainWindow(QMainWindow):
                 self.setWindowTitle(f"Audio Visualizer - {Path(self.current_file).name}")
             else:
                 self.setWindowTitle("GPU-Accelerated Audio Visualizer")
+            # Show playlist sidebar for single channel mode
+            if hasattr(self, 'playlist_widget'):
+                self.playlist_widget.show()
         elif index == 1:  # DAS Multi-Channel
             self.setWindowTitle("DAS Multi-Channel Visualizer")
+            # Hide playlist sidebar for DAS mode (DAS has its own sidebar)
+            if hasattr(self, 'playlist_widget'):
+                self.playlist_widget.hide()
 
     def _on_das_status_message(self, message: str):
         """Handle status messages from DAS tab."""
