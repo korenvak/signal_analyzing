@@ -237,14 +237,13 @@ class AnnotationRenderer:
                 self.add_annotation(annotation, is_selected)
             else:
                 # Only selection state changed - update colors in-place
+                # Note: border_width cannot be changed after creation in VisPy
                 if is_selected:
                     rect.color = (1.0, 0.4, 0.0, 0.4)
                     rect.border_color = (1.0, 0.4, 0.0, 1.0)
-                    rect.border_width = 3.0
                 else:
                     rect.color = (1.0, 0.0, 0.0, 0.3)
                     rect.border_color = (1.0, 0.0, 0.0, 1.0)
-                    rect.border_width = 2.0
 
                 # Update visibility
                 rect.visible = annotation.is_visible
@@ -269,14 +268,13 @@ class AnnotationRenderer:
             rect = visuals.get('rect')
             if rect:
                 # Update colors in-place (more efficient than recreating)
+                # Note: border_width cannot be changed after creation in VisPy
                 if is_selected:
                     rect.color = (1.0, 0.4, 0.0, 0.4)    # Orange tint
                     rect.border_color = (1.0, 0.4, 0.0, 1.0)  # Orange border
-                    rect.border_width = 3.0
                 else:
                     rect.color = (1.0, 0.0, 0.0, 0.3)    # Red tint
                     rect.border_color = (1.0, 0.0, 0.0, 1.0)  # Red border
-                    rect.border_width = 2.0
     
     def clear_all(self):
         """Remove all annotation rectangles."""
