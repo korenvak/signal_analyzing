@@ -198,66 +198,85 @@ class AnnotationRenderer:
     
     def update_annotation(self, annotation: Annotation, is_selected: bool = False):
         """Update an existing annotation rectangle.
-        
+
         Args:
             annotation: The annotation with updated bounds
             is_selected: Whether this annotation is selected
         """
         if annotation.id not in self.annotations:
             self.add_annotation(annotation, is_selected)
+            return
+
+        visuals = self.annotations[annotation.id]
+        rect = visuals.get('rect')
+
+        if rect:
+            # Calculate new bounds
+            t_min = min(annotation.t_start, annotation.t_end)
+            t_max = max(annotation.t_start, annotation.t_end)
+            f_min = min(annotation.f_min, annotation.f_max)
+            f_max = max(annotation.f_min, annotation.f_max)
+
+            width = t_max - t_min
+            height = f_max - f_min
+            center_x = (t_min + t_max) / 2
+            center_y = (f_min + f_max) / 2
+
+            # Check if geometry changed
+            old_center = rect.center
+            geometry_changed = (
+                abs(old_center[0] - center_x) > 1e-6 or
+                abs(old_center[1] - center_y) > 1e-6 or
+                abs(rect.width - width) > 1e-6 or
+                abs(rect.height - height) > 1e-6
+            )
+
+            if geometry_changed:
+                # Geometry changed - need to recreate (VisPy limitation)
+                self.remove_annotation(annotation.id)
+                self.add_annotation(annotation, is_selected)
+            else:
+                # Only selection state changed - update colors in-place
+                if is_selected:
+                    rect.color = (1.0, 0.4, 0.0, 0.4)
+                    rect.border_color = (1.0, 0.4, 0.0, 1.0)
+                    rect.border_width = 3.0
+                else:
+                    rect.color = (1.0, 0.0, 0.0, 0.3)
+                    rect.border_color = (1.0, 0.0, 0.0, 1.0)
+                    rect.border_width = 2.0
+
+                # Update visibility
+                rect.visible = annotation.is_visible
+
+                # Update Doppler curve if needed
+                if annotation.points:
+                    self.update_doppler_curve(annotation)
         else:
-            # Remove old visuals
+            # No rect exists, create fresh
             self.remove_annotation(annotation.id)
-            # Add new visuals
             self.add_annotation(annotation, is_selected)
     
     def set_selected(self, annotation_id: Optional[int]):
         """Set which annotation is selected (highlighted).
-        
+
         Args:
             annotation_id: ID of annotation to select, or None to deselect all
         """
         for ann_id, visuals in self.annotations.items():
             is_selected = (ann_id == annotation_id)
-            
-            # We must recreate the visual because VisPy visuals are often frozen
-            # or don't support dynamic property updates reliably
-            old_rect = visuals.get('rect')
-            if old_rect:
-                # Capture current geometry
-                center = old_rect.center
-                width = old_rect.width
-                height = old_rect.height
-                parent = old_rect.parent
-                
-                # Remove old
-                old_rect.parent = None
-                
-                # Define new colors
+
+            rect = visuals.get('rect')
+            if rect:
+                # Update colors in-place (more efficient than recreating)
                 if is_selected:
-                    fill_color = (1.0, 0.4, 0.0, 0.4)    # Orange tint
-                    border_color = (1.0, 0.4, 0.0, 1.0)  # Orange border
-                    border_width = 3.0
+                    rect.color = (1.0, 0.4, 0.0, 0.4)    # Orange tint
+                    rect.border_color = (1.0, 0.4, 0.0, 1.0)  # Orange border
+                    rect.border_width = 3.0
                 else:
-                    fill_color = (1.0, 0.0, 0.0, 0.3)    # Red tint
-                    border_color = (1.0, 0.0, 0.0, 1.0)  # Red border
-                    border_width = 2.0
-                
-                # Create new visual
-                new_rect = scene.visuals.Rectangle(
-                    center=center,
-                    width=width,
-                    height=height,
-                    color=fill_color,
-                    border_color=border_color,
-                    border_width=border_width,
-                    parent=parent
-                )
-                new_rect.order = 100
-                new_rect.set_gl_state('translucent', depth_test=False)
-                
-                # Update storage
-                visuals['rect'] = new_rect
+                    rect.color = (1.0, 0.0, 0.0, 0.3)    # Red tint
+                    rect.border_color = (1.0, 0.0, 0.0, 1.0)  # Red border
+                    rect.border_width = 2.0
     
     def clear_all(self):
         """Remove all annotation rectangles."""

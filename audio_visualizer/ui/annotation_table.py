@@ -40,13 +40,27 @@ class AnnotationTableWidget(QTableWidget):
         self.setEditTriggers(QAbstractItemView.DoubleClicked | 
                             QAbstractItemView.SelectedClicked)
         
-        # Setup header
+        # Setup header - allow user resizing with sensible defaults
         header = self.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # ID
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)  # File
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)  # Label
-        header.setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)  # View
-        header.setSectionResizeMode(10, QHeaderView.ResizeMode.ResizeToContents)  # Curve
+        # Default to interactive (user can resize all columns)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
+
+        # Set initial column widths (pixels)
+        self.setColumnWidth(0, 40)   # ID
+        self.setColumnWidth(1, 100)  # File
+        self.setColumnWidth(2, 65)   # t_start
+        self.setColumnWidth(3, 65)   # t_end
+        self.setColumnWidth(4, 60)   # f_min
+        self.setColumnWidth(5, 60)   # f_max
+        self.setColumnWidth(6, 65)   # SNR
+        self.setColumnWidth(7, 75)   # Slope
+        self.setColumnWidth(8, 120)  # Label (stretches)
+        self.setColumnWidth(9, 45)   # View
+        self.setColumnWidth(10, 50)  # Curve
+
+        # Label column should stretch to fill available space
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         
         # Enable context menu
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)

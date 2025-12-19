@@ -416,7 +416,13 @@ class VisPyCanvas(scene.SceneCanvas):
         # Text readout
         self.text_visual = scene.visuals.Text('', color='white', font_size=11,
                                               pos=(10, 30), parent=self.view.scene)
-        
+
+        # Mode indicator (shows current mode in top-left corner)
+        self.mode_indicator = scene.visuals.Text('', color='white', font_size=12,
+                                                  bold=True, parent=self.view.scene)
+        self.mode_indicator.order = 250  # On top of everything
+        self._current_mode_name = None  # Track current mode for efficient updates
+
         # OpenGL limit
         self.max_texture_size = 16384
         
@@ -1258,7 +1264,47 @@ class VisPyCanvas(scene.SceneCanvas):
         self.text_visual.text = text
         if pos:
             self.text_visual.pos = pos
-    
+
+    def update_mode_indicator(self):
+        """Update the mode indicator overlay based on current mode state.
+
+        Shows the current mode (annotation, measurement, curve, event) in the
+        top-left corner with appropriate color coding.
+        """
+        # Determine current mode and color
+        mode_name = None
+        mode_color = 'white'
+
+        if self.curve_mode:
+            mode_name = "CURVE"
+            mode_color = (0, 1, 1, 1)  # Cyan
+        elif self.event_mode:
+            mode_name = "EVENT"
+            mode_color = (1, 0.5, 0, 1)  # Orange
+        elif self.annotation_mode:
+            mode_name = "ANNOTATION"
+            mode_color = (1, 0.3, 0.3, 1)  # Red
+        elif self.measurement_mode:
+            mode_name = "MEASURE"
+            mode_color = (1, 0.8, 0, 1)  # Yellow
+
+        # Only update if mode changed (for efficiency)
+        if mode_name == self._current_mode_name:
+            return
+
+        self._current_mode_name = mode_name
+
+        if mode_name:
+            self.mode_indicator.text = f"[ {mode_name} ]"
+            self.mode_indicator.color = mode_color
+            self.mode_indicator.pos = (10, 10)
+            self.mode_indicator.visible = True
+        else:
+            self.mode_indicator.text = ''
+            self.mode_indicator.visible = False
+
+        self.update()
+
     def set_interpolation(self, mode: str):
         """Set image interpolation mode."""
         vispy_mode_map = {'nearest': 'nearest', 'bilinear': 'linear', 'bicubic': 'cubic'}
@@ -1276,7 +1322,7 @@ class VisPyCanvas(scene.SceneCanvas):
         """Enable or disable curve drawing mode."""
         was_enabled = self.curve_mode
         self.curve_mode = enabled
-        
+
         if enabled and not was_enabled:
             # Entering curve mode - disable other modes
             self.annotation_mode = False
@@ -1287,8 +1333,9 @@ class VisPyCanvas(scene.SceneCanvas):
         elif not enabled and was_enabled:
             self.update_text_readout("", (10, 60))
             logger.info("Curve mode: OFF")
-            
-        # Update cursor or visual feedback if needed
+
+        # Update mode indicator and canvas
+        self.update_mode_indicator()
         self.update()
     
     def set_curve_callback(self, callback):
@@ -1421,6 +1468,8 @@ class VisPyCanvas(scene.SceneCanvas):
             self.update_text_readout("", (10, 60))
             logger.info("Event mode: OFF")
 
+        # Update mode indicator and canvas
+        self.update_mode_indicator()
         self.update()
 
     def set_event_created_callback(self, callback):
@@ -1577,11 +1626,14 @@ class VisPyCanvas(scene.SceneCanvas):
         if not self.measurement_mode:
             self.clear_measurement()
         logger.info(f"Measurement mode: {'ON' if self.measurement_mode else 'OFF'}")
-        
+
+        # Update mode indicator
+        self.update_mode_indicator()
+
         # Notify callback
         if self._measurement_mode_callback:
             self._measurement_mode_callback(self.measurement_mode)
-        
+
         return self.measurement_mode
     
     def clear_measurement(self):
@@ -1793,7 +1845,7 @@ class VisPyCanvas(scene.SceneCanvas):
     
     def set_annotation_mode(self, enabled: bool):
         """Enable or disable annotation drawing mode.
-        
+
         Args:
             enabled: True to enable annotation mode, False to disable
         """
@@ -1806,6 +1858,7 @@ class VisPyCanvas(scene.SceneCanvas):
             if self._annotation_renderer:
                 self._annotation_renderer.hide_temp_rectangle()
         logger.info(f"Annotation mode: {'ON' if enabled else 'OFF'}")
+        self.update_mode_indicator()
     
     def set_annotation_callbacks(self, on_created=None, on_clicked=None, on_context_menu=None):
         """Set callbacks for annotation events.

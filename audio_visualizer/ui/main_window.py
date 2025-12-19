@@ -319,8 +319,8 @@ class MainWindow(QMainWindow):
                 on_context_menu=self.on_annotation_context_menu
             )
             
-            single_channel_layout.addWidget(spec_container, 1)
-            
+            # Note: spec_container will be added to splitter later with annotation_table
+
             # Connect callbacks for status bar updates
             self.spectrogram_canvas.on_zoom_changed_callback = self.on_zoom_level_changed
             self.spectrogram_canvas.on_cursor_moved_callback = self.on_cursor_moved
@@ -349,21 +349,28 @@ class MainWindow(QMainWindow):
             # Connect ROI selection signal
             self.interaction_manager.roi_selected.connect(self.on_roi_selected_wrapper)
         
-        # Add annotation table below the spectrogram
+        # Add annotation table below the spectrogram with resizable splitter
         self.annotation_table = AnnotationTableWidget()
-        self.annotation_table.setMaximumHeight(250)
-        self.annotation_table.setMinimumHeight(150)
-        
+        self.annotation_table.setMinimumHeight(80)  # Minimum when collapsed
+
         # Connect annotation table signals
         self.annotation_table.annotation_selected.connect(self.on_table_annotation_selected)
         self.annotation_table.annotation_deleted.connect(self.on_table_annotation_deleted)
         self.annotation_table.annotation_updated.connect(self.on_table_annotation_updated)
         self.annotation_table.annotation_visibility_changed.connect(self.on_annotation_visibility_changed)
         self.annotation_table.doppler_visibility_changed.connect(self.on_doppler_visibility_changed)
-        
-        # Add table to single channel layout (below spectrogram)
+
+        # Create vertical splitter for spectrogram and annotation table
         if HAS_VISPY:
-            single_channel_layout.addWidget(self.annotation_table)
+            self.spec_table_splitter = QSplitter(Qt.Orientation.Vertical)
+            self.spec_table_splitter.addWidget(spec_container)
+            self.spec_table_splitter.addWidget(self.annotation_table)
+            # Set initial sizes (80% spectrogram, 20% table)
+            self.spec_table_splitter.setSizes([600, 150])
+            # Allow collapsing of annotation table
+            self.spec_table_splitter.setCollapsible(0, False)  # Spectrogram not collapsible
+            self.spec_table_splitter.setCollapsible(1, True)   # Table is collapsible
+            single_channel_layout.addWidget(self.spec_table_splitter)
         else:
             single_channel_layout.addWidget(QLabel("VisPy not available"))
 
@@ -1081,8 +1088,12 @@ class MainWindow(QMainWindow):
     def load_audio_file(self, file_path: str):
         """Load an audio file for analysis with optimized cleanup."""
         try:
+            # Show progress feedback for large file loading
+            self.status_widget.show_progress("Loading audio file")
+            self.status_widget.update_progress(5)
             self.statusBar().showMessage("Loading audio file...")
-            
+            QApplication.processEvents()  # Allow UI to update
+
             # PERFORMANCE: Aggressive cleanup before loading new file
             if hasattr(self, 'current_file') and self.current_file is not None:
                 logger.info(f"Switching from {os.path.basename(self.current_file)} to {os.path.basename(file_path)}")
@@ -1111,8 +1122,16 @@ class MainWindow(QMainWindow):
                     self.spectrogram_canvas.normalized_display_data = None
                     self.spectrogram_canvas.reset_zoom_history()
             
+            # Update progress: file cleanup done
+            self.status_widget.update_progress(20)
+            QApplication.processEvents()
+
             sample_rate, duration = self.audio_loader.load_file(file_path)
-            
+
+            # Update progress: file loaded
+            self.status_widget.update_progress(50)
+            QApplication.processEvents()
+
             self.current_file = file_path
             
             # Add file to project if project is loaded
@@ -1190,13 +1209,21 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'spectrogram_canvas'):
                 self.spectrogram_canvas.set_normalization_mode('std', std_scale=2.5)
 
+            # Update progress: preparing view
+            self.status_widget.update_progress(70)
+            QApplication.processEvents()
+
             # Restore event markers for this file if they exist
             self._restore_event_markers_for_file(file_path)
 
-            # Refresh current view
+            # Refresh current view (this computes spectrogram - has its own progress)
             self.refresh_current_view()
-            
+
+            # Hide progress bar when done
+            self.status_widget.hide_progress()
+
         except Exception as e:
+            self.status_widget.hide_progress()
             QMessageBox.critical(self, "Error", f"Failed to load audio file:\n{str(e)}")
             self.statusBar().showMessage("Ready")
     
