@@ -168,21 +168,17 @@ class MainWindow(QMainWindow):
         
         logger.info(f"Initialized {len(self.atlas_renderers)} atlas renderers")
 
-        logger.info("DEBUG: Starting state initialization...")
-
         # Multi-file state
         self.current_file = None  # Currently active file
         self.file_data = {}  # file_path -> {audio_data, sample_rate, duration, view_range}
         # Default view range (will be updated when file is loaded)
         self.current_view_range = ((0.0, 10.0), (0.0, 22050.0))  # (time, freq)
 
-        logger.info("DEBUG: Creating AnnotationManager...")
         # Annotation system
         self.annotation_manager = AnnotationManager()
         self.annotation_renderer = None  # Will be initialized after canvas creation
         self.selected_annotation_id = None
 
-        logger.info("DEBUG: Creating EventManager...")
         # Event tagging system (separate from annotations)
         self.event_manager = EventManager()
         self.event_panel = None  # Will be initialized in setup_ui
@@ -191,7 +187,6 @@ class MainWindow(QMainWindow):
         # Measurement panel (floating window)
         self.measurement_panel = None
 
-        logger.info("DEBUG: Creating FilterManager...")
         # Filter manager
         self.filter_manager = FilterManager()
 
@@ -210,7 +205,6 @@ class MainWindow(QMainWindow):
             'extent': None
         }
 
-        logger.info("DEBUG: Calling setup_ui...")
         # Setup UI
         self.setup_ui()
         self.setup_menu_bar()
@@ -229,28 +223,23 @@ class MainWindow(QMainWindow):
         
     def setup_ui(self):
         """Setup the main user interface with improved layout and containers."""
-        logger.info("DEBUG setup_ui: Creating central widget...")
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
-        logger.info("DEBUG setup_ui: Creating main layout...")
         # Main layout with NO padding to maximize canvas space
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        logger.info("DEBUG setup_ui: Setting up compact toolbar...")
         # Add compact toolbar at the top
         self.setup_compact_toolbar()
         main_layout.addWidget(self.toolbar)
 
-        logger.info("DEBUG setup_ui: Creating ControlsWidget...")
         # Minimal controls at the top (hidden by default, toggle with Ctrl+P)
         self.controls_widget = ControlsWidget()
         self.controls_widget.setVisible(False)  # Hidden by default
         main_layout.addWidget(self.controls_widget)
 
-        logger.info("DEBUG setup_ui: Creating viz container...")
         # Container for visualization - glassmorphic card style
         viz_container = QFrame()
         viz_container.setObjectName("viz_container")
@@ -259,21 +248,18 @@ class MainWindow(QMainWindow):
         viz_layout.setContentsMargins(0, 0, 0, 0)  # NO MARGINS!
         viz_layout.setSpacing(0)
 
-        logger.info("DEBUG setup_ui: Creating main splitter...")
         # Splitter for playlist and canvas
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         viz_layout.addWidget(self.main_splitter)
 
-        logger.info("DEBUG setup_ui: Creating PlaylistWidget...")
         # Simple playlist on the left (single panel, no tabs)
         self.playlist_widget = PlaylistWidget()
         self.playlist_widget.setMaximumWidth(220)
         self.playlist_widget.setMinimumWidth(180)
         self.connect_playlist_signals()
         self.main_splitter.addWidget(self.playlist_widget)
-        
+
         # Main tab widget for different visualization modes
-        logger.info("DEBUG setup_ui: Creating main tab widget...")
         self.main_tabs = QTabWidget()
         self.main_tabs.setDocumentMode(True)
         self.main_tabs.setTabPosition(QTabWidget.TabPosition.North)
@@ -303,7 +289,6 @@ class MainWindow(QMainWindow):
         self.main_splitter.setSizes([260, 1200])
 
         # ============ TAB 1: Single Channel Spectrogram ============
-        logger.info("DEBUG setup_ui: Creating Single Channel tab...")
         single_channel_tab = QWidget()
         single_channel_layout = QVBoxLayout(single_channel_tab)
         single_channel_layout.setContentsMargins(0, 0, 0, 0)
@@ -386,7 +371,6 @@ class MainWindow(QMainWindow):
         self.main_tabs.addTab(single_channel_tab, "Single Channel")
 
         # ============ TAB 2: DAS Multi-Channel ============
-        logger.info("DEBUG setup_ui: Creating DAS Multi-Channel tab...")
         try:
             DASTabClass = _get_das_tab_class()
             self.das_tab = DASTabClass(parent=self)
@@ -1113,6 +1097,19 @@ class MainWindow(QMainWindow):
                     tile_cache=self.tile_cache,
                     engines=self.engines
                 )
+
+                # Clear spectrogram cache explicitly
+                self.spectrogram_cache = {
+                    'time_range': None, 'freq_range': None,
+                    'fft_size': None, 'hop_length': None,
+                    'data': None, 'extent': None
+                }
+
+                # Clear canvas display data and zoom history
+                if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+                    self.spectrogram_canvas.raw_display_data = None
+                    self.spectrogram_canvas.normalized_display_data = None
+                    self.spectrogram_canvas.reset_zoom_history()
             
             sample_rate, duration = self.audio_loader.load_file(file_path)
             

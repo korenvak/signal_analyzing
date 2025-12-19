@@ -433,6 +433,11 @@ class VisPyCanvas(scene.SceneCanvas):
         self.normalization_mode = 'std'  # 'minmax' or 'std' - default to STD (adaptive to zoom)
         self.std_scale = 2.5  # Scale factor for STD normalization
 
+        # Zoom history for undo (Ctrl+Z or Backspace)
+        self.zoom_history = []  # Stack of (x, y, width, height) tuples
+        self.zoom_history_max = 20  # Maximum history size
+        self.zoom_forward_history = []  # For redo (Ctrl+Y)
+
         # Connect events
         self.view.events.mouse_wheel.connect(self.on_mouse_wheel)
         self.events.key_press.connect(self.on_key_press)
@@ -472,52 +477,120 @@ class VisPyCanvas(scene.SceneCanvas):
 
         self.zoom_with_center(scale_factors, event.pos)
     
+    def _save_zoom_state(self):
+        """Save current zoom state to history stack."""
+        rect = self.view.camera.rect
+        if rect is None:
+            return
+        state = (float(rect.left), float(rect.bottom), float(rect.width), float(rect.height))
+
+        # Don't save if it's identical to the last state
+        if self.zoom_history and self.zoom_history[-1] == state:
+            return
+
+        self.zoom_history.append(state)
+
+        # Limit history size
+        while len(self.zoom_history) > self.zoom_history_max:
+            self.zoom_history.pop(0)
+
+        # Clear forward history on new action
+        self.zoom_forward_history.clear()
+
+    def zoom_undo(self):
+        """Undo last zoom - go back to previous zoom state."""
+        if not self.zoom_history:
+            logger.debug("No zoom history to undo")
+            return False
+
+        # Save current state for redo
+        rect = self.view.camera.rect
+        if rect is not None:
+            current = (float(rect.left), float(rect.bottom), float(rect.width), float(rect.height))
+            self.zoom_forward_history.append(current)
+
+        # Restore previous state
+        x, y, w, h = self.zoom_history.pop()
+        self.view.camera.rect = (x, y, w, h)
+        self.update_dynamic_clim()
+        self.notify_zoom_changed()
+        logger.debug(f"Zoom undo: restored to ({x:.2f}, {y:.2f}, {w:.2f}, {h:.2f})")
+        return True
+
+    def zoom_redo(self):
+        """Redo zoom - go forward in zoom history."""
+        if not self.zoom_forward_history:
+            logger.debug("No zoom forward history to redo")
+            return False
+
+        # Save current state
+        rect = self.view.camera.rect
+        if rect is not None:
+            current = (float(rect.left), float(rect.bottom), float(rect.width), float(rect.height))
+            self.zoom_history.append(current)
+
+        # Restore forward state
+        x, y, w, h = self.zoom_forward_history.pop()
+        self.view.camera.rect = (x, y, w, h)
+        self.update_dynamic_clim()
+        self.notify_zoom_changed()
+        logger.debug(f"Zoom redo: restored to ({x:.2f}, {y:.2f}, {w:.2f}, {h:.2f})")
+        return True
+
+    def reset_zoom_history(self):
+        """Clear zoom history (e.g., when loading new file)."""
+        self.zoom_history.clear()
+        self.zoom_forward_history.clear()
+
     def zoom_with_center(self, scale_factors, mouse_pos):
         """Zoom with center-based scaling."""
         try:
             rect = self.view.camera.rect
             if rect is None:
                 return
-            
+
+            # Save current state before zooming
+            self._save_zoom_state()
+
             current_width = float(rect.width)
             current_height = float(rect.height)
             current_x = float(rect.left)
             current_y = float(rect.bottom)
-            
+
             if current_width <= 0 or current_height <= 0:
                 return
-            
+
             new_width = current_width / scale_factors[0]
             new_height = current_height / scale_factors[1]
-            
+
             # Apply boundary constraints
             if self.data_bounds:
                 time_min, time_max, freq_min, freq_max = self.data_bounds
-                
+
                 max_width = time_max - time_min
                 min_width = max_width / 100
                 new_width = max(min_width, min(new_width, max_width))
-                
+
                 max_height = freq_max - freq_min
                 min_height = max_height / 100
                 new_height = max(min_height, min(new_height, max_height))
-            
+
             # Zoom around center
             center_x = current_x + current_width / 2
             center_y = current_y + current_height / 2
             new_x = center_x - new_width / 2
             new_y = center_y - new_height / 2
-            
+
             # Constrain position
             if self.data_bounds:
                 time_min, time_max, freq_min, freq_max = self.data_bounds
-                
+
                 max_x = time_max - new_width
                 new_x = time_min if max_x < time_min else max(time_min, min(new_x, max_x))
-                
+
                 max_y = freq_max - new_height
                 new_y = freq_min if max_y < freq_min else max(freq_min, min(new_y, max_y))
-            
+
             if new_width > 0 and new_height > 0:
                 self.view.camera.rect = (new_x, new_y, new_width, new_height)
                 self.update_dynamic_clim()
@@ -600,7 +673,12 @@ class VisPyCanvas(scene.SceneCanvas):
                 # Optionally exit curve mode
                 self.set_curve_mode(False)
                 event.handled = True
-    
+        elif event.key == 'Backspace':
+            # Zoom undo - go back to previous zoom level
+            if self.zoom_undo():
+                event.handled = True
+        # Note: Ctrl+Z/Ctrl+Y handled by main window for consistency
+
     def on_mouse_press(self, event):
         """Handle mouse press for panning, measurement, or annotation."""
         # Handle Right Click (Context Menu)
