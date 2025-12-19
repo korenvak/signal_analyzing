@@ -807,14 +807,26 @@ class MainWindow(QMainWindow):
         filter_menu.addSeparator()
 
         # === Undo/Redo ===
+        # General undo action - handles annotations first, then filters
+        self.undo_action = QAction("Undo", self)
+        self.undo_action.setShortcut("Ctrl+Z")
+        self.undo_action.triggered.connect(self.undo_last_action)
+        filter_menu.addAction(self.undo_action)
+
+        self.redo_action = QAction("Redo", self)
+        self.redo_action.setShortcut("Ctrl+Y")
+        self.redo_action.triggered.connect(self.redo_last_action)
+        filter_menu.addAction(self.redo_action)
+
+        filter_menu.addSeparator()
+
+        # Keep filter-specific undo for menu (no shortcut)
         self.undo_filter_action = QAction("Undo Filter", self)
-        self.undo_filter_action.setShortcut("Ctrl+Z")
         self.undo_filter_action.triggered.connect(self.undo_filter)
         self.undo_filter_action.setEnabled(False)
         filter_menu.addAction(self.undo_filter_action)
 
         self.redo_filter_action = QAction("Redo Filter", self)
-        self.redo_filter_action.setShortcut("Ctrl+Y")
         self.redo_filter_action.triggered.connect(self.redo_filter)
         self.redo_filter_action.setEnabled(False)
         filter_menu.addAction(self.redo_filter_action)
@@ -1293,14 +1305,17 @@ class MainWindow(QMainWindow):
     
     def on_annotation_context_menu(self, time: float, freq: float):
         """Handle right-click context menu on annotations.
-        
+
         Args:
             time: Time coordinate
             freq: Frequency coordinate
         """
+        logger.info(f"Context menu requested at t={time:.3f}, f={freq:.0f}")
         annotation = self.annotation_manager.get_annotation_at_point(time, freq)
         if not annotation:
+            logger.info(f"No annotation found at point ({time:.3f}, {freq:.0f}), {len(self.annotation_manager.annotations)} annotations exist")
             return
+        logger.info(f"Found annotation {annotation.id} at point")
             
         # Select it first
         self.select_annotation(annotation.id)
@@ -3626,6 +3641,62 @@ class MainWindow(QMainWindow):
             self.spectrogram_canvas.update()
 
     # === Undo/Redo ===
+
+    def undo_last_action(self):
+        """Undo the last action (annotation or filter).
+
+        Priority: Annotations first, then filters.
+        """
+        # Try annotation undo first
+        if self.annotation_manager.can_undo():
+            result = self.annotation_manager.undo()
+            if result:
+                action_type, annotation = result
+                if action_type == 'remove':
+                    # Annotation was removed (undid an add)
+                    self.annotation_renderer.remove_annotation(annotation.id)
+                    self.annotation_table.remove_annotation(annotation.id)
+                    self.statusBar().showMessage(f"Undid: removed annotation {annotation.id}")
+                elif action_type == 'add':
+                    # Annotation was added back (undid a remove)
+                    self.annotation_renderer.add_annotation(annotation, is_selected=False)
+                    self.annotation_table.add_annotation(annotation)
+                    self.statusBar().showMessage(f"Undid: restored annotation {annotation.id}")
+                return
+
+        # Fall back to filter undo
+        if self.filter_manager.can_undo():
+            self.undo_filter()
+        else:
+            self.statusBar().showMessage("Nothing to undo")
+
+    def redo_last_action(self):
+        """Redo the last undone action (annotation or filter).
+
+        Priority: Annotations first, then filters.
+        """
+        # Try annotation redo first
+        if self.annotation_manager.can_redo():
+            result = self.annotation_manager.redo()
+            if result:
+                action_type, annotation = result
+                if action_type == 'add':
+                    # Annotation was added (redid an add)
+                    self.annotation_renderer.add_annotation(annotation, is_selected=False)
+                    self.annotation_table.add_annotation(annotation)
+                    self.statusBar().showMessage(f"Redid: restored annotation {annotation.id}")
+                elif action_type == 'remove':
+                    # Annotation was removed (redid a remove)
+                    self.annotation_renderer.remove_annotation(annotation.id)
+                    self.annotation_table.remove_annotation(annotation.id)
+                    self.statusBar().showMessage(f"Redid: removed annotation {annotation.id}")
+                return
+
+        # Fall back to filter redo
+        if self.filter_manager.can_redo():
+            self.redo_filter()
+        else:
+            self.statusBar().showMessage("Nothing to redo")
 
     def undo_filter(self):
         """Undo the last filter operation."""

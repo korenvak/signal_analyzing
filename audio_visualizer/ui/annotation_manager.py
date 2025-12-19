@@ -17,16 +17,22 @@ logger = logging.getLogger(__name__)
 
 class AnnotationManager:
     """Manages a collection of annotations for a single audio file."""
-    
+
     def __init__(self, file_path: Optional[str] = None):
         """Initialize annotation manager.
-        
+
         Args:
             file_path: Path to the audio file (used for loading/saving annotations)
         """
         self.file_path = file_path
         self.annotations: List[Annotation] = []
         self.next_id = 1
+
+        # Undo/Redo stacks: each entry is ('action', data)
+        # Actions: 'add' (data=annotation), 'remove' (data=annotation), 'modify' (data=(old, new))
+        self._undo_stack: List[Tuple[str, any]] = []
+        self._redo_stack: List[Tuple[str, any]] = []
+        self._max_undo = 50
     
     def add_annotation(self, annotation: Annotation) -> Annotation:
         """Add a new annotation.
@@ -51,7 +57,10 @@ class AnnotationManager:
         logger.info(f"Added annotation {annotation.id}: "
                    f"time=[{annotation.t_start:.3f}, {annotation.t_end:.3f}]s, "
                    f"freq=[{annotation.f_min:.1f}, {annotation.f_max:.1f}]Hz")
-        
+
+        # Push to undo stack (undo of 'add' is remove)
+        self._push_undo('add', annotation)
+
         return annotation
     
     def remove_annotation(self, annotation_id: int) -> bool:
@@ -67,6 +76,8 @@ class AnnotationManager:
             if ann.id == annotation_id:
                 removed = self.annotations.pop(i)
                 logger.info(f"Removed annotation {annotation_id}")
+                # Push to undo stack (undo of 'remove' is add back)
+                self._push_undo('remove', removed)
                 return True
         return False
     
@@ -104,8 +115,88 @@ class AnnotationManager:
         """Clear all annotations."""
         count = len(self.annotations)
         self.annotations.clear()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
         logger.info(f"Cleared {count} annotations")
-    
+
+    # ==================== Undo/Redo ====================
+
+    def _push_undo(self, action: str, data):
+        """Push an action to the undo stack."""
+        self._undo_stack.append((action, data))
+        # Limit stack size
+        while len(self._undo_stack) > self._max_undo:
+            self._undo_stack.pop(0)
+        # Clear redo stack on new action
+        self._redo_stack.clear()
+
+    def can_undo(self) -> bool:
+        """Check if undo is available."""
+        return len(self._undo_stack) > 0
+
+    def can_redo(self) -> bool:
+        """Check if redo is available."""
+        return len(self._redo_stack) > 0
+
+    def undo(self) -> Optional[Tuple[str, any]]:
+        """Undo the last annotation action.
+
+        Returns:
+            Tuple of (action_type, annotation) that was undone, or None if nothing to undo.
+            action_type is 'add' or 'remove' indicating what was UNDONE (reverse of original).
+        """
+        if not self._undo_stack:
+            logger.info("Nothing to undo")
+            return None
+
+        action, data = self._undo_stack.pop()
+
+        if action == 'add':
+            # Undo an add = remove the annotation
+            for i, ann in enumerate(self.annotations):
+                if ann.id == data.id:
+                    self.annotations.pop(i)
+                    self._redo_stack.append(('add', data))
+                    logger.info(f"Undid add: removed annotation {data.id}")
+                    return ('remove', data)
+        elif action == 'remove':
+            # Undo a remove = add the annotation back
+            self.annotations.append(data)
+            self._redo_stack.append(('remove', data))
+            logger.info(f"Undid remove: restored annotation {data.id}")
+            return ('add', data)
+
+        return None
+
+    def redo(self) -> Optional[Tuple[str, any]]:
+        """Redo the last undone annotation action.
+
+        Returns:
+            Tuple of (action_type, annotation) that was redone, or None if nothing to redo.
+        """
+        if not self._redo_stack:
+            logger.info("Nothing to redo")
+            return None
+
+        action, data = self._redo_stack.pop()
+
+        if action == 'add':
+            # Redo an add = add the annotation again
+            self.annotations.append(data)
+            self._undo_stack.append(('add', data))
+            logger.info(f"Redid add: restored annotation {data.id}")
+            return ('add', data)
+        elif action == 'remove':
+            # Redo a remove = remove the annotation again
+            for i, ann in enumerate(self.annotations):
+                if ann.id == data.id:
+                    self.annotations.pop(i)
+                    self._undo_stack.append(('remove', data))
+                    logger.info(f"Redid remove: removed annotation {data.id}")
+                    return ('remove', data)
+
+        return None
+
     def set_file_path(self, file_path: str):
         """Update the file path (called when loading a new audio file)."""
         self.file_path = file_path

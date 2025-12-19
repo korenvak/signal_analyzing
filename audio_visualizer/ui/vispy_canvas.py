@@ -693,18 +693,22 @@ class VisPyCanvas(scene.SceneCanvas):
                 world_pos = self._screen_to_world(event.pos)
                 if world_pos is not None:
                     time_pos, freq_pos = world_pos
-                    
+
                     # If in curve mode, right click clears the curve
                     if self.curve_mode:
                         self.clear_curve()
                         event.handled = True
                         return
 
-                    logger.debug(f"Right click at t={time_pos:.3f}, f={freq_pos:.0f}")
+                    logger.info(f"Right click at t={time_pos:.3f}, f={freq_pos:.0f}")
                     if self._on_annotation_context_menu_callback:
                         self._on_annotation_context_menu_callback(time_pos, freq_pos)
                         event.handled = True
                         return
+                    else:
+                        logger.warning("Right click: no context menu callback set")
+                else:
+                    logger.warning("Right click: could not convert screen to world coordinates")
             except Exception as e:
                 logger.warning(f"Error handling right click: {e}", exc_info=True)
         
