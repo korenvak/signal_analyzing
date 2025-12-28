@@ -645,16 +645,35 @@ class VisPyCanvas(scene.SceneCanvas):
             self.set_curve_mode(not self.curve_mode)
         elif event.key == 'Return' or event.key == 'Enter':
             # Finish curve drawing (save to selected annotation)
-            if self.curve_mode and len(self.curve_points) >= 4:
-                logger.info(f"Curve completed with {len(self.curve_points)} points")
+            print(f"DEBUG: Enter key pressed! curve_mode={self.curve_mode}, points={len(self.curve_points)}")
+            if self.curve_mode and len(self.curve_points) >= 2:
+                print(f"DEBUG: Entering save flow with {len(self.curve_points)} points")
+                # Show immediate feedback
+                self.update_text_readout(f"Processing {len(self.curve_points)} points, please wait...", (10, 60))
+
+                logger.info(f"Enter pressed: Curve completed with {len(self.curve_points)} points")
+                # Store points before callback (in case callback clears them)
+                points_copy = list(self.curve_points)
+                logger.info(f"Points copy created: {points_copy[:2]}... (showing first 2)")
+
                 # Call callback to save curve
                 if self._on_curve_completed_callback:
-                    self._on_curve_completed_callback(self.curve_points)
-                # Exit curve mode
+                    logger.info("Calling curve completed callback...")
+                    try:
+                        self._on_curve_completed_callback(points_copy)
+                        logger.info("Callback completed successfully")
+                    except Exception as e:
+                        logger.error(f"Error in curve completed callback: {e}", exc_info=True)
+                else:
+                    logger.warning("No curve completed callback set!")
+
+                # Exit curve mode and clear curve
                 self.set_curve_mode(False)
-                self.update_text_readout(f"Curve saved: {len(self.curve_points)} points", (10, 60))
+                self.clear_curve()
+                self.update_text_readout(f"Curve saved: {len(points_copy)} points", (10, 60))
             elif self.curve_mode:
-                logger.warning(f"Need at least 4 points (have {len(self.curve_points)})")
+                logger.warning(f"Need at least 2 points (have {len(self.curve_points)})")
+                self.update_text_readout(f"Need at least 2 points (have {len(self.curve_points)})", (10, 60))
         elif event.key in ('A', 'a'):
             # Toggle annotation mode
             self.set_annotation_mode(not self.annotation_mode)
@@ -696,7 +715,9 @@ class VisPyCanvas(scene.SceneCanvas):
 
                     # If in curve mode, right click clears the curve
                     if self.curve_mode:
+                        logger.info("Right-click: Clearing curve")
                         self.clear_curve()
+                        self.update_text_readout("CURVE MODE: Curve cleared | Click to add points (need 2 min) | Enter to finish", (10, 60))
                         event.handled = True
                         return
 
@@ -1040,7 +1061,9 @@ class VisPyCanvas(scene.SceneCanvas):
         
         self.raw_display_data = display_data
         self.display_extent = extent
-        self.current_clim = None
+        self.current_clim = None  # Reset clim to force re-normalization
+        self.local_mean_std = None  # Reset local stats for new data
+        self.normalized_display_data = None  # Clear normalized data
         
         if extent:
             time_start, time_end, freq_start, freq_end = extent
@@ -1064,8 +1087,10 @@ class VisPyCanvas(scene.SceneCanvas):
         if preserve_view and saved_camera_rect:
             self.view.camera.rect = saved_camera_rect
         
-        self.update_dynamic_clim()
-    
+        # Force immediate update instead of waiting for timer
+        self._update_dynamic_clim_now()
+        self.update()
+
     def schedule_normalization_update(self):
         """Schedule debounced normalization update."""
         self.normalization_pending = True
@@ -1184,7 +1209,10 @@ class VisPyCanvas(scene.SceneCanvas):
     def _apply_normalized_data(self, clim_min: float, clim_max: float):
         """Normalize and display data."""
         if self.raw_display_data is None:
+            logger.warning("_apply_normalized_data: No raw_display_data!")
             return
+
+        logger.info(f"Applying normalized data: clim=[{clim_min:.1f}, {clim_max:.1f}], shape={self.raw_display_data.shape}")
         
         if self.normalization_mode == 'std' and self.local_mean_std is not None:
             # STD-based normalization using local (visible region) mean/std
@@ -1218,11 +1246,13 @@ class VisPyCanvas(scene.SceneCanvas):
                 translate=(time_start, freq_start)
             )
         
+        logger.info(f"Setting image_visual data: shape={self.normalized_display_data.shape}")
         self.image_visual.set_data(self.normalized_display_data)
         self.image_visual.clim = (0.0, 1.0)
         if current_transform is not None:
             self.image_visual.transform = current_transform
-        
+
+        logger.info("Calling canvas update()")
         self.update()
     
     def set_normalization_mode(self, mode: str, std_scale: float = 2.5):
@@ -1332,8 +1362,8 @@ class VisPyCanvas(scene.SceneCanvas):
             self.annotation_mode = False
             self.measurement_mode = False
             # Show visual feedback
-            self.update_text_readout("CURVE MODE: Click to add points | Right-click to clear | ESC to exit", (10, 60))
-            logger.info("Curve mode: ON (Click to add points, Right-click to clear)")
+            self.update_text_readout("CURVE MODE: Click to add points (need 2 min) | Right-click to clear | Enter to finish", (10, 60))
+            logger.info("Curve mode: ON (Click to add points, Right-click to clear, Enter to finish)")
         elif not enabled and was_enabled:
             self.update_text_readout("", (10, 60))
             logger.info("Curve mode: OFF")
@@ -1356,7 +1386,12 @@ class VisPyCanvas(scene.SceneCanvas):
         
         # Update status text
         n_points = len(self.curve_points)
-        self.update_text_readout(f"CURVE MODE: {n_points} points | Click to add | Right-click to clear | Enter to finish", (10, 60))
+        min_points = 2
+        status = f"CURVE MODE: {n_points} points"
+        if n_points < min_points:
+            status += f" (need {min_points - n_points} more)"
+        status += " | Click to add | Right-click to clear | Enter to finish"
+        self.update_text_readout(status, (10, 60))
         
         if self._on_curve_updated_callback:
             self._on_curve_updated_callback(self.curve_points)
@@ -1376,47 +1411,63 @@ class VisPyCanvas(scene.SceneCanvas):
             self._on_curve_updated_callback([])
             
     def _update_curve_visuals(self):
-        """Update the VisPy visuals for the curve with cubic spline interpolation."""
+        """Update the VisPy visuals for the curve with monotone cubic interpolation (PCHIP)."""
         if not self.curve_points:
             self.curve_visual.visible = False
             self.curve_markers.visible = False
             self.update()
             return
-            
+
         points = np.array(self.curve_points)
         logger.info(f"Updating curve visuals with {len(points)} points")
-        
-        # If we have enough points, use cubic spline interpolation
-        if len(points) >= 4:
+
+        # If we have enough points, use monotone cubic interpolation (PCHIP)
+        if len(points) >= 2:
             try:
-                from scipy.interpolate import CubicSpline
-                
+                from scipy.interpolate import PchipInterpolator
+
                 # Sort by time
                 sorted_indices = np.argsort(points[:, 0])
                 sorted_points = points[sorted_indices]
-                
+
                 times = sorted_points[:, 0]
                 freqs = sorted_points[:, 1]
-                
-                # Create cubic spline
-                cs = CubicSpline(times, freqs)
-                
-                # Generate smooth curve
-                t_min, t_max = times[0], times[-1]
-                t_smooth = np.linspace(t_min, t_max, max(100, len(points) * 10))
-                f_smooth = cs(t_smooth)
-                
-                smooth_curve = np.column_stack((t_smooth, f_smooth))
-                
-                # Update Line with smooth curve - color set in set_data
-                self.curve_visual.set_data(pos=smooth_curve, color='yellow', width=2.5)
-                
+
+                # Check for duplicate times
+                if len(np.unique(times)) < len(times):
+                    logger.warning("Duplicate time values detected, removing duplicates")
+                    unique_indices = np.unique(times, return_index=True)[1]
+                    times = times[unique_indices]
+                    freqs = freqs[unique_indices]
+
+                if len(times) >= 2:
+                    # Create PCHIP interpolator (monotone cubic - no oscillations)
+                    interpolator = PchipInterpolator(times, freqs)
+
+                    # Generate smooth curve
+                    t_min, t_max = times[0], times[-1]
+                    t_smooth = np.linspace(t_min, t_max, max(100, len(points) * 10))
+                    f_smooth = interpolator(t_smooth)
+
+                    smooth_curve = np.column_stack((t_smooth, f_smooth))
+
+                    # Update Line with smooth curve - color set in set_data
+                    self.curve_visual.set_data(pos=smooth_curve, color='yellow', width=2.5)
+                    logger.debug(f"PCHIP interpolation: {len(points)} points -> {len(t_smooth)} smooth points")
+                else:
+                    # Fallback to linear
+                    self.curve_visual.set_data(pos=points, color='cyan', width=2.0)
+
+            except ImportError:
+                logger.debug("scipy.interpolate.PchipInterpolator not available, using linear")
+                # Fallback to linear
+                self.curve_visual.set_data(pos=points, color='cyan', width=2.0)
             except Exception as e:
-                logger.debug(f"Spline interpolation failed: {e}, using linear")
+                logger.debug(f"PCHIP interpolation failed: {e}, using linear")
                 # Fallback to linear
                 self.curve_visual.set_data(pos=points, color='cyan', width=2.0)
         else:
-            # Not enough points for spline, use linear
+            # Not enough points for interpolation, use linear
             self.curve_visual.set_data(pos=points, color='cyan', width=2.0)
             
         self.curve_visual.visible = True
@@ -1434,6 +1485,39 @@ class VisPyCanvas(scene.SceneCanvas):
         self.curve_markers.order = 300  # Very high order to ensure on top
         logger.info(f"Curve markers set to visible with {len(points)} points at order 300")
         self.update()
+
+    # ==================== Preview Curves (for DSP detection) ====================
+
+    def draw_preview_curve(self, points: np.ndarray, color: str = 'yellow'):
+        """Draw a preview curve on the spectrogram.
+
+        Args:
+            points: Nx2 array of (time, freq) points
+            color: Color for the curve
+        """
+        if not hasattr(self, '_preview_curves'):
+            self._preview_curves = []
+
+        if len(points) < 2:
+            return
+
+        # Create a new line visual for preview
+        preview_line = scene.visuals.Line(parent=self.view.scene, method='gl')
+        preview_line.set_data(pos=points, color=color, width=3.0)
+        preview_line.visible = True
+        preview_line.order = 160  # Above annotations
+        preview_line.set_gl_state('translucent', depth_test=False)
+
+        self._preview_curves.append(preview_line)
+        self.update()
+
+    def clear_preview_curves(self):
+        """Clear all preview curves from the spectrogram."""
+        if hasattr(self, '_preview_curves'):
+            for curve in self._preview_curves:
+                curve.parent = None  # Remove from scene
+            self._preview_curves = []
+            self.update()
 
     # ==================== Event Tagging Mode (Vertical Lines) ====================
 

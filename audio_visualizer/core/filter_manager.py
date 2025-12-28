@@ -627,19 +627,22 @@ class FilterManager:
                    gain: float = 0.98,
                    power: float = 0.5,
                    bias: float = 2.0,
-                   eps: float = 1e-6) -> Tuple[np.ndarray, str]:
+                   eps: float = 1e-6,
+                   normalize_output: bool = True) -> Tuple[np.ndarray, str]:
         """Apply Per-Channel Energy Normalization (PCEN).
 
         PCEN is excellent for removing slowly varying interference and
-        enhancing transient signals.
+        enhancing transient signals. This implementation handles edge
+        effects properly for clean visualization.
 
         Args:
             data: Input spectrogram (freq x time)
-            time_constant: Smoothing time constant
-            gain: AGC strength
-            power: Compression exponent
+            time_constant: Smoothing time constant (lower = faster response)
+            gain: AGC strength (0-1, higher = more normalization)
+            power: Compression exponent (0-1, lower = more compression)
             bias: Bias before compression
             eps: Small constant for numerical stability
+            normalize_output: If True, scale output to match input range for proper visualization
 
         Returns:
             (filtered_data, log_message)
@@ -650,26 +653,52 @@ class FilterManager:
 
         data_cpu = _ensure_cpu(data)
 
+        # Store original range for normalization
+        orig_min = np.min(data_cpu)
+        orig_max = np.max(data_cpu)
+        orig_range = orig_max - orig_min
+
         # Ensure positive values
         data_pos = np.maximum(data_cpu, eps)
 
-        # IIR smoothing along time axis (axis=1)
-        # M[n] = (1-s) * M[n-1] + s * E[n]
-        # where s = time_constant
-        smooth = np.zeros_like(data_pos)
-        smooth[:, 0] = data_pos[:, 0]
+        # Use forward-backward filtering to avoid edge artifacts (shadows)
+        # This gives zero-phase filtering without edge distortion
 
+        # Forward pass
         s = time_constant
+        smooth_fwd = np.zeros_like(data_pos)
+        # Initialize with mean of first few frames to reduce edge transient
+        init_frames = min(10, data_pos.shape[1])
+        smooth_fwd[:, 0] = np.mean(data_pos[:, :init_frames], axis=1)
+
         for t in range(1, data_pos.shape[1]):
-            smooth[:, t] = (1 - s) * smooth[:, t-1] + s * data_pos[:, t]
+            smooth_fwd[:, t] = (1 - s) * smooth_fwd[:, t-1] + s * data_pos[:, t]
+
+        # Backward pass (to eliminate "shadow" artifacts from edges)
+        smooth_bwd = np.zeros_like(data_pos)
+        smooth_bwd[:, -1] = np.mean(data_pos[:, -init_frames:], axis=1)
+
+        for t in range(data_pos.shape[1] - 2, -1, -1):
+            smooth_bwd[:, t] = (1 - s) * smooth_bwd[:, t+1] + s * data_pos[:, t]
+
+        # Combine forward and backward (average)
+        smooth = (smooth_fwd + smooth_bwd) / 2
 
         # PCEN formula: (E / (eps + M)^gain + bias)^power - bias^power
-        # Simplified version often used:
-        # output = (E / (eps + smooth)**gain) ** power
         normalized = (data_pos / (eps + smooth) ** gain + bias) ** power - bias ** power
 
         # Ensure non-negative
         result = np.maximum(normalized, 0)
+
+        # Normalize output to match original data range for proper visualization
+        if normalize_output and orig_range > 0:
+            result_min = np.min(result)
+            result_max = np.max(result)
+            result_range = result_max - result_min
+
+            if result_range > 0:
+                # Scale to original range
+                result = (result - result_min) / result_range * orig_range + orig_min
 
         dt = time.time() - start_time
         return result, f"PCEN (tc={time_constant:.3f}, gain={gain:.2f}, power={power:.2f}) in {dt:.3f}s"

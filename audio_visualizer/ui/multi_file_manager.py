@@ -216,8 +216,12 @@ class PlaylistWidget(QWidget):
     def on_file_selected(self, item: QListWidgetItem):
         """Handle file selection."""
         file_path = item.data(Qt.ItemDataRole.UserRole)
+        logger.info(f"PlaylistWidget: Item clicked, file_path={file_path}")
         if file_path:
+            logger.info(f"PlaylistWidget: Emitting file_selected signal for {file_path}")
             self.file_selected.emit(file_path)
+        else:
+            logger.warning("PlaylistWidget: No file_path data in clicked item")
     
     def show_context_menu(self, position):
         """Show context menu for file operations."""

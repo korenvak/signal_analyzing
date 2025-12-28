@@ -13,7 +13,8 @@ from .qt_compat import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QWidget, QToolBar, QLabel, QPushButton, QFileDialog,
     QMessageBox, QSplitter, QFrame, QSizePolicy, QDialog,
-    Qt, QTimer, QAction, QKeySequence, QMenu, QCursor, QTabWidget
+    Qt, QTimer, QAction, QKeySequence, QMenu, QCursor, QTabWidget,
+    QInputDialog
 )
 
 try:
@@ -56,6 +57,8 @@ from .event_manager import EventManager
 from .event_panel import EventPanel
 from .event_dialog import EventInputDialog, EventEditDialog
 from .event_data import TaggedEvent
+from .track_manager import TrackManager
+from .track_data import PaintedTrack
 from ..core.filter_manager import FilterManager
 from ..core.filename_parser import parse_pixel_filename
 from .filter_dialog import (
@@ -78,6 +81,7 @@ from ..core.cutout_analyzer import (
     save_cutout_numpy,
     write_cutout_metadata
 )
+from ..core.gpu_dsp_engine import get_dsp_engine, DetectedCurve, SNRResult, HarmonicResult
 
 # DAS Multi-channel tab (lazy import to avoid circular deps)
 DASTab = None
@@ -183,6 +187,9 @@ class MainWindow(QMainWindow):
         self.event_manager = EventManager()
         self.event_panel = None  # Will be initialized in setup_ui
         self._file_event_markers = {}  # Per-file storage: {file_path: (t1, t2)}
+
+        # Track painting system (for frequency tracks over spectrograms)
+        self.track_manager = TrackManager()
 
         # Measurement panel (floating window)
         self.measurement_panel = None
@@ -616,12 +623,47 @@ class MainWindow(QMainWindow):
 
         # Analysis menu
         analysis_menu = menubar.addMenu("Analysis")
-        
+
         refresh_action = QAction("Refresh Current View", self)
         refresh_action.setShortcut("F5")
         refresh_action.triggered.connect(self.refresh_current_view)
         analysis_menu.addAction(refresh_action)
-        
+
+        analysis_menu.addSeparator()
+
+        # === DSP Analysis Submenu ===
+        dsp_menu = analysis_menu.addMenu("DSP Analysis")
+
+        # Auto-detect tracks in visible area
+        detect_tracks_action = QAction("Detect Curved Tracks in View...", self)
+        detect_tracks_action.setShortcut("Ctrl+Shift+D")
+        detect_tracks_action.triggered.connect(self.detect_tracks_in_view)
+        dsp_menu.addAction(detect_tracks_action)
+
+        dsp_menu.addSeparator()
+
+        # SNR for selected annotation
+        snr_action = QAction("Estimate SNR (Selected Annotation)", self)
+        snr_action.triggered.connect(self.estimate_selected_annotation_snr)
+        dsp_menu.addAction(snr_action)
+
+        # Harmonics for selected annotation
+        harmonics_action = QAction("Detect Harmonics (Selected Annotation)", self)
+        harmonics_action.triggered.connect(self.detect_harmonics_selected_annotation)
+        dsp_menu.addAction(harmonics_action)
+
+        # Detect track for selected annotation
+        detect_curve_action = QAction("Detect Curved Track (Selected Annotation)", self)
+        detect_curve_action.triggered.connect(self.detect_curved_track_selected_annotation)
+        dsp_menu.addAction(detect_curve_action)
+
+        dsp_menu.addSeparator()
+
+        # Suppress track
+        suppress_action = QAction("Suppress Track (Selected Annotation)", self)
+        suppress_action.triggered.connect(self.suppress_selected_annotation_track)
+        dsp_menu.addAction(suppress_action)
+
         # Annotation menu
         annotation_menu = menubar.addMenu("Annotations")
         
@@ -891,7 +933,14 @@ class MainWindow(QMainWindow):
         measure_action.setCheckable(True)
         measure_action.triggered.connect(lambda checked: self.spectrogram_canvas.toggle_measurement_mode())
         self.toolbar.addAction(measure_action)
-        
+
+        self.toolbar.addSeparator()
+
+        # DSP Analysis button with dropdown menu
+        dsp_action = QAction("🔬 DSP", self)
+        dsp_action.triggered.connect(self.show_dsp_menu)
+        self.toolbar.addAction(dsp_action)
+
         # Spacer to push info to the right
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -1010,7 +1059,56 @@ class MainWindow(QMainWindow):
             action.triggered.connect(lambda checked, c=cmap: self.set_colormap(c))
         
         menu.exec(QCursor.pos())
-        
+
+    def show_dsp_menu(self):
+        """Show DSP analysis menu from toolbar."""
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: rgba(30, 30, 40, 0.95);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu::item {
+                color: #B0B0B0;
+                padding: 6px 20px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background: rgba(100, 100, 255, 0.3);
+                color: white;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: rgba(255, 255, 255, 0.1);
+                margin: 4px 10px;
+            }
+        """)
+
+        # Detect tracks in view (most commonly used)
+        detect_view_action = menu.addAction("🔍 Detect Tracks in View...")
+        detect_view_action.triggered.connect(self.detect_tracks_in_view)
+
+        menu.addSeparator()
+
+        # Analysis for selected annotation
+        snr_action = menu.addAction("📊 Estimate SNR (Selected)")
+        snr_action.triggered.connect(self.estimate_selected_annotation_snr)
+
+        harmonics_action = menu.addAction("🎵 Detect Harmonics (Selected)")
+        harmonics_action.triggered.connect(self.detect_harmonics_selected_annotation)
+
+        detect_track_action = menu.addAction("📈 Detect Track (Selected)")
+        detect_track_action.triggered.connect(self.detect_curved_track_selected_annotation)
+
+        menu.addSeparator()
+
+        suppress_action = menu.addAction("🚫 Suppress Track (Selected)")
+        suppress_action.triggered.connect(self.suppress_selected_annotation_track)
+
+        menu.exec(QCursor.pos())
+
     def show_view_menu(self):
         """Show view options menu."""
         menu = QMenu(self)
@@ -1196,6 +1294,12 @@ class MainWindow(QMainWindow):
             
             # Update playlist widget with file info
             if hasattr(self, 'playlist_widget'):
+                # First, mark the previously loaded file as not loaded
+                for path in self.playlist_widget.get_file_paths():
+                    if path != file_path:
+                        self.playlist_widget.update_file_info(path, is_loaded=False)
+
+                # Add and mark the new file as loaded
                 self.playlist_widget.add_file_path(file_path)
                 self.playlist_widget.update_file_info(
                     file_path, duration=duration, sample_rate=sample_rate, is_loaded=True
@@ -1350,9 +1454,33 @@ class MainWindow(QMainWindow):
 
             redraw_action = menu.addAction("Redraw Curve")
             redraw_action.triggered.connect(lambda: self.start_curve_for_annotation(annotation))
-        
+
         menu.addSeparator()
-        
+
+        # === Advanced DSP Analysis ===
+        dsp_menu = menu.addMenu("Advanced Analysis")
+
+        # SNR Estimation
+        snr_action = dsp_menu.addAction("Estimate SNR")
+        snr_action.triggered.connect(lambda: self.estimate_annotation_snr(annotation))
+
+        # Harmonic Detection
+        harmonic_action = dsp_menu.addAction("Detect Harmonics")
+        harmonic_action.triggered.connect(lambda: self.detect_harmonics_in_annotation(annotation))
+
+        # Curved Track Detection
+        curve_detect_action = dsp_menu.addAction("Detect Curved Tracks")
+        curve_detect_action.triggered.connect(lambda: self.detect_curved_tracks_in_annotation(annotation))
+
+        dsp_menu.addSeparator()
+
+        # Track Suppression (if has curve)
+        if annotation.points and len(annotation.points) >= 4:
+            suppress_action = dsp_menu.addAction("Suppress Track from Spectrogram")
+            suppress_action.triggered.connect(lambda: self.suppress_annotation_track(annotation))
+
+        menu.addSeparator()
+
         # Delete
         delete_action = menu.addAction("Delete Annotation")
         delete_action.triggered.connect(lambda: self.on_table_annotation_deleted(annotation.id))
@@ -2215,11 +2343,36 @@ class MainWindow(QMainWindow):
         
     def on_curve_completed(self, points: list):
         """Handle curve completion - save to selected annotation and calculate Doppler."""
-        if not points or len(points) < 4:
-            self.statusBar().showMessage("Need at least 4 points for Doppler analysis")
+        logger.info(f"on_curve_completed called with {len(points) if points else 0} points")
+
+        if not points or len(points) < 2:
+            logger.warning(f"Not enough points: {len(points) if points else 0}")
+            self.statusBar().showMessage("Need at least 2 points for track")
             return
-            
-        # If there's a selected annotation, save the curve to it
+
+        logger.info("Showing save track dialog...")
+        # Ask user if they want to save as a track
+        try:
+            reply = QMessageBox.question(
+                self,
+                "Save Track",
+                f"You've painted a track with {len(points)} points.\n\n"
+                "Do you want to save this track with interpolated data?\n\n"
+                "This will create:\n"
+                "- CSV file with track summary\n"
+                "- CSV file with detailed time/frequency/amplitude data\n"
+                "- PNG image with track overlay on spectrogram",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            logger.info(f"User replied: {'Yes' if reply == QMessageBox.StandardButton.Yes else 'No'}")
+
+            if reply == QMessageBox.StandardButton.Yes:
+                self.save_painted_track(points)
+        except Exception as e:
+            logger.error(f"Error showing dialog: {e}", exc_info=True)
+
+        # If there's a selected annotation, also save the curve to it for Doppler analysis
         ann_id = self.annotation_table.get_selected_annotation_id()
         if ann_id:
             annotation = self.annotation_manager.get_annotation(ann_id)
@@ -2228,15 +2381,13 @@ class MainWindow(QMainWindow):
                 annotation.points = points
                 logger.info(f"Saved {len(points)} curve points to annotation {ann_id}")
 
-                # Automatically calculate Doppler
-                self.calculate_doppler_for_annotation(annotation)
+                # Automatically calculate Doppler if enough points
+                if len(points) >= 4:
+                    self.calculate_doppler_for_annotation(annotation)
+                    self.statusBar().showMessage(f"Doppler analysis complete for annotation #{ann_id}")
 
                 # Save to file (uses project manager if loaded)
                 self.save_annotations(silent=True)
-
-                self.statusBar().showMessage(f"Doppler analysis complete for annotation #{ann_id}")
-        else:
-            self.statusBar().showMessage("No annotation selected - curve not saved")
         
     def on_measurement_mode_changed(self, is_on: bool):
         """Handle measurement mode toggle - update status bar."""
@@ -4604,8 +4755,13 @@ class MainWindow(QMainWindow):
     
     def on_file_selected_from_playlist(self, file_path: str):
         """Handle file selection from playlist."""
+        logger.info(f"Playlist file selected: {file_path}")
+        logger.info(f"Current file: {self.current_file}")
         if file_path != self.current_file:
+            logger.info(f"Loading new file from playlist: {file_path}")
             self.load_audio_file(file_path)
+        else:
+            logger.info(f"File already loaded, skipping: {file_path}")
     
     def on_files_dropped(self, file_paths: list):
         """Handle files dropped onto playlist."""
@@ -4856,6 +5012,97 @@ class MainWindow(QMainWindow):
                 self.event_panel.update_event(updated_event)
             self.statusBar().showMessage(f"Event {event_id} updated")
 
+    def save_painted_track(self, points: list):
+        """Save a painted frequency track with interpolation and metadata.
+
+        Args:
+            points: List of (time, frequency) tuples from user clicks
+        """
+        if not self.current_file:
+            QMessageBox.warning(self, "Save Track", "No audio file loaded.")
+            return
+
+        # Check if track session is active, if not create one
+        if not self.track_manager.session_active:
+            # Create session directory next to audio file
+            audio_path = Path(self.current_file)
+            session_dir = audio_path.parent / f"{audio_path.stem}_tracks"
+
+            success = self.track_manager.create_new_session(session_dir)
+            if not success:
+                QMessageBox.critical(self, "Save Track", "Failed to create track session.")
+                return
+
+            logger.info(f"Created new track session at {session_dir}")
+
+        # Get spectrogram data
+        try:
+            # Get current spectrogram data from cache/canvas
+            S, freqs, times = self._get_spectrogram_axes()
+
+            if S is None or times is None or freqs is None:
+                QMessageBox.warning(self, "Save Track", "No spectrogram data available.")
+                return
+
+            # Ask for track label
+            track_label, ok = QInputDialog.getText(
+                self,
+                "Track Label",
+                "Enter a label for this track (optional):",
+                text=""
+            )
+            if not ok:
+                return  # User cancelled
+
+            # Create track with interpolation and amplitude sampling
+            track = self.track_manager.create_track(
+                control_points=points,
+                audio_file=self.current_file,
+                S=S,
+                times_axis=times,
+                freqs_axis=freqs,
+                num_interp_samples=200,  # Generate 200 interpolated points
+                track_label=track_label,
+                notes=""
+            )
+
+            if track is None:
+                QMessageBox.critical(self, "Save Track", "Failed to create track.")
+                return
+
+            # Save track with all exports
+            success = self.track_manager.save_track(
+                track=track,
+                S=S,
+                times=times,
+                freqs=freqs,
+                export_image=True,
+                export_detailed_csv=True
+            )
+
+            if success:
+                QMessageBox.information(
+                    self,
+                    "Track Saved",
+                    f"Track #{track.id} saved successfully!\n\n"
+                    f"Control points: {track.n_control_points}\n"
+                    f"Interpolated points: {track.n_interpolated_points}\n"
+                    f"Duration: {track.duration:.3f} s\n"
+                    f"Frequency range: {track.f_min:.1f} - {track.f_max:.1f} Hz\n\n"
+                    f"Files created:\n"
+                    f"- Summary CSV: {self.track_manager.csv_path}\n"
+                    f"- Detailed CSV: {self.track_manager.data_dir}\n"
+                    f"- PNG image: {track.image_path}"
+                )
+                logger.info(f"Track {track.id} saved: {track.n_control_points} control points, "
+                           f"{track.n_interpolated_points} interpolated points")
+            else:
+                QMessageBox.warning(self, "Save Track", "Track saved with some errors. Check logs.")
+
+        except Exception as e:
+            logger.error(f"Failed to save track: {e}")
+            QMessageBox.critical(self, "Save Track", f"Error saving track: {e}")
+
     def on_goto_event(self, t_center: float, f_center: float):
         """Navigate the spectrogram view to center on an event.
 
@@ -4932,6 +5179,643 @@ class MainWindow(QMainWindow):
                     canvas.event_line_2.visible = False
 
             logger.debug(f"Restored event markers for {os.path.basename(file_path)}: t1={t1}, t2={t2}")
+
+    # ========== Advanced DSP Analysis Methods ==========
+
+    def _get_selected_annotation_or_warn(self) -> Optional[Annotation]:
+        """Get the currently selected annotation, or show a warning if none selected."""
+        ann_id = self.selected_annotation_id
+        if ann_id is None:
+            # Try from table
+            ann_id = self.annotation_table.get_selected_annotation_id()
+
+        if ann_id is None:
+            QMessageBox.warning(
+                self, "No Selection",
+                "Please select an annotation first.\n\n"
+                "You can:\n"
+                "1. Click on an annotation in the spectrogram\n"
+                "2. Select one from the annotation table\n"
+                "3. Create a new annotation (press 'A' to enter annotation mode)"
+            )
+            return None
+
+        annotation = self.annotation_manager.get_annotation(ann_id)
+        if annotation is None:
+            QMessageBox.warning(self, "Error", f"Annotation #{ann_id} not found.")
+            return None
+
+        return annotation
+
+    def estimate_selected_annotation_snr(self):
+        """Estimate SNR for the currently selected annotation."""
+        annotation = self._get_selected_annotation_or_warn()
+        if annotation:
+            self.estimate_annotation_snr(annotation)
+
+    def detect_harmonics_selected_annotation(self):
+        """Detect harmonics in the currently selected annotation."""
+        annotation = self._get_selected_annotation_or_warn()
+        if annotation:
+            self.detect_harmonics_in_annotation(annotation)
+
+    def detect_curved_track_selected_annotation(self):
+        """Detect curved track in the currently selected annotation."""
+        annotation = self._get_selected_annotation_or_warn()
+        if annotation:
+            self.detect_curved_tracks_in_annotation(annotation)
+
+    def suppress_selected_annotation_track(self):
+        """Suppress track from the currently selected annotation."""
+        annotation = self._get_selected_annotation_or_warn()
+        if annotation:
+            self.suppress_annotation_track(annotation)
+
+    def detect_tracks_in_view(self):
+        """Detect curved tracks in the visible spectrogram area.
+
+        This scans the entire visible region for tracks and allows
+        the user to create annotations from detected tracks.
+        """
+        full_data, freqs, times = self._get_spectrogram_axes()
+
+        if full_data is None:
+            QMessageBox.warning(self, "No Data", "No spectrogram data available.")
+            return
+
+        try:
+            # Get visible region from canvas
+            if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+                rect = self.spectrogram_canvas.view.camera.rect
+                t_min_view, f_min_view = rect.left, rect.bottom
+                t_max_view, f_max_view = rect.right, rect.top
+            else:
+                # Use full range
+                t_min_view, t_max_view = times[0], times[-1]
+                f_min_view, f_max_view = freqs[0], freqs[-1]
+
+            # Clamp to data bounds
+            t_min_view = max(t_min_view, times[0])
+            t_max_view = min(t_max_view, times[-1])
+            f_min_view = max(f_min_view, freqs[0])
+            f_max_view = min(f_max_view, freqs[-1])
+
+            # Find indices for visible region
+            t_start_idx = np.searchsorted(times, t_min_view)
+            t_end_idx = np.searchsorted(times, t_max_view)
+            f_min_idx = np.searchsorted(freqs, f_min_view)
+            f_max_idx = np.searchsorted(freqs, f_max_view)
+
+            # Ensure valid bounds
+            t_start_idx = max(0, t_start_idx)
+            t_end_idx = min(full_data.shape[1], t_end_idx)
+            f_min_idx = max(0, f_min_idx)
+            f_max_idx = min(full_data.shape[0], f_max_idx)
+
+            # Extract visible region
+            region = full_data[f_min_idx:f_max_idx, t_start_idx:t_end_idx]
+            region_times = times[t_start_idx:t_end_idx]
+            region_freqs = freqs[f_min_idx:f_max_idx]
+
+            if region.size == 0 or region.shape[0] < 10 or region.shape[1] < 10:
+                QMessageBox.warning(self, "Region Too Small",
+                    "The visible region is too small for track detection.\n"
+                    "Please zoom out or pan to show more of the spectrogram.")
+                return
+
+            self.statusBar().showMessage("Detecting curved tracks in view...")
+            QApplication.processEvents()
+
+            # Get DSP engine
+            dsp_engine = get_dsp_engine()
+
+            # Detect tracks using SIMPLE peak-following algorithm
+            # This follows actual intensity maxima at each time column
+            # Much more reliable than DP for steep Doppler curves!
+            curves = dsp_engine.detect_tracks_simple(
+                region, region_times, region_freqs,
+                num_tracks=3,
+                min_length=max(10, region.shape[1] // 10)
+            )
+
+            if not curves:
+                QMessageBox.information(
+                    self, "No Tracks Found",
+                    "No curved tracks were detected in the visible area.\n\n"
+                    "Tips:\n"
+                    "- Try zooming into a region with a visible signal\n"
+                    "- Adjust the contrast/normalization\n"
+                    "- The signal may be too weak or noisy"
+                )
+                self.statusBar().showMessage("No tracks detected")
+                return
+
+            # Show results dialog
+            self._show_detected_tracks_dialog(curves, region_times, region_freqs)
+
+        except Exception as e:
+            logger.error(f"Error detecting tracks in view: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Track detection failed: {e}")
+
+    def _show_detected_tracks_dialog(self, curves: list, times: np.ndarray, freqs: np.ndarray):
+        """Show dialog with detected tracks and option to create annotations.
+
+        Args:
+            curves: List of DetectedCurve objects
+            times: Time axis for the region
+            freqs: Frequency axis for the region
+        """
+        from .qt_compat import QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QDialogButtonBox
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Detected Tracks ({len(curves)} found)")
+        dialog.setMinimumSize(500, 400)
+
+        layout = QVBoxLayout(dialog)
+
+        # Info label
+        info_label = QLabel(
+            f"Found {len(curves)} curved track(s) in the visible area.\n"
+            "Select tracks to create annotations from them."
+        )
+        layout.addWidget(info_label)
+
+        # List of detected tracks
+        track_list = QListWidget()
+        track_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+
+        for i, curve in enumerate(curves):
+            item_text = (
+                f"Track {i+1}: {curve.fit_type.capitalize()} | "
+                f"Duration: {curve.duration:.2f}s | "
+                f"Freq: {curve.freq_range[0]:.0f}-{curve.freq_range[1]:.0f} Hz | "
+                f"SNR: {curve.snr_db:.1f} dB | "
+                f"Score: {curve.score:.2f}"
+            )
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, i)  # Store index
+            track_list.addItem(item)
+
+        # Select all by default
+        track_list.selectAll()
+        layout.addWidget(track_list)
+
+        # Buttons
+        button_box = QDialogButtonBox()
+        create_btn = button_box.addButton("Create Annotations", QDialogButtonBox.ButtonRole.AcceptRole)
+        preview_btn = button_box.addButton("Preview", QDialogButtonBox.ButtonRole.ActionRole)
+        cancel_btn = button_box.addButton(QDialogButtonBox.StandardButton.Cancel)
+
+        layout.addWidget(button_box)
+
+        # Store curves for access in handlers
+        dialog.curves = curves
+        dialog.track_list = track_list
+
+        def preview_tracks():
+            """Show preview of detected tracks on spectrogram."""
+            selected_indices = [
+                item.data(Qt.ItemDataRole.UserRole)
+                for item in track_list.selectedItems()
+            ]
+            if selected_indices and HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+                # Draw preview curves
+                for idx in selected_indices:
+                    curve = curves[idx]
+                    points = np.array(curve.points)
+                    if len(points) > 1:
+                        self.spectrogram_canvas.draw_preview_curve(points, color='yellow')
+                self.statusBar().showMessage(f"Previewing {len(selected_indices)} track(s)")
+
+        def create_annotations():
+            """Create annotations from selected tracks."""
+            selected_indices = [
+                item.data(Qt.ItemDataRole.UserRole)
+                for item in track_list.selectedItems()
+            ]
+
+            if not selected_indices:
+                QMessageBox.warning(dialog, "No Selection", "Please select at least one track.")
+                return
+
+            created_count = 0
+            for idx in selected_indices:
+                curve = curves[idx]
+
+                # Create annotation from curve
+                t_start = min(p[0] for p in curve.points)
+                t_end = max(p[0] for p in curve.points)
+                f_min = min(p[1] for p in curve.points)
+                f_max = max(p[1] for p in curve.points)
+
+                # Add some padding
+                t_padding = (t_end - t_start) * 0.05
+                f_padding = (f_max - f_min) * 0.1
+
+                annotation = self.annotation_manager.create_annotation(
+                    t_start=t_start - t_padding,
+                    t_end=t_end + t_padding,
+                    f_min=f_min - f_padding,
+                    f_max=f_max + f_padding,
+                    label=f"Track_{curve.fit_type}",
+                    color=None
+                )
+
+                if annotation:
+                    # Set the curve points
+                    annotation.points = curve.points
+                    annotation.show_doppler_curve = True
+                    annotation.snr_db = curve.snr_db
+                    annotation.slope_hz_per_sec = curve.curvature * 1000
+
+                    # Add to UI
+                    self.annotation_table.add_annotation(annotation)
+                    if self.annotation_renderer:
+                        self.annotation_renderer.add_annotation(annotation)
+
+                    created_count += 1
+
+            # Save annotations
+            self.save_annotations(silent=True)
+
+            self.statusBar().showMessage(f"Created {created_count} annotation(s) from detected tracks")
+            dialog.accept()
+
+        preview_btn.clicked.connect(preview_tracks)
+        create_btn.clicked.connect(create_annotations)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        dialog.exec()
+
+        # Clear any preview curves
+        if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+            self.spectrogram_canvas.clear_preview_curves()
+
+    def estimate_annotation_snr(self, annotation: Annotation):
+        """Estimate SNR for an annotation region using GPU DSP engine.
+
+        Args:
+            annotation: The annotation to analyze
+        """
+        full_data, freqs, times = self._get_spectrogram_axes()
+
+        if full_data is None:
+            QMessageBox.warning(self, "No Data", "No spectrogram data available.")
+            return
+
+        try:
+            # Get DSP engine
+            dsp_engine = get_dsp_engine()
+
+            # Find indices for annotation bounds
+            t_start_idx = np.searchsorted(times, annotation.t_start)
+            t_end_idx = np.searchsorted(times, annotation.t_end)
+            f_min_idx = np.searchsorted(freqs, annotation.f_min)
+            f_max_idx = np.searchsorted(freqs, annotation.f_max)
+
+            # Ensure valid bounds
+            t_start_idx = max(0, t_start_idx)
+            t_end_idx = min(full_data.shape[1], t_end_idx)
+            f_min_idx = max(0, f_min_idx)
+            f_max_idx = min(full_data.shape[0], f_max_idx)
+
+            # Extract region
+            region = full_data[f_min_idx:f_max_idx, t_start_idx:t_end_idx]
+
+            if region.size == 0:
+                QMessageBox.warning(self, "Invalid Region", "Annotation region is too small.")
+                return
+
+            self.statusBar().showMessage("Estimating SNR...")
+
+            # Estimate SNR using DSP engine
+            result = dsp_engine.snr_estimator.estimate_snr(region)
+
+            # Store result in annotation
+            annotation.snr_db = result.snr_db
+
+            # Update table
+            self.annotation_table.update_annotation(annotation)
+
+            # Save annotations
+            self.save_annotations(silent=True)
+
+            # Show result dialog
+            QMessageBox.information(
+                self, "SNR Estimation Result",
+                f"Annotation #{annotation.id}\n\n"
+                f"SNR: {result.snr_db:.1f} dB\n"
+                f"Peak SNR: {result.peak_snr_db:.1f} dB\n"
+                f"Signal Power: {result.signal_power:.2e}\n"
+                f"Noise Power: {result.noise_power:.2e}\n"
+                f"Confidence: {result.confidence:.1%}\n"
+                f"Method: {result.method}"
+            )
+
+            self.statusBar().showMessage(f"SNR: {result.snr_db:.1f} dB for annotation #{annotation.id}")
+            logger.info(f"SNR estimation for annotation {annotation.id}: {result.snr_db:.1f} dB")
+
+        except Exception as e:
+            logger.error(f"Error estimating SNR: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"SNR estimation failed: {e}")
+
+    def detect_harmonics_in_annotation(self, annotation: Annotation):
+        """Detect harmonics in annotation region using GPU DSP engine.
+
+        Args:
+            annotation: The annotation to analyze
+        """
+        full_data, freqs, times = self._get_spectrogram_axes()
+
+        if full_data is None:
+            QMessageBox.warning(self, "No Data", "No spectrogram data available.")
+            return
+
+        try:
+            # Get DSP engine
+            dsp_engine = get_dsp_engine()
+
+            # Find indices for annotation bounds
+            t_start_idx = np.searchsorted(times, annotation.t_start)
+            t_end_idx = np.searchsorted(times, annotation.t_end)
+            f_min_idx = np.searchsorted(freqs, annotation.f_min)
+            f_max_idx = np.searchsorted(freqs, annotation.f_max)
+
+            # Ensure valid bounds
+            t_start_idx = max(0, t_start_idx)
+            t_end_idx = min(full_data.shape[1], t_end_idx)
+            f_min_idx = max(0, f_min_idx)
+            f_max_idx = min(full_data.shape[0], f_max_idx)
+
+            # Extract region
+            region = full_data[f_min_idx:f_max_idx, t_start_idx:t_end_idx]
+            region_freqs = freqs[f_min_idx:f_max_idx]
+
+            if region.size == 0:
+                QMessageBox.warning(self, "Invalid Region", "Annotation region is too small.")
+                return
+
+            self.statusBar().showMessage("Detecting harmonics...")
+
+            # Detect harmonics using DSP engine
+            result = dsp_engine.harmonic_analyzer.find_harmonics(region, region_freqs)
+
+            if result is None:
+                QMessageBox.information(
+                    self, "Harmonic Detection",
+                    f"No clear harmonic structure detected in annotation #{annotation.id}."
+                )
+                return
+
+            # Format harmonics list
+            harmonics_text = "\n".join([
+                f"  {i+1}. {freq:.1f} Hz (amplitude: {amp:.2f})"
+                for i, (freq, amp) in enumerate(result.harmonics[:8])  # Show first 8
+            ])
+
+            # Show result dialog
+            QMessageBox.information(
+                self, "Harmonic Detection Result",
+                f"Annotation #{annotation.id}\n\n"
+                f"Fundamental Frequency: {result.fundamental_freq:.1f} Hz\n"
+                f"Number of Harmonics: {result.num_harmonics}\n"
+                f"Harmonic-to-Noise Ratio: {result.hnr_db:.1f} dB\n"
+                f"Confidence: {result.confidence:.1%}\n\n"
+                f"Detected Harmonics:\n{harmonics_text}"
+            )
+
+            self.statusBar().showMessage(
+                f"Found {result.num_harmonics} harmonics (f0={result.fundamental_freq:.1f} Hz) "
+                f"in annotation #{annotation.id}"
+            )
+            logger.info(f"Harmonic detection for annotation {annotation.id}: "
+                       f"f0={result.fundamental_freq:.1f} Hz, {result.num_harmonics} harmonics")
+
+        except Exception as e:
+            logger.error(f"Error detecting harmonics: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Harmonic detection failed: {e}")
+
+    def detect_curved_tracks_in_annotation(self, annotation: Annotation):
+        """Detect curved tracks in annotation region using GPU DSP engine.
+
+        Args:
+            annotation: The annotation to analyze
+        """
+        full_data, freqs, times = self._get_spectrogram_axes()
+
+        if full_data is None:
+            QMessageBox.warning(self, "No Data", "No spectrogram data available.")
+            return
+
+        try:
+            # Get DSP engine
+            dsp_engine = get_dsp_engine()
+
+            # Find indices for annotation bounds - NO PADDING!
+            # We want the track to stay strictly within annotation bounds
+            t_start_idx = np.searchsorted(times, annotation.t_start)
+            t_end_idx = np.searchsorted(times, annotation.t_end)
+            f_min_idx = np.searchsorted(freqs, annotation.f_min)
+            f_max_idx = np.searchsorted(freqs, annotation.f_max)
+
+            # Ensure valid bounds (no padding - stay within annotation)
+            t_start_idx = max(0, t_start_idx)
+            t_end_idx = min(full_data.shape[1], t_end_idx)
+            f_min_idx = max(0, f_min_idx)
+            f_max_idx = min(full_data.shape[0], f_max_idx)
+
+            # Extract region - EXACTLY the annotation bounds
+            region = full_data[f_min_idx:f_max_idx, t_start_idx:t_end_idx]
+            region_times = times[t_start_idx:t_end_idx]
+            region_freqs = freqs[f_min_idx:f_max_idx]
+
+            if region.size == 0 or region.shape[0] < 10 or region.shape[1] < 10:
+                QMessageBox.warning(self, "Invalid Region", "Annotation region is too small for track detection.")
+                return
+
+            self.statusBar().showMessage("Detecting curved tracks...")
+
+            # Detect curved tracks using SIMPLE peak-following algorithm
+            # Follows actual intensity maxima - works great for Doppler!
+            curves = dsp_engine.detect_tracks_simple(
+                region, region_times, region_freqs,
+                num_tracks=1,  # Just find the best track for annotation
+                min_length=max(10, region.shape[1] // 5)
+            )
+
+            if not curves:
+                QMessageBox.information(
+                    self, "Track Detection",
+                    f"No curved tracks detected in annotation #{annotation.id}.\n\n"
+                    "Try adjusting the annotation bounds or the signal may be too weak."
+                )
+                return
+
+            # Take the best curve
+            best_curve = curves[0]
+
+            # CLIP track points to annotation bounds - ensure track stays inside
+            clipped_points = [
+                (t, f) for t, f in best_curve.points
+                if annotation.t_start <= t <= annotation.t_end
+                and annotation.f_min <= f <= annotation.f_max
+            ]
+
+            if len(clipped_points) < 4:
+                QMessageBox.warning(
+                    self, "Track Detection",
+                    f"Track was detected but doesn't fit well within annotation bounds.\n"
+                    "Try adjusting the annotation to better cover the signal."
+                )
+                return
+
+            # Convert curve points to annotation format
+            annotation.points = clipped_points
+            annotation.show_doppler_curve = True
+
+            # Store additional analysis info
+            annotation.slope_hz_per_sec = best_curve.curvature * 1000  # Approximate slope
+            if hasattr(annotation, 'snr_db') and annotation.snr_db is None:
+                annotation.snr_db = best_curve.snr_db
+
+            # Update visual
+            if self.annotation_renderer:
+                self.annotation_renderer.update_doppler_curve(annotation)
+
+            # Update table
+            self.annotation_table.update_annotation(annotation)
+
+            # Save annotations
+            self.save_annotations(silent=True)
+
+            # Show result dialog
+            QMessageBox.information(
+                self, "Track Detection Result",
+                f"Annotation #{annotation.id}\n\n"
+                f"Track Type: {best_curve.fit_type.capitalize()}\n"
+                f"Points Extracted: {len(best_curve.points)}\n"
+                f"Duration: {best_curve.duration:.3f} s\n"
+                f"Frequency Range: {best_curve.freq_range[0]:.1f} - {best_curve.freq_range[1]:.1f} Hz\n"
+                f"Curvature: {best_curve.curvature:.4f}\n"
+                f"SNR: {best_curve.snr_db:.1f} dB\n"
+                f"Detection Score: {best_curve.score:.3f}\n"
+                f"Inflection Points: {len(best_curve.inflection_points)}\n\n"
+                f"Track has been applied to the annotation."
+            )
+
+            self.statusBar().showMessage(
+                f"Detected {best_curve.fit_type} track with {len(best_curve.points)} points "
+                f"for annotation #{annotation.id}"
+            )
+            logger.info(f"Curved track detection for annotation {annotation.id}: "
+                       f"{best_curve.fit_type}, {len(best_curve.points)} points, score={best_curve.score:.3f}")
+
+        except Exception as e:
+            logger.error(f"Error detecting curved tracks: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Track detection failed: {e}")
+
+    def suppress_annotation_track(self, annotation: Annotation):
+        """Suppress/remove the annotation's track from the spectrogram.
+
+        Args:
+            annotation: The annotation with track points to suppress
+        """
+        if not annotation.points or len(annotation.points) < 4:
+            QMessageBox.warning(
+                self, "No Track",
+                "This annotation doesn't have enough track points.\n"
+                "Use 'Detect Curved Tracks' or draw a curve first."
+            )
+            return
+
+        full_data, freqs, times = self._get_spectrogram_axes()
+
+        if full_data is None:
+            QMessageBox.warning(self, "No Data", "No spectrogram data available.")
+            return
+
+        try:
+            # Get DSP engine
+            dsp_engine = get_dsp_engine()
+
+            # Convert annotation points to curve object
+            from ..core.gpu_dsp_engine import DetectedCurve
+
+            points_arr = np.array(annotation.points)
+            curve = DetectedCurve(
+                points=annotation.points,
+                coefficients=np.polyfit(points_arr[:, 0], points_arr[:, 1], 3),
+                fit_type='polynomial',
+                degree=3,
+                score=1.0,
+                snr_db=getattr(annotation, 'snr_db', 0) or 0,
+                duration=annotation.t_end - annotation.t_start,
+                freq_range=(annotation.f_min, annotation.f_max),
+                curvature=0.0,
+                inflection_points=[]
+            )
+
+            self.statusBar().showMessage("Suppressing track from spectrogram...")
+
+            # Suppress track using DSP engine
+            suppressed_data = dsp_engine.track_suppressor.suppress_track(
+                full_data.copy(), times, freqs, curve,
+                width_hz=50.0,  # Width of suppression band
+                method='interpolate'
+            )
+
+            # Update the spectrogram display
+            if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+                # Store original data if not already stored
+                if not hasattr(self, '_original_spectrogram_data'):
+                    self._original_spectrogram_data = full_data.copy()
+
+                # Update cache with suppressed data
+                self.spectrogram_cache['data'] = suppressed_data
+
+                # Update display
+                self.spectrogram_canvas.update_spectrogram(
+                    suppressed_data,
+                    times=times,
+                    freqs=freqs,
+                    keep_view=True
+                )
+
+            self.statusBar().showMessage(f"Track suppressed for annotation #{annotation.id}")
+
+            # Ask if user wants to keep the change
+            reply = QMessageBox.question(
+                self, "Track Suppressed",
+                f"Track from annotation #{annotation.id} has been suppressed.\n\n"
+                "Do you want to keep this change?\n\n"
+                "Click 'Yes' to keep the suppressed spectrogram.\n"
+                "Click 'No' to revert to the original.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+
+            if reply == QMessageBox.StandardButton.No:
+                # Revert to original
+                if hasattr(self, '_original_spectrogram_data'):
+                    self.spectrogram_cache['data'] = self._original_spectrogram_data
+                    self.spectrogram_canvas.update_spectrogram(
+                        self._original_spectrogram_data,
+                        times=times,
+                        freqs=freqs,
+                        keep_view=True
+                    )
+                    self.statusBar().showMessage("Reverted to original spectrogram")
+            else:
+                # Clear original data reference to save memory
+                if hasattr(self, '_original_spectrogram_data'):
+                    del self._original_spectrogram_data
+                self.statusBar().showMessage("Track suppression applied")
+
+            logger.info(f"Track suppression for annotation {annotation.id} completed")
+
+        except Exception as e:
+            logger.error(f"Error suppressing track: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Track suppression failed: {e}")
 
 
 def main():
