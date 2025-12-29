@@ -1242,9 +1242,9 @@ class VisPyCanvas(scene.SceneCanvas):
         
         self.normalized_display_data = normalized
         
-        # Preserve transform
-        current_transform = self.image_visual.transform
-        if current_transform is None and self.display_extent is not None:
+        # ALWAYS create fresh transform from display_extent
+        current_transform = None
+        if self.display_extent is not None:
             time_start, time_end, freq_start, freq_end = self.display_extent
             time_width = max(time_end - time_start, 1e-9)
             freq_height = max(freq_end - freq_start, 1e-9)
@@ -1255,12 +1255,12 @@ class VisPyCanvas(scene.SceneCanvas):
         
         print(f"\n===== _APPLY_NORMALIZED_DATA =====")
         print(f"Setting image_visual data: shape={self.normalized_display_data.shape}")
+        print(f"Display extent: {self.display_extent}")
         print(f"Transform: {current_transform}")
         
         # FORCE: Remove old image visual and create new one
         # This ensures OpenGL texture is fully replaced
         old_order = self.image_visual.order
-        old_cmap = getattr(self.image_visual, '_cmap', 'plasma')
         old_interp = self.current_interpolation
         
         # Remove old visual from scene
