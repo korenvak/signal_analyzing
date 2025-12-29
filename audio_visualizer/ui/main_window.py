@@ -3088,10 +3088,20 @@ class MainWindow(QMainWindow):
     def load_spectrogram_data(self, audio_data: np.ndarray, view_time_range: tuple = None):
         """Load spectrogram data using batched FFT - NO DOWNSAMPLING (use tile system instead)."""
         try:
+            print(f"\n===== LOAD_SPECTROGRAM_DATA =====")
+            print(f"Audio data shape: {audio_data.shape}")
+            print(f"View time range: {view_time_range}")
+            
             # Check if cached spectrogram covers this region
             # Skip cache during auto-recompute (we want higher resolution)
             preserve_view = getattr(self, '_preserve_view_on_update', False)
-            if not preserve_view:
+            print(f"Preserve view: {preserve_view}")
+            print(f"Cache data is None: {self.spectrogram_cache['data'] is None}")
+            print(f"Cache time_range: {self.spectrogram_cache['time_range']}")
+            
+            # DISABLED CACHE FOR DEBUGGING - always recompute
+            use_cache = False  # FORCE RECOMPUTE
+            if use_cache and not preserve_view:
                 cache = self.spectrogram_cache
                 if (cache['data'] is not None and 
                     cache['time_range'] is not None and
@@ -3104,9 +3114,11 @@ class MainWindow(QMainWindow):
                     time_match = abs(cached_start - req_start) < 0.1 and abs(cached_end - req_end) < 0.1
                     if (time_match and cache['fft_size'] == self.spectrogram_engine.fft_size):
                         
-                        logger.info(f"Using cached spectrogram (exact match {req_start:.1f}-{req_end:.1f}s)")
+                        print(f"Using cached spectrogram (exact match {req_start:.1f}-{req_end:.1f}s)")
                         self.spectrogram_canvas.update_image(cache['data'], cache['extent'])
                         return
+            
+            print("Computing new spectrogram (cache bypassed)...")
             
             # Show progress bar
             self.status_widget.show_progress("Computing spectrogram")

@@ -1256,7 +1256,24 @@ class VisPyCanvas(scene.SceneCanvas):
         print(f"\n===== _APPLY_NORMALIZED_DATA =====")
         print(f"Setting image_visual data: shape={self.normalized_display_data.shape}")
         print(f"Transform: {current_transform}")
-        self.image_visual.set_data(self.normalized_display_data)
+        
+        # FORCE: Remove old image visual and create new one
+        # This ensures OpenGL texture is fully replaced
+        old_order = self.image_visual.order
+        old_cmap = getattr(self.image_visual, '_cmap', 'plasma')
+        old_interp = self.current_interpolation
+        
+        # Remove old visual from scene
+        self.image_visual.parent = None
+        
+        # Create new image visual with the new data
+        self.image_visual = scene.visuals.Image(
+            self.normalized_display_data,
+            parent=self.view.scene,
+            interpolation=old_interp,
+            cmap='plasma'
+        )
+        self.image_visual.order = old_order
         self.image_visual.clim = (0.0, 1.0)
         if current_transform is not None:
             self.image_visual.transform = current_transform
