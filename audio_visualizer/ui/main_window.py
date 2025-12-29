@@ -4755,13 +4755,14 @@ class MainWindow(QMainWindow):
     
     def on_file_selected_from_playlist(self, file_path: str):
         """Handle file selection from playlist."""
-        logger.info(f"Playlist file selected: {file_path}")
-        logger.info(f"Current file: {self.current_file}")
+        print(f"\n========== FILE SELECTED FROM PLAYLIST ==========")
+        print(f"Selected file: {file_path}")
+        print(f"Current file: {self.current_file}")
         if file_path != self.current_file:
-            logger.info(f"Loading new file from playlist: {file_path}")
+            print(f"Loading new file...")
             self.load_audio_file(file_path)
         else:
-            logger.info(f"File already loaded, skipping: {file_path}")
+            print(f"File already loaded, skipping")
     
     def on_files_dropped(self, file_paths: list):
         """Handle files dropped onto playlist."""

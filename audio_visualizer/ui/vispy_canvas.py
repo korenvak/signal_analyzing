@@ -6,7 +6,7 @@ import logging
 from typing import Optional, Tuple, Callable
 import numpy as np
 
-from .qt_compat import QTimer, Signal
+from .qt_compat import QTimer, Signal, QApplication
 
 try:
     from vispy import scene
@@ -1012,7 +1012,12 @@ class VisPyCanvas(scene.SceneCanvas):
             extent: (time_start, time_end, freq_start, freq_end)
             preserve_view: If True, don't change camera position (for zoomed recompute)
         """
+        print(f"\n===== UPDATE_IMAGE CALLED =====")
+        print(f"Data shape: {data.shape if data is not None else 'None'}")
+        print(f"Extent: {extent}")
+        print(f"Preserve view: {preserve_view}")
         if data is None or data.size == 0:
+            print("Data is None or empty, returning early!")
             return
         
         # Save current camera position if preserving view
@@ -1090,6 +1095,8 @@ class VisPyCanvas(scene.SceneCanvas):
         # Force immediate update instead of waiting for timer
         self._update_dynamic_clim_now()
         self.update()
+        # Process Qt events to ensure display is refreshed
+        QApplication.processEvents()
 
     def schedule_normalization_update(self):
         """Schedule debounced normalization update."""
@@ -1246,14 +1253,25 @@ class VisPyCanvas(scene.SceneCanvas):
                 translate=(time_start, freq_start)
             )
         
-        logger.info(f"Setting image_visual data: shape={self.normalized_display_data.shape}")
+        print(f"\n===== _APPLY_NORMALIZED_DATA =====")
+        print(f"Setting image_visual data: shape={self.normalized_display_data.shape}")
+        print(f"Transform: {current_transform}")
         self.image_visual.set_data(self.normalized_display_data)
         self.image_visual.clim = (0.0, 1.0)
         if current_transform is not None:
             self.image_visual.transform = current_transform
 
-        logger.info("Calling canvas update()")
-        self.update()
+        print("Calling canvas update()")
+        # Force visual update and ensure OpenGL redraws
+        self.image_visual.update()  # Update the image visual specifically
+        self.update()  # Update the canvas
+        # Also trigger Qt repaint
+        if hasattr(self, 'native') and self.native is not None:
+            self.native.update()
+            self.native.repaint()
+        # Process Qt events to ensure display is refreshed
+        QApplication.processEvents()
+        print("_apply_normalized_data COMPLETE")
     
     def set_normalization_mode(self, mode: str, std_scale: float = 2.5):
         """Set normalization mode.
