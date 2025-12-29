@@ -1279,16 +1279,33 @@ class VisPyCanvas(scene.SceneCanvas):
             self.image_visual.transform = current_transform
 
         print("Calling canvas update()")
-        # Force visual update and ensure OpenGL redraws
-        self.image_visual.update()  # Update the image visual specifically
-        self.update()  # Update the canvas
-        # Also trigger Qt repaint
-        if hasattr(self, 'native') and self.native is not None:
-            self.native.update()
-            self.native.repaint()
-        # Process Qt events to ensure display is refreshed
-        QApplication.processEvents()
-        print("_apply_normalized_data COMPLETE")
+        try:
+            # Force visual update and ensure OpenGL redraws
+            self.image_visual.update()  # Update the image visual specifically
+            
+            # Force the view to update
+            self.view.scene.update()
+            self.view.update()
+            
+            # Update the canvas itself
+            self.update()
+            
+            # Force OpenGL context update
+            self.context.flush_commands()
+            
+            # Also trigger Qt repaint
+            if hasattr(self, 'native') and self.native is not None:
+                self.native.update()
+                self.native.repaint()
+            
+            # Process Qt events to ensure display is refreshed
+            QApplication.processEvents()
+            
+            print("_apply_normalized_data COMPLETE - SUCCESS")
+        except Exception as e:
+            print(f"ERROR in canvas update: {e}")
+            import traceback
+            traceback.print_exc()
     
     def set_normalization_mode(self, mode: str, std_scale: float = 2.5):
         """Set normalization mode.
