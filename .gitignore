@@ -38,4 +38,15 @@ debug_*.png
 test_*.wav
 
 test_das_data/
+test_cache_atlas/
+test_cache_progressive/
 *.npy
+*.npz
+*.pkl
+*.pickle
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+nul
