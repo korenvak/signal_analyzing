@@ -1257,46 +1257,26 @@ class VisPyCanvas(scene.SceneCanvas):
         print(f"Setting image_visual data: shape={self.normalized_display_data.shape}")
         print(f"Display extent: {self.display_extent}")
         print(f"Transform: {current_transform}")
-        
+
         try:
             # Make a fresh contiguous copy of the data to ensure new memory
             fresh_data = np.ascontiguousarray(self.normalized_display_data.copy())
             print(f"Fresh data stats: min={fresh_data.min():.3f}, max={fresh_data.max():.3f}, mean={fresh_data.mean():.3f}")
-            
-            # Set the data using VisPy's set_data method
+
+            # Simple approach: just use set_data
             self.image_visual.set_data(fresh_data)
             self.image_visual.clim = (0.0, 1.0)
-            
+
             # Set transform
             if current_transform is not None:
                 self.image_visual.transform = current_transform
-            
-            # Mark the visual as needing update
-            self.image_visual._need_texture_upload = True
-            
-            print("Calling canvas update()")
-            
-            # Force visual update
+
+            # Force updates
             self.image_visual.update()
-            
-            # Update scene hierarchy
             self.view.scene.update()
             self.view.update()
-            
-            # Update canvas
             self.update()
-            
-            # Force OpenGL flush
-            self.context.flush_commands()
-            
-            # Trigger Qt repaint
-            if hasattr(self, 'native') and self.native is not None:
-                self.native.update()
-                self.native.repaint()
-            
-            # Process events
-            QApplication.processEvents()
-            
+
             print("_apply_normalized_data COMPLETE - SUCCESS")
         except Exception as e:
             print(f"ERROR in _apply_normalized_data: {e}")

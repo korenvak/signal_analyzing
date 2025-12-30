@@ -1231,7 +1231,12 @@ class MainWindow(QMainWindow):
                     self.spectrogram_canvas.raw_display_data = None
                     self.spectrogram_canvas.normalized_display_data = None
                     self.spectrogram_canvas.reset_zoom_history()
-            
+
+                # CRITICAL: Clear audio loader cache to ensure new file data is loaded
+                if hasattr(self, 'audio_loader') and hasattr(self.audio_loader, 'clear_cache'):
+                    self.audio_loader.clear_cache()
+                    logger.info("Cleared audio loader cache for file switch")
+
             # Update progress: file cleanup done
             self.status_widget.update_progress(20)
             QApplication.processEvents()
