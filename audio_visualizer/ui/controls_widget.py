@@ -229,7 +229,10 @@ class ControlsWidget(QWidget):
         self.advanced_norm_combo.setToolTip("Min-Max: Use dB range. STD: Use statistical normalization (mean ± std)")
         norm_row.addWidget(self.advanced_norm_combo)
 
-        # Sync with main combo
+        # Connect advanced_norm_combo directly to trigger normalization change
+        self.advanced_norm_combo.currentTextChanged.connect(self.on_normalization_mode_changed)
+
+        # Sync with main combo (for bidirectional sync)
         self.advanced_norm_combo.currentTextChanged.connect(
             lambda text: self.normalization_combo.setCurrentText(text) if self.normalization_combo.currentText() != text else None
         )
