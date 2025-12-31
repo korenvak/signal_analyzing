@@ -19,6 +19,7 @@ class ControlsWidget(QWidget):
     interpolation_changed = Signal(str)
     freq_scale_changed = Signal(str)
     normalization_mode_changed = Signal(str)  # 'minmax' or 'std'
+    gamma_changed = Signal(float)  # Gamma correction value
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -227,7 +228,7 @@ class ControlsWidget(QWidget):
         self.advanced_norm_combo.setFixedWidth(100)
         self.advanced_norm_combo.setToolTip("Min-Max: Use dB range. STD: Use statistical normalization (mean ± std)")
         norm_row.addWidget(self.advanced_norm_combo)
-        
+
         # Sync with main combo
         self.advanced_norm_combo.currentTextChanged.connect(
             lambda text: self.normalization_combo.setCurrentText(text) if self.normalization_combo.currentText() != text else None
@@ -235,9 +236,26 @@ class ControlsWidget(QWidget):
         self.normalization_combo.currentTextChanged.connect(
             lambda text: self.advanced_norm_combo.setCurrentText(text) if self.advanced_norm_combo.currentText() != text else None
         )
-        
+
         norm_row.addStretch()
         norm_layout.addLayout(norm_row)
+
+        # Gamma correction slider
+        gamma_row = QHBoxLayout()
+        gamma_row.setSpacing(8)
+        gamma_row.addWidget(QLabel("Gamma:"))
+        self.gamma_slider = QSlider(Qt.Horizontal)
+        self.gamma_slider.setRange(50, 150)  # 0.5 to 1.5
+        self.gamma_slider.setValue(85)  # Default 0.85
+        self.gamma_slider.setFixedWidth(100)
+        self.gamma_slider.setToolTip("Gamma correction: <1.0 brightens mid-tones, >1.0 darkens them")
+        gamma_row.addWidget(self.gamma_slider)
+        self.gamma_label = QLabel("0.85")
+        self.gamma_label.setFixedWidth(35)
+        gamma_row.addWidget(self.gamma_label)
+        gamma_row.addStretch()
+        norm_layout.addLayout(gamma_row)
+
         advanced_layout.addWidget(norm_group)
         
         # Style
@@ -281,7 +299,8 @@ class ControlsWidget(QWidget):
         self.freq_scale_combo.currentTextChanged.connect(self.on_freq_scale_changed)
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         self.normalization_combo.currentTextChanged.connect(self.on_normalization_mode_changed)
-    
+        self.gamma_slider.valueChanged.connect(self.on_gamma_changed)
+
     def emit_parameters_changed(self):
         """Emit parameters changed signal."""
         fft_size = int(self.fft_size_combo.currentText())
@@ -368,4 +387,14 @@ class ControlsWidget(QWidget):
         """Get current normalization mode ('minmax' or 'std')."""
         mode_text = self.normalization_combo.currentText()
         return 'std' if mode_text == 'STD' else 'minmax'
+
+    def on_gamma_changed(self, value: int):
+        """Handle gamma slider change."""
+        gamma = value / 100.0
+        self.gamma_label.setText(f"{gamma:.2f}")
+        self.gamma_changed.emit(gamma)
+
+    def get_gamma(self) -> float:
+        """Get current gamma value."""
+        return self.gamma_slider.value() / 100.0
 

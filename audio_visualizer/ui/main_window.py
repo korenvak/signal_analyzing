@@ -423,6 +423,7 @@ class MainWindow(QMainWindow):
         self.controls_widget.refresh_requested.connect(self.refresh_current_view)
         self.controls_widget.interpolation_changed.connect(self.on_interpolation_changed)
         self.controls_widget.normalization_mode_changed.connect(self.on_normalization_mode_changed)
+        self.controls_widget.gamma_changed.connect(self.on_gamma_changed)
 
         # Connect tab change signal
         self.main_tabs.currentChanged.connect(self._on_main_tab_changed)
@@ -903,10 +904,12 @@ class MainWindow(QMainWindow):
             }
         """)
         
-        # Settings button - opens settings menu
+        # Settings button - toggles settings panel visibility
         settings_action = QAction("⚙ Settings", self)
-        settings_action.triggered.connect(self.show_settings_menu)
+        settings_action.setCheckable(True)
+        settings_action.triggered.connect(lambda checked: self.controls_widget.setVisible(checked))
         self.toolbar.addAction(settings_action)
+        self.toggle_settings_action = settings_action
         
         self.toolbar.addSeparator()
         
@@ -2294,7 +2297,7 @@ class MainWindow(QMainWindow):
     def on_normalization_mode_changed(self, mode: str):
         """Handle normalization mode changes."""
         logger.info(f"Normalization mode changed to: {mode}")
-        
+
         try:
             if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
                 self.spectrogram_canvas.set_normalization_mode(mode, std_scale=2.5)
@@ -2302,7 +2305,17 @@ class MainWindow(QMainWindow):
                 self.spectrogram_canvas.update_dynamic_clim()
         except Exception as e:
             logger.error(f"Error updating normalization mode: {e}")
-    
+
+    def on_gamma_changed(self, gamma: float):
+        """Handle gamma correction changes."""
+        logger.info(f"Gamma correction changed to: {gamma:.2f}")
+
+        try:
+            if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+                self.spectrogram_canvas.set_gamma_correction(gamma)
+        except Exception as e:
+            logger.error(f"Error updating gamma: {e}")
+
     def update_displays(self):
         """Force update of all displays."""
         try:
@@ -4975,8 +4988,8 @@ class MainWindow(QMainWindow):
             )
 
             if image_path:
-                # Update event with image path and save
-                self.event_manager._save_all_to_csv()
+                # Image path is already set on the event by capture_event_image
+                # Don't call _save_all_to_csv here - the caller will save the event
                 logger.info(f"Event {event.id} image captured: {image_path}")
 
         except Exception as e:

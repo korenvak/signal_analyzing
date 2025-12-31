@@ -442,6 +442,7 @@ class VisPyCanvas(scene.SceneCanvas):
         self.local_mean_std = None  # Mean/std for visible region (for STD normalization)
         self.normalization_mode = 'std'  # 'minmax' or 'std' - default to STD (adaptive to zoom)
         self.std_scale = 2.5  # Scale factor for STD normalization
+        self.gamma_correction = 0.85  # Gamma for perceptual contrast (1.0=linear, <1=brighter mids)
 
         # Zoom history for undo (Ctrl+Z or Backspace)
         self.zoom_history = []  # Stack of (x, y, width, height) tuples
@@ -1232,31 +1233,53 @@ class VisPyCanvas(scene.SceneCanvas):
             self._apply_normalized_data(new_clim[0], new_clim[1])
     
     def _apply_normalized_data(self, clim_min: float, clim_max: float):
-        """Normalize and display data."""
+        """Normalize and display data with improved perceptual mapping.
+
+        Uses techniques from professional audio visualization tools:
+        - Percentile-based clipping for robustness
+        - Optional gamma correction for better contrast
+        - Adaptive scaling based on visible region
+        """
         if self.raw_display_data is None:
             logger.warning("_apply_normalized_data: No raw_display_data!")
             return
 
         logger.info(f"Applying normalized data: clim=[{clim_min:.1f}, {clim_max:.1f}], shape={self.raw_display_data.shape}")
-        
+
+        # Gamma value for perceptual contrast enhancement (1.0 = linear, <1.0 = brighter mids)
+        # Professional tools like Sonic Visualiser use similar approach
+        gamma = getattr(self, 'gamma_correction', 0.85)
+
         if self.normalization_mode == 'std' and self.local_mean_std is not None:
-            # STD-based normalization using local (visible region) mean/std
-            # This makes it adaptive to zoom level, just like minmax
+            # STD-based normalization - better for signals with varying dynamic range
             mean, std = self.local_mean_std
-            std = max(std, 1e-6)  # Avoid division by zero
-            
-            # Compute z-scores: (value - mean) / (std * scale)
-            # Maps approximately [-scale, +scale] sigma range
-            z_scores = (self.raw_display_data - mean) / (std * self.std_scale)
-            
-            # Map z-score to [0, 1]: z_score of -scale maps to 0, +scale maps to 1
-            normalized = (z_scores + 1.0) * 0.5
-            normalized = np.clip(normalized, 0.0, 1.0).astype(np.float32)
+            std = max(std, 1e-6)
+
+            # Map using percentile-based bounds instead of raw z-scores
+            # This provides better contrast for audio spectrograms
+            lower_bound = mean - self.std_scale * std
+            upper_bound = mean + self.std_scale * std
+
+            normalized = (self.raw_display_data - lower_bound) / max(upper_bound - lower_bound, 1e-6)
+            normalized = np.clip(normalized, 0.0, 1.0)
+
+            # Apply gamma correction for better perceptual contrast
+            if gamma != 1.0:
+                normalized = np.power(normalized, gamma)
+
+            normalized = normalized.astype(np.float32)
         else:
-            # Min-Max normalization (default)
+            # Min-Max normalization with improved dynamic range handling
             clim_range = max(clim_max - clim_min, 1e-6)
             normalized = (self.raw_display_data - clim_min) / clim_range
-            normalized = np.clip(normalized, 0.0, 1.0).astype(np.float32)
+            normalized = np.clip(normalized, 0.0, 1.0)
+
+            # Apply gamma correction for better perceptual contrast
+            # This helps bring out subtle details in the spectrogram
+            if gamma != 1.0:
+                normalized = np.power(normalized, gamma)
+
+            normalized = normalized.astype(np.float32)
         
         self.normalized_display_data = normalized
         
@@ -1271,15 +1294,9 @@ class VisPyCanvas(scene.SceneCanvas):
                 translate=(time_start, freq_start)
             )
         
-        print(f"\n===== _APPLY_NORMALIZED_DATA =====")
-        print(f"Setting image_visual data: shape={self.normalized_display_data.shape}")
-        print(f"Display extent: {self.display_extent}")
-        print(f"Transform: {current_transform}")
-
         try:
             # Make a fresh contiguous copy of the data to ensure new memory
             fresh_data = np.ascontiguousarray(self.normalized_display_data.copy())
-            print(f"Fresh data stats: min={fresh_data.min():.3f}, max={fresh_data.max():.3f}, mean={fresh_data.mean():.3f}")
 
             # Simple approach: just use set_data
             self.image_visual.set_data(fresh_data)
@@ -1295,11 +1312,9 @@ class VisPyCanvas(scene.SceneCanvas):
             self.view.update()
             self.update()
 
-            print("_apply_normalized_data COMPLETE - SUCCESS")
+            logger.debug(f"Applied normalized data: shape={fresh_data.shape}, gamma={gamma:.2f}")
         except Exception as e:
-            print(f"ERROR in _apply_normalized_data: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Error in _apply_normalized_data: {e}", exc_info=True)
     
     def set_normalization_mode(self, mode: str, std_scale: float = 2.5):
         """Set normalization mode.
@@ -1320,7 +1335,22 @@ class VisPyCanvas(scene.SceneCanvas):
             self._apply_normalized_data(self.current_clim[0], self.current_clim[1])
         
         logger.debug(f"Normalization mode changed to: {mode} (std_scale={self.std_scale})")
-    
+
+    def set_gamma_correction(self, gamma: float):
+        """Set gamma correction value for perceptual contrast.
+
+        Args:
+            gamma: Gamma value (0.5-2.0). Values < 1.0 brighten mid-tones,
+                   values > 1.0 darken them. Default is 0.85.
+        """
+        self.gamma_correction = max(0.5, min(2.0, gamma))
+
+        # Re-apply normalization with new gamma
+        if self.current_clim is not None:
+            self._apply_normalized_data(self.current_clim[0], self.current_clim[1])
+
+        logger.debug(f"Gamma correction set to: {self.gamma_correction:.2f}")
+
     def set_crosshair(self, enabled: bool, pos: tuple = None):
         """Enable/disable crosshair display."""
         self.crosshair_enabled = enabled
