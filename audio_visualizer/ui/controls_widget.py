@@ -88,16 +88,10 @@ class ControlsWidget(QWidget):
         # Normalization mode selector (prominent location)
         layout.addWidget(QLabel("Normalize:"))
         self.normalization_combo = QComboBox()
-        self.normalization_combo.addItems(['Min-Max', 'STD', 'PCEN', 'Whitening', 'SMED'])
+        self.normalization_combo.addItems(['Min-Max', 'STD'])
         self.normalization_combo.setCurrentText('STD')
-        self.normalization_combo.setFixedWidth(100)
-        self.normalization_combo.setToolTip(
-            "Min-Max: Use dB range\n"
-            "STD: Statistical normalization\n"
-            "PCEN: Per-Channel Energy Norm (best for tracks)\n"
-            "Whitening: Flatten frequency response\n"
-            "SMED: Median subtraction (moving tracks)"
-        )
+        self.normalization_combo.setFixedWidth(90)
+        self.normalization_combo.setToolTip("Normalization method: Min-Max (range) or STD (statistical)")
         layout.addWidget(self.normalization_combo)
         
         layout.addStretch()
@@ -229,16 +223,10 @@ class ControlsWidget(QWidget):
         
         norm_row.addWidget(QLabel("Method:"))
         self.advanced_norm_combo = QComboBox()
-        self.advanced_norm_combo.addItems(['Min-Max', 'STD', 'PCEN', 'Whitening', 'SMED'])
+        self.advanced_norm_combo.addItems(['Min-Max', 'STD'])
         self.advanced_norm_combo.setCurrentText('STD')
         self.advanced_norm_combo.setFixedWidth(100)
-        self.advanced_norm_combo.setToolTip(
-            "Min-Max: Use dB range\n"
-            "STD: Statistical normalization\n"
-            "PCEN: Per-Channel Energy Norm (best for tracks)\n"
-            "Whitening: Flatten frequency response\n"
-            "SMED: Median subtraction (moving tracks)"
-        )
+        self.advanced_norm_combo.setToolTip("Min-Max: Use dB range. STD: Use statistical normalization (mean ± std)")
         norm_row.addWidget(self.advanced_norm_combo)
 
         # Connect advanced_norm_combo directly to trigger normalization change
@@ -395,27 +383,13 @@ class ControlsWidget(QWidget):
     def on_normalization_mode_changed(self, mode_text: str):
         """Handle normalization mode change."""
         # Convert display text to internal mode
-        mode_map = {
-            'Min-Max': 'minmax',
-            'STD': 'std',
-            'PCEN': 'pcen',
-            'Whitening': 'whitening',
-            'SMED': 'smed'
-        }
-        mode = mode_map.get(mode_text, 'minmax')
+        mode = 'std' if mode_text == 'STD' else 'minmax'
         self.normalization_mode_changed.emit(mode)
-
+    
     def get_normalization_mode(self) -> str:
-        """Get current normalization mode."""
+        """Get current normalization mode ('minmax' or 'std')."""
         mode_text = self.normalization_combo.currentText()
-        mode_map = {
-            'Min-Max': 'minmax',
-            'STD': 'std',
-            'PCEN': 'pcen',
-            'Whitening': 'whitening',
-            'SMED': 'smed'
-        }
-        return mode_map.get(mode_text, 'minmax')
+        return 'std' if mode_text == 'STD' else 'minmax'
 
     def on_gamma_changed(self, value: int):
         """Handle gamma slider change."""

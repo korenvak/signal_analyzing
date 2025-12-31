@@ -1232,95 +1232,6 @@ class VisPyCanvas(scene.SceneCanvas):
             self.current_clim = new_clim
             self._apply_normalized_data(new_clim[0], new_clim[1])
     
-    def _apply_pcen(self, data: np.ndarray, gain: float = 0.98, bias: float = 2.0,
-                     power: float = 0.5, time_constant: float = 0.4, eps: float = 1e-6) -> np.ndarray:
-        """Apply Per-Channel Energy Normalization (PCEN).
-
-        PCEN is excellent for detecting thin frequency tracks and bioacoustic signals.
-        Formula: P = (S / (eps + M)^gain + bias)^power - bias^power
-
-        Args:
-            data: Input spectrogram (freq x time), should be in linear scale (not dB)
-            gain: AGC strength (0.98 default, slightly less than 1)
-            bias: Bias for nonlinear compression (2.0 default)
-            power: Compression exponent (0.5 default, sqrt-like compression)
-            time_constant: Smoothing time constant in seconds (0.4 default)
-            eps: Small constant for numerical stability
-
-        Returns:
-            PCEN-normalized spectrogram
-        """
-        # Convert from dB back to linear power if needed
-        # Our raw_display_data is in dB, so convert back
-        linear_data = np.power(10.0, data / 10.0)
-
-        # Compute smoothing coefficient from time constant
-        # Assuming ~100 frames per second (depends on hop_length)
-        hop_rate = 100  # approximate
-        b = 1.0 - np.exp(-1.0 / (time_constant * hop_rate))
-
-        # Apply IIR filter along time axis for each frequency channel
-        # M[f, t] = (1 - b) * M[f, t-1] + b * S[f, t]
-        M = np.zeros_like(linear_data)
-        M[:, 0] = linear_data[:, 0]
-        for t in range(1, linear_data.shape[1]):
-            M[:, t] = (1 - b) * M[:, t-1] + b * linear_data[:, t]
-
-        # Apply PCEN formula
-        # P = (S / (eps + M)^gain + bias)^power - bias^power
-        smooth = eps + M
-        normalized = (linear_data / np.power(smooth, gain) + bias)
-        normalized = np.power(normalized, power) - np.power(bias, power)
-
-        return normalized
-
-    def _apply_spectral_whitening(self, data: np.ndarray) -> np.ndarray:
-        """Apply spectral whitening to flatten frequency response.
-
-        Divides each frequency bin by its median over time, making all frequencies
-        equally prominent. This enhances thin tracks that would otherwise be
-        masked by strong frequency bands.
-
-        Args:
-            data: Input spectrogram (freq x time) in dB
-
-        Returns:
-            Whitened spectrogram
-        """
-        # Compute median for each frequency bin across time
-        freq_median = np.median(data, axis=1, keepdims=True)
-
-        # Avoid division by zero
-        freq_median = np.maximum(np.abs(freq_median), 1e-6)
-
-        # Subtract median (in dB domain, this is like division in linear)
-        whitened = data - freq_median
-
-        return whitened
-
-    def _apply_smed(self, data: np.ndarray, window_size: int = 51) -> np.ndarray:
-        """Apply Spectral Median Subtraction (SMED) for track enhancement.
-
-        Subtracts a running median along the time axis for each frequency bin.
-        This removes stationary noise and highlights moving frequency tracks.
-
-        Args:
-            data: Input spectrogram (freq x time) in dB
-            window_size: Size of median filter window (odd number)
-
-        Returns:
-            SMED-processed spectrogram
-        """
-        from scipy.ndimage import median_filter
-
-        # Apply median filter along time axis (axis=1)
-        background = median_filter(data, size=(1, window_size), mode='reflect')
-
-        # Subtract background to get residual (tracks)
-        residual = data - background
-
-        return residual
-
     def _apply_normalized_data(self, clim_min: float, clim_max: float):
         """Normalize and display data with improved perceptual mapping.
 
@@ -1328,67 +1239,47 @@ class VisPyCanvas(scene.SceneCanvas):
         - Percentile-based clipping for robustness
         - Optional gamma correction for better contrast
         - Adaptive scaling based on visible region
-        - PCEN for track detection
-        - Spectral whitening for flat frequency response
         """
         if self.raw_display_data is None:
             logger.warning("_apply_normalized_data: No raw_display_data!")
             return
 
-        logger.info(f"Applying normalized data: mode={self.normalization_mode}, clim=[{clim_min:.1f}, {clim_max:.1f}]")
+        logger.info(f"Applying normalized data: clim=[{clim_min:.1f}, {clim_max:.1f}], shape={self.raw_display_data.shape}")
 
         # Gamma value for perceptual contrast enhancement (1.0 = linear, <1.0 = brighter mids)
+        # Professional tools like Sonic Visualiser use similar approach
         gamma = getattr(self, 'gamma_correction', 0.85)
 
-        if self.normalization_mode == 'pcen':
-            # PCEN - excellent for detecting thin frequency tracks
-            pcen_data = self._apply_pcen(self.raw_display_data)
-            # Normalize to 0-1 range
-            p_min, p_max = np.percentile(pcen_data, [2, 98])
-            normalized = (pcen_data - p_min) / max(p_max - p_min, 1e-6)
-            normalized = np.clip(normalized, 0.0, 1.0)
-
-        elif self.normalization_mode == 'whitening':
-            # Spectral whitening - flattens frequency response
-            whitened = self._apply_spectral_whitening(self.raw_display_data)
-            # Normalize to 0-1 range
-            p_min, p_max = np.percentile(whitened, [2, 98])
-            normalized = (whitened - p_min) / max(p_max - p_min, 1e-6)
-            normalized = np.clip(normalized, 0.0, 1.0)
-
-        elif self.normalization_mode == 'smed':
-            # SMED - removes stationary noise, highlights moving tracks
-            smed_data = self._apply_smed(self.raw_display_data)
-            # Normalize to 0-1 range (use positive values only for tracks)
-            # Tracks appear as positive residuals
-            normalized = np.clip(smed_data, 0, None)
-            p_max = np.percentile(normalized, 98)
-            normalized = normalized / max(p_max, 1e-6)
-            normalized = np.clip(normalized, 0.0, 1.0)
-
-        elif self.normalization_mode == 'std' and self.local_mean_std is not None:
+        if self.normalization_mode == 'std' and self.local_mean_std is not None:
             # STD-based normalization - better for signals with varying dynamic range
             mean, std = self.local_mean_std
             std = max(std, 1e-6)
 
             # Map using percentile-based bounds instead of raw z-scores
+            # This provides better contrast for audio spectrograms
             lower_bound = mean - self.std_scale * std
             upper_bound = mean + self.std_scale * std
 
             normalized = (self.raw_display_data - lower_bound) / max(upper_bound - lower_bound, 1e-6)
             normalized = np.clip(normalized, 0.0, 1.0)
 
+            # Apply gamma correction for better perceptual contrast
+            if gamma != 1.0:
+                normalized = np.power(normalized, gamma)
+
+            normalized = normalized.astype(np.float32)
         else:
             # Min-Max normalization with improved dynamic range handling
             clim_range = max(clim_max - clim_min, 1e-6)
             normalized = (self.raw_display_data - clim_min) / clim_range
             normalized = np.clip(normalized, 0.0, 1.0)
 
-        # Apply gamma correction for better perceptual contrast
-        if gamma != 1.0:
-            normalized = np.power(normalized, gamma)
+            # Apply gamma correction for better perceptual contrast
+            # This helps bring out subtle details in the spectrogram
+            if gamma != 1.0:
+                normalized = np.power(normalized, gamma)
 
-        normalized = normalized.astype(np.float32)
+            normalized = normalized.astype(np.float32)
         
         self.normalized_display_data = normalized
         
@@ -1427,24 +1318,23 @@ class VisPyCanvas(scene.SceneCanvas):
     
     def set_normalization_mode(self, mode: str, std_scale: float = 2.5):
         """Set normalization mode.
-
+        
         Args:
-            mode: 'minmax', 'std', 'pcen', 'whitening', or 'smed'
+            mode: 'minmax' or 'std'
             std_scale: Scale factor for STD normalization (typically 2.0-3.0)
         """
-        valid_modes = ('minmax', 'std', 'pcen', 'whitening', 'smed')
-        if mode not in valid_modes:
+        if mode not in ('minmax', 'std'):
             logger.warning(f"Invalid normalization mode: {mode}, using 'minmax'")
             mode = 'minmax'
-
+        
         self.normalization_mode = mode
         self.std_scale = max(0.5, min(5.0, std_scale))  # Clamp to reasonable range
-
+        
         # Re-apply normalization with new mode
         if self.current_clim is not None:
             self._apply_normalized_data(self.current_clim[0], self.current_clim[1])
-
-        logger.info(f"Normalization mode changed to: {mode}")
+        
+        logger.debug(f"Normalization mode changed to: {mode} (std_scale={self.std_scale})")
 
     def set_gamma_correction(self, gamma: float):
         """Set gamma correction value for perceptual contrast.
