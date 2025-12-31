@@ -327,6 +327,10 @@ class VisPyCanvas(scene.SceneCanvas):
         self.mouse_pos = (0, 0)
         self.crosshair_enabled = False
         self.is_panning = False
+        self.is_zooming = False  # Track if zoom in progress
+        self._zoom_end_timer = QTimer()
+        self._zoom_end_timer.setSingleShot(True)
+        self._zoom_end_timer.timeout.connect(self._on_zoom_ended)
         self.last_mouse_pos = None
         self.pan_speed = 1.0
         
@@ -599,12 +603,19 @@ class VisPyCanvas(scene.SceneCanvas):
 
             if new_width > 0 and new_height > 0:
                 self.view.camera.rect = (new_x, new_y, new_width, new_height)
+                # Mark as zooming and delay normalization until zoom ends
+                self.is_zooming = True
+                self._zoom_end_timer.start(200)  # 200ms after last zoom event
                 self.update_dynamic_clim()
                 self.notify_zoom_changed()
                 self.schedule_auto_recompute()
-            
+
         except Exception:
             pass
+
+    def _on_zoom_ended(self):
+        """Called when zoom interaction ends (after delay)."""
+        self.is_zooming = False
     
     def on_key_press(self, event):
         """Handle key press events for zoom controls, navigation, and modes."""
@@ -1099,12 +1110,19 @@ class VisPyCanvas(scene.SceneCanvas):
         QApplication.processEvents()
 
     def schedule_normalization_update(self):
-        """Schedule debounced normalization update."""
+        """Schedule debounced normalization update.
+
+        Uses longer delay (300ms) to avoid recomputing during active zoom/pan.
+        """
         self.normalization_pending = True
-        self.normalization_timer.start(150)
-    
+        self.normalization_timer.start(300)  # Increased from 150ms for smoother interaction
+
     def _do_debounced_normalization(self):
         """Perform normalization update (called by timer)."""
+        # Skip if user is actively panning or zooming
+        if self.is_panning or self.is_zooming:
+            self.normalization_timer.start(300)  # Reschedule
+            return
         if self.normalization_pending:
             self.normalization_pending = False
             self._update_dynamic_clim_now()

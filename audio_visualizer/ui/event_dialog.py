@@ -15,10 +15,158 @@ from .qt_compat import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QSpinBox, QDoubleSpinBox, QLineEdit,
     QPushButton, QGroupBox, QFrame, QMessageBox,
+    QButtonGroup, QRadioButton, QShortcut, QKeySequence,
     Qt, QFont
 )
 
 logger = logging.getLogger(__name__)
+
+
+class QuickEventDialog(QDialog):
+    """Fast dialog for quick event tagging - only harmonics count and signal quality."""
+
+    def __init__(
+        self,
+        t_start: float,
+        t_end: float,
+        f_min: float,
+        f_max: float,
+        parent=None
+    ):
+        """Initialize quick event dialog.
+
+        Args:
+            t_start: Event start time (relative seconds)
+            t_end: Event end time (relative seconds)
+            f_min: Lower frequency bound
+            f_max: Upper frequency bound
+            parent: Parent widget
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Quick Event Tag")
+        self.setMinimumWidth(300)
+
+        self.t_start = t_start
+        self.t_end = t_end
+        self.f_min = f_min
+        self.f_max = f_max
+
+        self._setup_ui()
+        self._setup_shortcuts()
+
+    def _setup_ui(self):
+        """Setup the dialog UI."""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # Duration info
+        duration = self.t_end - self.t_start
+        duration_label = QLabel(f"Duration: {duration:.3f}s  ({self.t_start:.2f}s - {self.t_end:.2f}s)")
+        duration_label.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(duration_label)
+
+        # Harmonics count
+        harmonics_layout = QHBoxLayout()
+        harmonics_label = QLabel("Harmonics count:")
+        self.harmonics_spin = QSpinBox()
+        self.harmonics_spin.setRange(0, 20)
+        self.harmonics_spin.setValue(1)
+        self.harmonics_spin.setToolTip("Number of harmonics (0 = not set)")
+        self.harmonics_spin.setMinimumWidth(60)
+        harmonics_layout.addWidget(harmonics_label)
+        harmonics_layout.addWidget(self.harmonics_spin)
+        harmonics_layout.addStretch()
+        layout.addLayout(harmonics_layout)
+
+        # Signal quality (0, 1, 2)
+        quality_label = QLabel("Signal quality:")
+        layout.addWidget(quality_label)
+
+        quality_layout = QHBoxLayout()
+        self.quality_group = QButtonGroup(self)
+
+        self.quality_0 = QRadioButton("0 - Low")
+        self.quality_1 = QRadioButton("1 - Medium")
+        self.quality_2 = QRadioButton("2 - High")
+
+        self.quality_group.addButton(self.quality_0, 0)
+        self.quality_group.addButton(self.quality_1, 1)
+        self.quality_group.addButton(self.quality_2, 2)
+
+        self.quality_1.setChecked(True)  # Default to medium
+
+        quality_layout.addWidget(self.quality_0)
+        quality_layout.addWidget(self.quality_1)
+        quality_layout.addWidget(self.quality_2)
+        layout.addLayout(quality_layout)
+
+        # Keyboard hints
+        hints_label = QLabel("Shortcuts: 0/1/2 = quality, Enter = save, Esc = cancel")
+        hints_label.setStyleSheet("color: #666; font-size: 10px;")
+        layout.addWidget(hints_label)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(self.cancel_btn)
+
+        self.save_btn = QPushButton("Save (Enter)")
+        self.save_btn.setDefault(True)
+        self.save_btn.clicked.connect(self.accept)
+        button_layout.addWidget(self.save_btn)
+
+        layout.addLayout(button_layout)
+
+        # Focus on harmonics spin
+        self.harmonics_spin.setFocus()
+        self.harmonics_spin.selectAll()
+
+    def _setup_shortcuts(self):
+        """Setup keyboard shortcuts for fast input."""
+        # Number keys for quality selection
+        QShortcut(QKeySequence("0"), self, lambda: self._set_quality(0))
+        QShortcut(QKeySequence("1"), self, lambda: self._set_quality(1))
+        QShortcut(QKeySequence("2"), self, lambda: self._set_quality(2))
+
+    def _set_quality(self, quality: int):
+        """Set quality and optionally save."""
+        if quality == 0:
+            self.quality_0.setChecked(True)
+        elif quality == 1:
+            self.quality_1.setChecked(True)
+        elif quality == 2:
+            self.quality_2.setChecked(True)
+
+    def get_values(self) -> dict:
+        """Get the entered values.
+
+        Returns:
+            Dictionary with:
+            - f_min: float
+            - f_max: float
+            - harmonic_number: Optional[int]
+            - signal_quality: int (0, 1, or 2)
+            - snr_estimate_db: None (not used in quick mode)
+            - notes: str (quality as text)
+        """
+        harmonic = self.harmonics_spin.value()
+        if harmonic == 0:
+            harmonic = None
+
+        quality = self.quality_group.checkedId()
+        quality_text = ["Low", "Medium", "High"][quality]
+
+        return {
+            'f_min': self.f_min,
+            'f_max': self.f_max,
+            'harmonic_number': harmonic,
+            'signal_quality': quality,
+            'snr_estimate_db': None,
+            'notes': f"Quality: {quality_text}"
+        }
 
 
 class EventInputDialog(QDialog):

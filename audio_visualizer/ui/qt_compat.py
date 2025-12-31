@@ -28,6 +28,7 @@ try:
         QPolygonF, QPainterPath, QDragEnterEvent, QDropEvent, QKeyEvent,
         QMouseEvent, QWheelEvent, QResizeEvent, QCloseEvent, QPaintEvent
     )
+    from PyQt5.QtWidgets import QShortcut
     # In PyQt5, QAction is in QtWidgets
     from PyQt5.QtWidgets import QAction
     QT_BINDING = 'PyQt5'
@@ -45,7 +46,8 @@ except ImportError:
             QFont, QFontMetrics, QCursor, QPalette, QIcon, QDoubleValidator,
             QIntValidator, QLinearGradient, QRadialGradient, QTransform,
             QPolygonF, QPainterPath, QDragEnterEvent, QDropEvent, QKeyEvent,
-            QMouseEvent, QWheelEvent, QResizeEvent, QCloseEvent, QPaintEvent
+            QMouseEvent, QWheelEvent, QResizeEvent, QCloseEvent, QPaintEvent,
+            QShortcut
         )
         # In PySide6, QAction is in QtGui
         from PySide6.QtGui import QAction

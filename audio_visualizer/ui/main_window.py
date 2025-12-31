@@ -55,7 +55,7 @@ from .measurement_panel import MeasurementPanel
 from .auto_detect_dialog import AutoDetectDialog, run_auto_detect_dialog
 from .event_manager import EventManager
 from .event_panel import EventPanel
-from .event_dialog import EventInputDialog, EventEditDialog
+from .event_dialog import EventInputDialog, EventEditDialog, QuickEventDialog
 from .event_data import TaggedEvent
 from .track_manager import TrackManager
 from .track_data import PaintedTrack
@@ -4862,6 +4862,7 @@ class MainWindow(QMainWindow):
         """Handle when user marks an event region with two vertical lines.
 
         This is called after both lines are placed on the spectrogram.
+        Uses quick dialog for fast tagging with harmonics count and signal quality.
         """
         if not self.event_manager.session_active:
             QMessageBox.warning(
@@ -4886,33 +4887,12 @@ class MainWindow(QMainWindow):
             else:
                 f_min, f_max = 0, 22050
 
-            # Parse filename for absolute times and sensor info
-            parsed = parse_pixel_filename(self.current_file)
-            absolute_start = None
-            absolute_end = None
-            sensor_name = None
-            sensor_id = None
-
-            if parsed:
-                sensor_name = parsed.sensor_name
-                sensor_id = parsed.sensor_id
-                absolute_start = parsed.compute_absolute_time(t_start)
-                absolute_end = parsed.compute_absolute_time(t_end)
-
-            # Estimate SNR from spectrogram data
-            suggested_snr = self._estimate_event_snr(t_start, t_end, f_min, f_max)
-
-            # Show input dialog
-            dialog = EventInputDialog(
+            # Show QUICK input dialog (just harmonics count and signal quality)
+            dialog = QuickEventDialog(
                 t_start=t_start,
                 t_end=t_end,
                 f_min=f_min,
                 f_max=f_max,
-                absolute_start=absolute_start,
-                absolute_end=absolute_end,
-                suggested_snr=suggested_snr,
-                sensor_name=sensor_name,
-                sensor_id=sensor_id,
                 parent=self
             )
 
