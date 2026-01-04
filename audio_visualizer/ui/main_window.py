@@ -1318,19 +1318,36 @@ class MainWindow(QMainWindow):
                 f"({duration:.1f}s, {sample_rate}Hz, max {nyquist_freq:.0f}Hz)"
             )
             
+            # Save current annotations before switching (if any exist)
+            if len(self.annotation_manager) > 0:
+                self.save_annotations(silent=True)
+                logger.info(f"Auto-saved {len(self.annotation_manager)} annotations before file switch")
+
             # Update annotation manager for new file (clears previous annotations)
             self.annotation_manager.set_file_path(file_path)
 
             # Clear annotation visuals from canvas and table
             self.refresh_annotation_display()
 
-            # Auto-load annotations if project is loaded
+            # Auto-load annotations for this file
+            # First try project path, then legacy path
+            annotations_loaded = False
             if self.project_manager.is_project_loaded():
                 annotations_path = self.project_manager.get_file_annotations_path(Path(file_path).name)
                 if annotations_path and annotations_path.exists():
                     self.annotation_manager.load_from_file(str(annotations_path))
-                    self.refresh_annotation_display()
-                    logger.info(f"Auto-loaded {len(self.annotation_manager)} annotations for {Path(file_path).name}")
+                    annotations_loaded = True
+
+            # Try legacy path (next to audio file) if project didn't have annotations
+            if not annotations_loaded:
+                legacy_path = self.annotation_manager.get_json_path()
+                if legacy_path and legacy_path.exists():
+                    self.annotation_manager.load_from_file(str(legacy_path))
+                    annotations_loaded = True
+
+            if annotations_loaded:
+                self.refresh_annotation_display()
+                logger.info(f"Auto-loaded {len(self.annotation_manager)} annotations for {Path(file_path).name}")
             
             # Set default normalization mode to STD
             if hasattr(self, 'spectrogram_canvas'):
@@ -2403,12 +2420,20 @@ class MainWindow(QMainWindow):
             if annotation:
                 # Save curve points
                 annotation.points = points
+                annotation.show_doppler_curve = True  # Make sure curve is visible
                 logger.info(f"Saved {len(points)} curve points to annotation {ann_id}")
+
+                # Update the Doppler curve visual (regardless of point count)
+                if self.annotation_renderer:
+                    self.annotation_renderer.update_doppler_curve(annotation)
 
                 # Automatically calculate Doppler if enough points
                 if len(points) >= 4:
                     self.calculate_doppler_for_annotation(annotation)
                     self.statusBar().showMessage(f"Doppler analysis complete for annotation #{ann_id}")
+
+                # Update table to reflect curve state
+                self.annotation_table.update_annotation(annotation)
 
                 # Save to file (uses project manager if loaded)
                 self.save_annotations(silent=True)
