@@ -1318,8 +1318,11 @@ class MainWindow(QMainWindow):
                 f"({duration:.1f}s, {sample_rate}Hz, max {nyquist_freq:.0f}Hz)"
             )
             
-            # Update annotation manager for new file
+            # Update annotation manager for new file (clears previous annotations)
             self.annotation_manager.set_file_path(file_path)
+
+            # Clear annotation visuals from canvas and table
+            self.refresh_annotation_display()
 
             # Auto-load annotations if project is loaded
             if self.project_manager.is_project_loaded():
