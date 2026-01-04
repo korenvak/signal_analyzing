@@ -1340,6 +1340,9 @@ class MainWindow(QMainWindow):
             # Restore event markers for this file if they exist
             self._restore_event_markers_for_file(file_path)
 
+            # Load and display saved tracks for this file
+            self._load_tracks_for_file(file_path)
+
             # Refresh current view (this computes spectrogram - has its own progress)
             self.refresh_current_view()
 
@@ -5033,18 +5036,27 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Save Track", "No audio file loaded.")
             return
 
-        # Check if track session is active, if not create one
-        if not self.track_manager.session_active:
-            # Create session directory next to audio file
-            audio_path = Path(self.current_file)
-            session_dir = audio_path.parent / f"{audio_path.stem}_tracks"
+        # Create session directory for this specific audio file
+        # Each audio file gets its own subfolder under a common _tracks directory
+        audio_path = Path(self.current_file)
+        base_tracks_dir = audio_path.parent / "tracks_session"
+        file_session_dir = base_tracks_dir / audio_path.stem
 
-            success = self.track_manager.create_new_session(session_dir)
+        # Check if we need to create/switch to a new session for this file
+        current_session_dir = self.track_manager.csv_path.parent if self.track_manager.csv_path else None
+        if current_session_dir != file_session_dir:
+            # Create or load session for this specific file
+            tracks_csv = file_session_dir / "tracks.csv"
+            if tracks_csv.exists():
+                success = self.track_manager.load_existing_session(tracks_csv)
+            else:
+                success = self.track_manager.create_new_session(file_session_dir)
+
             if not success:
-                QMessageBox.critical(self, "Save Track", "Failed to create track session.")
+                QMessageBox.critical(self, "Save Track", "Failed to create/load track session.")
                 return
 
-            logger.info(f"Created new track session at {session_dir}")
+            logger.info(f"Track session for {audio_path.name} at {file_session_dir}")
 
         # Get spectrogram data
         try:
@@ -5092,6 +5104,9 @@ class MainWindow(QMainWindow):
             )
 
             if success:
+                # Add track to canvas visualization (keeps it visible after save)
+                self._add_track_to_canvas(track)
+
                 QMessageBox.information(
                     self,
                     "Track Saved",
@@ -5113,6 +5128,71 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Failed to save track: {e}")
             QMessageBox.critical(self, "Save Track", f"Error saving track: {e}")
+
+    def _add_track_to_canvas(self, track):
+        """Add a saved track to the canvas visualization.
+
+        Args:
+            track: PaintedTrack object with interpolated data
+        """
+        if not hasattr(self, 'spectrogram_canvas'):
+            return
+
+        try:
+            # Prepare interpolated points as Nx2 array
+            if track.interpolated_times and track.interpolated_freqs:
+                interp_points = np.column_stack([
+                    track.interpolated_times,
+                    track.interpolated_freqs
+                ])
+            else:
+                return
+
+            # Prepare control points as Nx2 array
+            control_pts = None
+            if track.control_points:
+                control_pts = np.array(track.control_points)
+
+            # Add to canvas stored tracks
+            self.spectrogram_canvas.add_stored_track(
+                track_id=track.id,
+                interpolated_points=interp_points,
+                control_points=control_pts,
+                visible=True,
+                color='lime'  # Green for saved tracks
+            )
+
+            logger.info(f"Added track {track.id} to canvas visualization")
+
+        except Exception as e:
+            logger.error(f"Failed to add track to canvas: {e}")
+
+    def _load_tracks_for_file(self, audio_file: str):
+        """Load and display saved tracks for a specific audio file.
+
+        Args:
+            audio_file: Path to the audio file
+        """
+        if not hasattr(self, 'spectrogram_canvas'):
+            return
+
+        # Clear existing stored tracks from canvas
+        self.spectrogram_canvas.clear_stored_tracks()
+
+        # Try to load tracks for this file
+        audio_path = Path(audio_file)
+        base_tracks_dir = audio_path.parent / "tracks_session"
+        file_session_dir = base_tracks_dir / audio_path.stem
+        tracks_csv = file_session_dir / "tracks.csv"
+
+        if tracks_csv.exists():
+            # Load the session for this file
+            if self.track_manager.load_existing_session(tracks_csv):
+                # Get tracks for this file and display them
+                tracks = self.track_manager.get_tracks_for_file(audio_file)
+                for track in tracks:
+                    self._add_track_to_canvas(track)
+                logger.info(f"Loaded {len(tracks)} tracks for {audio_path.name}")
 
     def on_goto_event(self, t_center: float, f_center: float):
         """Navigate the spectrogram view to center on an event.

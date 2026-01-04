@@ -417,6 +417,9 @@ class VisPyCanvas(scene.SceneCanvas):
         # Detected Doppler Tracks (from full spectrogram detection)
         self.detected_track_visuals = []  # List of Line visuals for detected tracks
 
+        # Saved/stored tracks (persisted curves that remain visible)
+        self.stored_track_visuals = {}  # Dict[track_id, {'line': visual, 'markers': visual, 'visible': bool}]
+
         # Text readout
         self.text_visual = scene.visuals.Text('', color='white', font_size=11,
                                               pos=(10, 30), parent=self.view.scene)
@@ -2326,4 +2329,119 @@ class VisPyCanvas(scene.SceneCanvas):
     def get_detected_track_count(self) -> int:
         """Get the number of detected tracks currently displayed."""
         return len(self.detected_track_visuals)
+
+    # ==================== Stored/Saved Tracks Visualization ====================
+
+    def add_stored_track(self, track_id: int, interpolated_points: np.ndarray,
+                         control_points: np.ndarray = None, visible: bool = True,
+                         color: str = 'lime') -> bool:
+        """Add a saved track to the visualization (persists after curve mode ends).
+
+        Args:
+            track_id: Unique track identifier
+            interpolated_points: Nx2 array of (time, freq) interpolated points
+            control_points: Optional Nx2 array of control points to show as markers
+            visible: Initial visibility state
+            color: Track line color
+
+        Returns:
+            True if successfully added
+        """
+        try:
+            # Remove existing if updating
+            if track_id in self.stored_track_visuals:
+                self.remove_stored_track(track_id)
+
+            # Create line visual for interpolated curve
+            line_visual = scene.visuals.Line(parent=self.view.scene, method='gl')
+            line_visual.set_data(pos=interpolated_points, color=color, width=2.5)
+            line_visual.visible = visible
+            line_visual.order = 145  # Below active curve (150) but above spectrogram
+            line_visual.set_gl_state('translucent', depth_test=False)
+
+            # Create markers for control points if provided
+            markers_visual = None
+            if control_points is not None and len(control_points) > 0:
+                markers_visual = scene.visuals.Markers(parent=self.view.scene)
+                markers_visual.set_data(
+                    pos=control_points,
+                    face_color=color,
+                    edge_color='white',
+                    size=10,
+                    edge_width=2,
+                    symbol='disc'
+                )
+                markers_visual.visible = visible
+                markers_visual.order = 146
+
+            self.stored_track_visuals[track_id] = {
+                'line': line_visual,
+                'markers': markers_visual,
+                'visible': visible
+            }
+
+            logger.debug(f"Added stored track {track_id} with {len(interpolated_points)} points")
+            self.update()
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to add stored track {track_id}: {e}")
+            return False
+
+    def remove_stored_track(self, track_id: int) -> bool:
+        """Remove a stored track from visualization.
+
+        Args:
+            track_id: Track identifier to remove
+
+        Returns:
+            True if removed successfully
+        """
+        if track_id not in self.stored_track_visuals:
+            return False
+
+        track_data = self.stored_track_visuals.pop(track_id)
+
+        if track_data['line'] is not None:
+            track_data['line'].parent = None
+        if track_data['markers'] is not None:
+            track_data['markers'].parent = None
+
+        self.update()
+        logger.debug(f"Removed stored track {track_id}")
+        return True
+
+    def set_stored_track_visible(self, track_id: int, visible: bool) -> bool:
+        """Set visibility of a stored track.
+
+        Args:
+            track_id: Track identifier
+            visible: Whether to show or hide
+
+        Returns:
+            True if track found and updated
+        """
+        if track_id not in self.stored_track_visuals:
+            return False
+
+        track_data = self.stored_track_visuals[track_id]
+        track_data['visible'] = visible
+
+        if track_data['line'] is not None:
+            track_data['line'].visible = visible
+        if track_data['markers'] is not None:
+            track_data['markers'].visible = visible
+
+        self.update()
+        return True
+
+    def clear_stored_tracks(self):
+        """Remove all stored tracks from visualization."""
+        for track_id in list(self.stored_track_visuals.keys()):
+            self.remove_stored_track(track_id)
+        logger.debug("Cleared all stored tracks")
+
+    def get_stored_track_ids(self) -> list:
+        """Get list of stored track IDs."""
+        return list(self.stored_track_visuals.keys())
 
