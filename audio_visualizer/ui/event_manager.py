@@ -502,15 +502,28 @@ class EventManager:
             cbar = plt.colorbar(im, ax=ax)
             cbar.set_label('Power (dB)')
 
-            # Add timestamp info if available
+            # Add timestamp info if available (start time in top-left, end time in top-right)
             if event.event_start_absolute:
-                time_str = event.event_start_absolute.strftime("%Y-%m-%d %H:%M:%S")
-                ax.text(0.02, 0.98, time_str, transform=ax.transAxes,
+                start_time_str = event.event_start_absolute.strftime("%Y-%m-%d %H:%M:%S")
+                ax.text(0.02, 0.98, start_time_str, transform=ax.transAxes,
                        fontsize=8, verticalalignment='top',
                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-            # Save figure
-            image_filename = f"event_{event.id:04d}.png"
+            if event.event_end_absolute:
+                end_time_str = event.event_end_absolute.strftime("%Y-%m-%d %H:%M:%S")
+                ax.text(0.98, 0.98, end_time_str, transform=ax.transAxes,
+                       fontsize=8, verticalalignment='top', horizontalalignment='right',
+                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+            # Generate image filename: pixel_id - start_datetime - end_time
+            # Format: 1001 - 2025-10-29 11_21_48 - 11_22_35.png
+            if event.sensor_id and event.event_start_absolute and event.event_end_absolute:
+                start_dt_str = event.event_start_absolute.strftime("%Y-%m-%d %H_%M_%S")
+                end_time_str = event.event_end_absolute.strftime("%H_%M_%S")
+                image_filename = f"{event.sensor_id} - {start_dt_str} - {end_time_str}.png"
+            else:
+                # Fallback to old format if timestamps not available
+                image_filename = f"event_{event.id:04d}.png"
             image_path = self.image_dir / image_filename
 
             fig.savefig(image_path, dpi=dpi, bbox_inches='tight',

@@ -165,7 +165,7 @@ class QuickEventDialog(QDialog):
             'harmonic_number': harmonic,
             'signal_quality': quality,
             'snr_estimate_db': None,
-            'notes': f"Quality: {quality_text}"
+            'notes': quality_text  # Just High/Medium/Low without "Quality:" prefix
         }
 
 

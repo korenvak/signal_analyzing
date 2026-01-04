@@ -101,13 +101,10 @@ class TaggedEvent:
             'pixel': pixel_value,
             't_start': f"{self.t_start:.6f}",
             't_end': f"{self.t_end:.6f}",
-            'f_min': f"{self.f_min:.1f}",
-            'f_max': f"{self.f_max:.1f}",
             'event_start_absolute': format_datetime(self.event_start_absolute),
             'event_end_absolute': format_datetime(self.event_end_absolute),
             'harmonic_number': self.harmonic_number if self.harmonic_number is not None else "",
-            'snr_estimate_db': f"{self.snr_estimate_db:.1f}" if self.snr_estimate_db is not None else "",
-            'notes': self.notes,
+            'SNR': self.notes,  # Signal quality: High/Medium/Low
             'image_path': self.image_path,
             'created_at': format_datetime(self.created_at)
         }
@@ -157,6 +154,9 @@ class TaggedEvent:
             # Try old format
             pixel_id = parse_int(row.get('sensor_id', ''))
 
+        # Handle both old format (notes) and new format (SNR)
+        notes_value = row.get('SNR', '') or row.get('notes', '')
+
         return cls(
             id=int(row.get('id', 0)),
             audio_file=row.get('audio_file', ''),
@@ -170,7 +170,7 @@ class TaggedEvent:
             event_end_absolute=parse_datetime(row.get('event_end_absolute', '')),
             harmonic_number=parse_int(row.get('harmonic_number', '')),
             snr_estimate_db=parse_float(row.get('snr_estimate_db', '')),
-            notes=row.get('notes', ''),
+            notes=notes_value,
             image_path=row.get('image_path', ''),
             created_at=parse_datetime(row.get('created_at', ''))
         )
@@ -236,13 +236,10 @@ CSV_COLUMNS = [
     'pixel',  # Sensor ID (column name is 'pixel', value is the numeric ID)
     't_start',
     't_end',
-    'f_min',
-    'f_max',
     'event_start_absolute',
     'event_end_absolute',
     'harmonic_number',
-    'snr_estimate_db',
-    'notes',
+    'SNR',  # Signal quality: High/Medium/Low
     'image_path',
     'created_at'
 ]
