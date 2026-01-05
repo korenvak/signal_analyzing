@@ -81,28 +81,34 @@ class PlaylistWidget(QWidget):
     def setup_ui(self):
         """Set up the playlist UI."""
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
         
-        # Header
-        header_layout = QHBoxLayout()
+        # Header with title
         self.title_label = QLabel("Playlist")
-        self.title_label.setStyleSheet("font-weight: bold; font-size: 12px;")
-        header_layout.addWidget(self.title_label)
+        self.title_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        layout.addWidget(self.title_label)
         
-        # Sort button
-        self.sort_button = QPushButton("Sort ▼")
-        self.sort_button.setMaximumWidth(55)
-        self.sort_button.setToolTip("Sort playlist")
+        # Button row - separate from title for better fit
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(4)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Sort button - icon only to save space
+        self.sort_button = QPushButton("⇅")
+        self.sort_button.setFixedWidth(28)
+        self.sort_button.setToolTip("Sort playlist (by time, name, or size)")
         self.sort_button.clicked.connect(self.show_sort_menu)
-        header_layout.addWidget(self.sort_button)
+        button_layout.addWidget(self.sort_button)
         
-        # Add files button
-        self.add_button = QPushButton("Add...")
+        # Add files button - icon + short text
+        self.add_button = QPushButton("+ Add")
         self.add_button.clicked.connect(self.add_files)
-        self.add_button.setMaximumWidth(50)
-        header_layout.addWidget(self.add_button)
+        self.add_button.setToolTip("Add audio files to playlist")
+        button_layout.addWidget(self.add_button)
         
-        layout.addLayout(header_layout)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
         
         # File list
         self.file_list = QListWidget()

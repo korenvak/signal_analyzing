@@ -1041,13 +1041,6 @@ class MainWindow(QMainWindow):
         measure_action.triggered.connect(lambda checked: self.spectrogram_canvas.toggle_measurement_mode())
         self.toolbar.addAction(measure_action)
 
-        self.toolbar.addSeparator()
-
-        # DSP Analysis button with dropdown menu
-        dsp_action = QAction("🔬 DSP", self)
-        dsp_action.triggered.connect(self.show_dsp_menu)
-        self.toolbar.addAction(dsp_action)
-
         # Spacer to push info to the right
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)

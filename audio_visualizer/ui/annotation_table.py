@@ -38,6 +38,30 @@ class AnnotationTableWidget(QTableWidget):
         """Initialize the annotation table."""
         super().__init__(parent)
         
+        # Style checkboxes to have visible checkmarks
+        self.setStyleSheet("""
+            QTableWidget::indicator {
+                width: 16px;
+                height: 16px;
+            }
+            QTableWidget::indicator:checked {
+                background-color: #4CAF50;
+                border: 2px solid #2E7D32;
+                border-radius: 3px;
+            }
+            QTableWidget::indicator:unchecked {
+                background-color: #424242;
+                border: 2px solid #616161;
+                border-radius: 3px;
+            }
+            QTableWidget::indicator:checked:hover {
+                background-color: #66BB6A;
+            }
+            QTableWidget::indicator:unchecked:hover {
+                background-color: #555555;
+            }
+        """)
+        
         # Setup columns - removed Label column
         columns = [
             'ID', 'File', 't_start', 't_end', 'f_min', 'f_max',
