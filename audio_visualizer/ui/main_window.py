@@ -3446,18 +3446,47 @@ class MainWindow(QMainWindow):
             self.status_widget.hide_progress()
             self.statusBar().showMessage(f"Spectrogram error: {str(e)}")
     
-    def refresh_current_view(self):
-        """Refresh the currently active view - always compute full file."""
+    def refresh_current_view(self, force_full: bool = False):
+        """Refresh the currently active view with smart lazy loading.
+        
+        PERFORMANCE: Only computes visible region for large files.
+        
+        Args:
+            force_full: If True, always compute full file (for export/filters)
+        """
         if not self.current_file:
             return
         
-        # Always compute full file to avoid alignment issues
-        # The LOD system will choose appropriate resolution
         duration = self.audio_loader.duration
         sample_rate = self.spectrogram_engine.sample_rate
         
+        # LAZY LOADING THRESHOLD: Files longer than 5 minutes
+        # For shorter files, compute full file (better UX for scrolling)
+        lazy_threshold_seconds = 300  # 5 minutes
+        
+        if not force_full and duration > lazy_threshold_seconds:
+            # Get current visible region from canvas
+            if hasattr(self, 'spectrogram_canvas') and self.spectrogram_canvas.data_bounds:
+                visible = self.spectrogram_canvas.get_visible_region()
+                if visible:
+                    # Add padding for smoother scrolling (20% on each side)
+                    time_span = visible.time_end - visible.time_start
+                    padding = time_span * 0.2
+                    
+                    time_start = max(0.0, visible.time_start - padding)
+                    time_end = min(duration, visible.time_end + padding)
+                    
+                    self.current_view_range = (
+                        (time_start, time_end),
+                        (visible.freq_start, visible.freq_end)
+                    )
+                    logger.info(f"Lazy loading visible region: {time_start:.1f}s - {time_end:.1f}s (padded)")
+                    self.load_view_data('spectrogram')
+                    return
+        
+        # Full file computation (short files or forced)
         self.current_view_range = ((0.0, duration), (0.0, sample_rate / 2))
-        logger.info(f"Recomputing full file: {duration:.1f}s")
+        logger.info(f"Computing full file: {duration:.1f}s")
         
         self.load_view_data('spectrogram')
     
@@ -3471,7 +3500,8 @@ class MainWindow(QMainWindow):
         sample_rate = self.spectrogram_engine.sample_rate
         
         self.current_view_range = ((0.0, duration), (0.0, sample_rate / 2))
-        self.refresh_current_view()
+        # Force full file computation when fitting to view
+        self.refresh_current_view(force_full=True)
     
     # =========================================================================
     # Background Spectrogram Computation (Performance Optimization)
