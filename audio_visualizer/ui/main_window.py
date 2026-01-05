@@ -141,6 +141,8 @@ from .measurement_panel import MeasurementPanel
 from .auto_detect_dialog import AutoDetectDialog, run_auto_detect_dialog
 from .event_manager import EventManager
 from .event_panel import EventPanel
+from .global_annotation_panel import GlobalAnnotationPanel
+from .spectrum_magnifier import SpectrumMagnifier
 from .event_dialog import EventInputDialog, EventEditDialog, QuickEventDialog
 from .event_data import TaggedEvent
 from .track_manager import TrackManager
@@ -489,21 +491,42 @@ class MainWindow(QMainWindow):
             self.main_tabs.addTab(das_placeholder, "DAS Multi-Channel")
             self.das_tab = None
 
-        # Add Event Panel on the right side (hidden by default)
+        # Add Right Sidebar with Tabs (Event Panel and Global Annotations)
+        self.right_sidebar = QTabWidget()
+        self.right_sidebar.setMinimumWidth(280)
+        self.right_sidebar.setMaximumWidth(450)
+        
+        # 1. Event Panel
         self.event_panel = EventPanel(self.event_manager)
-        self.event_panel.setMinimumWidth(280)
-        self.event_panel.setMaximumWidth(400)
-
+        self.right_sidebar.addTab(self.event_panel, "Events")
+        
+        # 2. Global Annotation Panel
+        self.global_ann_panel = GlobalAnnotationPanel()
+        self.right_sidebar.addTab(self.global_ann_panel, "Global Search")
+        
+        # 3. Spectrum Magnifier
+        self.spectrum_magnifier = SpectrumMagnifier()
+        self.right_sidebar.addTab(self.spectrum_magnifier, "Magnifier")
+        
         # Connect event panel signals
         self.event_panel.event_mode_toggled.connect(self.on_event_mode_toggled)
         self.event_panel.goto_event_requested.connect(self.on_goto_event)
         self.event_panel.event_table.event_edit_requested.connect(self.on_event_edit_requested)
+        
+        # Connect global annotation panel signals
+        self.global_ann_panel.jump_requested.connect(self.on_global_jump_requested)
+        
+        # Connect spectrum magnifier signal
+        self.spectrogram_canvas.spectrum_slice_requested.connect(self.spectrum_magnifier.update_slice)
+        
+        # Connect right sidebar tab change to sync event mode
+        self.right_sidebar.currentChanged.connect(self._on_right_sidebar_tab_changed)
 
-        self.main_splitter.addWidget(self.event_panel)
-        self.main_splitter.setSizes([220, 1000, 300])  # Playlist, Center, Event Panel
+        self.main_splitter.addWidget(self.right_sidebar)
+        self.main_splitter.setSizes([220, 1000, 300])  # Playlist, Center, Right Sidebar
 
-        # Hide event panel by default - user toggles with E key or menu
-        self.event_panel.hide()
+        # Hide right sidebar by default - user toggles with E key or menu
+        self.right_sidebar.hide()
 
         main_layout.addWidget(viz_container)
         
@@ -538,6 +561,23 @@ class MainWindow(QMainWindow):
             # Hide playlist sidebar for DAS mode (DAS has its own sidebar)
             if hasattr(self, 'playlist_widget'):
                 self.playlist_widget.hide()
+
+    def _on_right_sidebar_tab_changed(self, index: int):
+        """Handle right sidebar tab change."""
+        if index == 0:  # Events tab
+            # Enable event mode if sidebar is visible
+            if self.right_sidebar.isVisible() and hasattr(self, 'spectrogram_canvas'):
+                # Sync with the mode button in event panel
+                if hasattr(self, 'event_panel'):
+                    self.spectrogram_canvas.set_event_mode(self.event_panel.mode_btn.isChecked())
+        else:
+            # Disable event mode for other tabs (Search)
+            if hasattr(self, 'spectrogram_canvas'):
+                self.spectrogram_canvas.set_event_mode(False)
+            
+            # Auto-refresh search if selected
+            if index == 1:
+                self._refresh_global_annotations()
 
     def _on_das_status_message(self, message: str):
         """Handle status messages from DAS tab."""
@@ -1322,7 +1362,6 @@ class MainWindow(QMainWindow):
             self.status_widget.show_progress("Loading audio file")
             self.status_widget.update_progress(5)
             self.statusBar().showMessage(f"Loading {os.path.basename(file_path)}...")
-            QApplication.processEvents()
 
             # PERFORMANCE: Lightweight cleanup for fast file switching
             if hasattr(self, 'current_file') and self.current_file is not None:
@@ -1343,11 +1382,9 @@ class MainWindow(QMainWindow):
                     'data': None, 'extent': None
                 }
 
-                # Clear canvas display data (reuses buffer on next update)
+                # Clear canvas display data (fully reset view for new file)
                 if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
-                    self.spectrogram_canvas.raw_display_data = None
-                    # Keep normalized_display_data buffer for reuse
-                    self.spectrogram_canvas.reset_zoom_history()
+                    self.spectrogram_canvas.reset_view()
 
                 # Clear audio chunk cache only (preserves memory-mapped file)
                 if hasattr(self, 'audio_loader'):
@@ -1355,13 +1392,11 @@ class MainWindow(QMainWindow):
 
             # Update progress: cleanup done
             self.status_widget.update_progress(15)
-            QApplication.processEvents()
 
             sample_rate, duration = self.audio_loader.load_file(file_path)
 
             # Update progress: file loaded
             self.status_widget.update_progress(50)
-            QApplication.processEvents()
 
             self.current_file = file_path
             
@@ -1446,7 +1481,6 @@ class MainWindow(QMainWindow):
 
             # Update progress: preparing view
             self.status_widget.update_progress(70)
-            QApplication.processEvents()
 
             # Restore event markers for this file if they exist
             self._restore_event_markers_for_file(file_path)
@@ -1456,7 +1490,8 @@ class MainWindow(QMainWindow):
 
             # Refresh current view (this computes spectrogram - has its own progress)
             # IMPORTANT: This must happen BEFORE refreshing annotations so canvas has valid data
-            self.refresh_current_view()
+            # FORCE_FULL: Ensure we load the whole file view initially, not a stale partial region
+            self.refresh_current_view(force_full=True)
 
             # Now refresh annotation display AFTER spectrogram is computed
             # This ensures annotations are rendered on a valid canvas
@@ -5231,15 +5266,19 @@ class MainWindow(QMainWindow):
     def on_event_mode_toggled_from_canvas(self, enabled: bool):
         """Handle event mode toggle from E key press on canvas.
 
-        Shows/hides the event panel and syncs panel toggle button.
+        Shows/hides the right sidebar and syncs panel toggle button.
         """
-        if hasattr(self, 'event_panel'):
+        if hasattr(self, 'right_sidebar'):
             if enabled:
-                self.event_panel.show()
-                self.event_panel.mode_btn.setChecked(True)
+                self.right_sidebar.show()
+                # Ensure Events tab is selected
+                self.right_sidebar.setCurrentIndex(0)
+                if hasattr(self, 'event_panel'):
+                    self.event_panel.mode_btn.setChecked(True)
             else:
-                self.event_panel.hide()
-                self.event_panel.mode_btn.setChecked(False)
+                self.right_sidebar.hide()
+                if hasattr(self, 'event_panel'):
+                    self.event_panel.mode_btn.setChecked(False)
 
             # Sync menu action checkbox
             if hasattr(self, 'toggle_event_panel_action'):
@@ -5248,26 +5287,68 @@ class MainWindow(QMainWindow):
             if enabled:
                 self.statusBar().showMessage("Event Mode: Click to place start line")
             else:
-                self.statusBar().showMessage("Event Mode disabled")
+                self.statusBar().showMessage("Side panel hidden")
 
     def toggle_event_panel(self):
-        """Toggle the event panel visibility."""
-        if hasattr(self, 'event_panel'):
-            is_visible = self.event_panel.isVisible()
+        """Toggle the right sidebar visibility."""
+        if hasattr(self, 'right_sidebar'):
+            is_visible = self.right_sidebar.isVisible()
             if is_visible:
-                self.event_panel.hide()
+                self.right_sidebar.hide()
                 if hasattr(self, 'spectrogram_canvas'):
                     self.spectrogram_canvas.set_event_mode(False)
                 if hasattr(self, 'toggle_event_panel_action'):
                     self.toggle_event_panel_action.setChecked(False)
-                self.statusBar().showMessage("Event Mode disabled")
+                self.statusBar().showMessage("Side panel hidden")
             else:
-                self.event_panel.show()
-                if hasattr(self, 'spectrogram_canvas'):
+                self.right_sidebar.show()
+                # If Events tab is active, enable event mode
+                if self.right_sidebar.currentIndex() == 0 and hasattr(self, 'spectrogram_canvas'):
                     self.spectrogram_canvas.set_event_mode(True)
                 if hasattr(self, 'toggle_event_panel_action'):
                     self.toggle_event_panel_action.setChecked(True)
-                self.statusBar().showMessage("Event Mode: Click to place start line")
+                
+                # Auto-refresh global annotations when showing search tab
+                if self.right_sidebar.currentIndex() == 1:
+                    self._refresh_global_annotations()
+                    
+                self.statusBar().showMessage("Side panel shown")
+
+    def _refresh_global_annotations(self):
+        """Refresh the global annotation list."""
+        if hasattr(self, 'global_ann_panel'):
+            root_dir = None
+            if self.current_file:
+                root_dir = os.path.dirname(self.current_file)
+            elif self.project_manager.is_project_loaded():
+                root_dir = str(self.project_manager.project_path)
+            
+            if root_dir:
+                self.global_ann_panel.refresh_list(root_dir)
+
+    def on_global_jump_requested(self, file_path, t_start, t_end, f_min, f_max):
+        """Handle jump request from global annotation list."""
+        logger.info(f"Global jump requested: {file_path} at t={t_start:.2f}s")
+        
+        # 1. Load file if different
+        if file_path != self.current_file:
+            self.load_audio_file(file_path)
+            
+        # 2. Zoom to annotation region (with some padding)
+        if hasattr(self, 'spectrogram_canvas'):
+            dt = max(0.5, (t_end - t_start) * 2.0)
+            df = max(100, (f_max - f_min) * 2.0)
+            t_center = (t_start + t_end) / 2
+            f_center = (f_min + f_max) / 2
+            
+            self.spectrogram_canvas.view.camera.rect = (
+                t_center - dt/2, 
+                f_center - df/2, 
+                dt, 
+                df
+            )
+            self.spectrogram_canvas.update()
+            self.statusBar().showMessage(f"Jumped to annotation in {os.path.basename(file_path)}")
 
     def on_event_region_marked(self, t_start: float, t_end: float):
         """Handle when user marks an event region with two vertical lines.

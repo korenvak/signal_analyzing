@@ -226,6 +226,11 @@ class TiledImageRenderer:
 class VisPyCanvas(scene.SceneCanvas):
     """Custom VisPy canvas for audio visualization with proper axes."""
     
+    # Signals
+    on_zoom_undo_available = Signal(bool)
+    on_zoom_redo_available = Signal(bool)
+    spectrum_slice_requested = Signal(np.ndarray, np.ndarray, float)  # power_db, freqs, time
+    
     def __init__(self, view_type: str, parent=None):
         if not HAS_VISPY:
             raise RuntimeError("VisPy not available")
@@ -332,7 +337,7 @@ class VisPyCanvas(scene.SceneCanvas):
         self._zoom_end_timer.setSingleShot(True)
         self._zoom_end_timer.timeout.connect(self._on_zoom_ended)
         self.last_mouse_pos = None
-        self.pan_speed = 1.0
+        self.pan_speed = 1.2  # Slightly faster pan for better feel (was 1.0)
         
         # Crosshair visuals
         self.crosshair_v = scene.visuals.Line(color=(0.5, 0.3, 0.9, 0.8), width=1.5, parent=self.view.scene)
@@ -401,6 +406,13 @@ class VisPyCanvas(scene.SceneCanvas):
         self.curve_markers.order = 200  # On top
         self.curve_markers.set_gl_state('translucent', depth_test=False)
         
+        # Curve ghost line (preview for next point)
+        self.curve_ghost = scene.visuals.Line(parent=self.view.scene, method='gl')
+        self.curve_ghost.set_data(color=(0.5, 1.0, 1.0, 0.5), width=1.5)
+        self.curve_ghost.visible = False
+        self.curve_ghost.order = 140  # Below actual curve
+        self.curve_ghost.set_gl_state('translucent', depth_test=False)
+        
         self._on_curve_updated_callback = None  # Callback(points) when curve changes
         self._on_curve_completed_callback = None  # Callback(points) when Enter pressed when curve changes
         self._on_curve_completed_callback = None  # Callback(points) when user presses Enter
@@ -449,7 +461,7 @@ class VisPyCanvas(scene.SceneCanvas):
 
         # Zoom history for undo (Ctrl+Z or Backspace)
         self.zoom_history = []  # Stack of (x, y, width, height) tuples
-        self.zoom_history_max = 20  # Maximum history size
+        self.zoom_history_max = 50  # Increased from 20 for better undo history
         self.zoom_forward_history = []  # For redo (Ctrl+Y)
 
         # Connect events
@@ -479,8 +491,8 @@ class VisPyCanvas(scene.SceneCanvas):
         shift_pressed = any('shift' in s for s in mod_strings)
         ctrl_pressed = any('ctrl' in s or 'control' in s for s in mod_strings)
 
-        # 15% zoom per scroll
-        factor = 1.15 if event.delta[1] > 0 else 0.87
+        # 10% zoom per scroll (reduced from 15% for smoothness)
+        factor = 1.10 if event.delta[1] > 0 else 0.91
 
         if shift_pressed:
             scale_factors = [factor, 1.0]  # Time only
@@ -556,6 +568,16 @@ class VisPyCanvas(scene.SceneCanvas):
         self.zoom_history.clear()
         self.zoom_forward_history.clear()
 
+    def reset_view(self):
+        """Reset view state for new file loading."""
+        self.data_bounds = None
+        self.raw_display_data = None
+        self.display_extent = None
+        self.reset_zoom_history()
+        # Reset camera to a neutral state
+        self.view.camera.rect = (0, 0, 1, 1)
+        self.update()
+
     def zoom_with_center(self, scale_factors, mouse_pos):
         """Zoom with center-based scaling."""
         try:
@@ -582,18 +604,35 @@ class VisPyCanvas(scene.SceneCanvas):
                 time_min, time_max, freq_min, freq_max = self.data_bounds
 
                 max_width = time_max - time_min
-                min_width = max_width / 100
+                min_width = max_width / 1000  # Allow 10x deeper zoom (was 100)
                 new_width = max(min_width, min(new_width, max_width))
 
                 max_height = freq_max - freq_min
-                min_height = max_height / 100
+                min_height = max_height / 1000  # Allow 10x deeper zoom (was 100)
                 new_height = max(min_height, min(new_height, max_height))
 
-            # Zoom around center
-            center_x = current_x + current_width / 2
-            center_y = current_y + current_height / 2
-            new_x = center_x - new_width / 2
-            new_y = center_y - new_height / 2
+            # Zoom around mouse position if provided, else around center
+            if mouse_pos is not None:
+                # Convert screen mouse pos to world relative fraction
+                world_mouse = self._screen_to_world(mouse_pos)
+                if world_mouse:
+                    rel_x = (world_mouse[0] - current_x) / current_width
+                    rel_y = (world_mouse[1] - current_y) / current_height
+                    
+                    new_x = world_mouse[0] - rel_x * new_width
+                    new_y = world_mouse[1] - rel_y * new_height
+                else:
+                    # Fallback to center
+                    center_x = current_x + current_width / 2
+                    center_y = current_y + current_height / 2
+                    new_x = center_x - new_width / 2
+                    new_y = center_y - new_height / 2
+            else:
+                # Zoom around center
+                center_x = current_x + current_width / 2
+                center_y = current_y + current_height / 2
+                new_x = center_x - new_width / 2
+                new_y = center_y - new_height / 2
 
             # Constrain position
             if self.data_bounds:
@@ -762,8 +801,9 @@ class VisPyCanvas(scene.SceneCanvas):
             if self.curve_mode:
                 world_pos = self._screen_to_world(event.pos)
                 if world_pos is not None:
-                    self.add_curve_point(world_pos[0], world_pos[1])
-                    logger.debug(f"Added curve point: t={world_pos[0]:.3f}s, f={world_pos[1]:.1f}Hz (total: {len(self.curve_points)})")
+                    t, f = world_pos
+                    self.add_curve_point(t, f)
+                    logger.debug(f"Added curve point: t={t:.3f}s, f={f:.1f}Hz (total: {len(self.curve_points)})")
                     event.handled = True
                     return
 
@@ -881,7 +921,7 @@ class VisPyCanvas(scene.SceneCanvas):
             self.is_panning = False
             self.last_mouse_pos = None
             event.handled = True
-    
+
     def on_mouse_move(self, event):
         """Handle mouse movement for panning, crosshair, and annotation drawing."""
         if event.pos is None:
@@ -916,6 +956,9 @@ class VisPyCanvas(scene.SceneCanvas):
         if self.is_panning and self.last_mouse_pos is not None:
             try:
                 delta_screen = event.pos - self.last_mouse_pos
+                if np.all(delta_screen == 0):
+                    return
+                    
                 rect = self.view.camera.rect
                 if rect is None:
                     return
@@ -967,6 +1010,31 @@ class VisPyCanvas(scene.SceneCanvas):
                     self.set_crosshair(True, self.mouse_pos)
                     readout = f"Time: {self._format_time(time_pos)}, Freq: {self._format_freq(freq_pos)}"
                     self.update_text_readout(readout, (10, 30))
+                
+                # Emit spectrum slice for magnifier
+                if self.raw_display_data is not None and self.display_extent is not None:
+                    try:
+                        time_start, time_end, freq_start, freq_end = self.display_extent
+                        data = self.raw_display_data
+                        rows, cols = data.shape
+                        
+                        col_idx = int((time_pos - time_start) / (time_end - time_start) * cols)
+                        if 0 <= col_idx < cols:
+                            slice_data = data[:, col_idx]
+                            freq_axis = np.linspace(freq_start, freq_end, rows)
+                            self.spectrum_slice_requested.emit(slice_data, freq_axis, time_pos)
+                    except:
+                        pass
+                
+                # Update curve ghost preview
+                if self.curve_mode and self.curve_points:
+                    # Show line from last point to current mouse
+                    last_pt = self.curve_points[-1]
+                    self.curve_ghost.set_data(pos=np.array([last_pt, (time_pos, freq_pos)], dtype=np.float32))
+                    self.curve_ghost.visible = True
+                else:
+                    self.curve_ghost.visible = False
+                    
         except Exception as e:
             logger.debug(f"Error in mouse move: {e}")
     
@@ -1110,22 +1178,21 @@ class VisPyCanvas(scene.SceneCanvas):
         # Force immediate update instead of waiting for timer
         self._update_dynamic_clim_now()
         self.update()
-        # Process Qt events to ensure display is refreshed
-        QApplication.processEvents()
+        # Removed redundant processEvents to prevent recursive draw errors
 
     def schedule_normalization_update(self):
         """Schedule debounced normalization update.
 
-        Uses longer delay (300ms) to avoid recomputing during active zoom/pan.
+        Uses 150ms delay (reduced from 300ms for responsiveness)
         """
         self.normalization_pending = True
-        self.normalization_timer.start(300)  # Increased from 150ms for smoother interaction
+        self.normalization_timer.start(150)  # Smoother feedback during navigation
 
     def _do_debounced_normalization(self):
         """Perform normalization update (called by timer)."""
         # Skip if user is actively panning or zooming
         if self.is_panning or self.is_zooming:
-            self.normalization_timer.start(300)  # Reschedule
+            self.normalization_timer.start(150)  # Reschedule
             return
         if self.normalization_pending:
             self.normalization_pending = False
@@ -1178,7 +1245,15 @@ class VisPyCanvas(scene.SceneCanvas):
                 row_start = max(0, min(num_rows - 1, row_start))
                 row_end = max(row_start + 1, min(num_rows, row_end))
                 
+                # PERFORMANCE: Subsample visible patch for statistics during active interaction
+                # This makes zooming/panning much smoother on large datasets
                 visible_patch = self.raw_display_data[row_start:row_end, col_start:col_end]
+                
+                # If patch is large, subsample for speed
+                if visible_patch.size > 10000:
+                    step = int(np.sqrt(visible_patch.size / 5000))
+                    visible_patch = visible_patch[::step, ::step]
+                
                 finite_vals = visible_patch[np.isfinite(visible_patch)]
                 if finite_vals.size > 10:
                     if self.normalization_mode == 'std':
@@ -1449,8 +1524,9 @@ class VisPyCanvas(scene.SceneCanvas):
             # Show visual feedback
             self.update_text_readout("CURVE MODE: Click to add points (need 2 min) | Right-click to clear | Enter to finish", (10, 60))
             logger.info("Curve mode: ON (Click to add points, Right-click to clear, Enter to finish)")
-        elif not enabled and was_enabled:
+        el        if not enabled and was_enabled:
             self.update_text_readout("", (10, 60))
+            self.curve_ghost.visible = False
             logger.info("Curve mode: OFF")
 
         # Update mode indicator and canvas
@@ -1491,6 +1567,7 @@ class VisPyCanvas(scene.SceneCanvas):
     def clear_curve(self):
         """Clear the current curve."""
         self.curve_points = []
+        self.curve_ghost.visible = False
         self._update_curve_visuals()
         if self._on_curve_updated_callback:
             self._on_curve_updated_callback([])
@@ -2044,7 +2121,7 @@ class VisPyCanvas(scene.SceneCanvas):
         self._on_annotation_created_callback = on_created
         self._on_annotation_clicked_callback = on_clicked
         self._on_annotation_context_menu_callback = on_context_menu
-    
+
     def _screen_to_world(self, screen_pos) -> Optional[Tuple[float, float]]:
         """Convert screen coordinates to world coordinates (time, frequency).
         
