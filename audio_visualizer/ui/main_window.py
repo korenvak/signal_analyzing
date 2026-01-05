@@ -2495,22 +2495,19 @@ class MainWindow(QMainWindow):
             self.spectrogram_canvas.data_bounds = original_bounds
     
     def on_db_range_changed(self, db_min: float, db_max: float):
-        """Handle dB range changes."""
-        logger.info(f"dB range changed to: [{db_min:.1f}, {db_max:.1f}] dB")
+        """Handle dB range changes - DISPLAY ONLY, no FFT recomputation."""
+        logger.debug(f"dB range changed to: [{db_min:.1f}, {db_max:.1f}] dB")
         
         try:
-            # Update all canvas image visuals with new dB range for color limits
+            # Update canvas display settings only - NO FFT recomputation needed
             if HAS_VISPY:
-                # Convert dB range to normalized range (spectrogram data is normalized 0-1)
-                # This affects the color mapping range
                 if hasattr(self, 'spectrogram_canvas') and self.spectrogram_canvas.image_visual:
                     # Store dB range for use during data normalization
                     self.spectrogram_canvas.db_range = (db_min, db_max)
+                    # Just update the color limits - this is instant
                     self.spectrogram_canvas.update_dynamic_clim()
-                    logger.debug(f"Updated spectrogram dB range to [{db_min:.1f}, {db_max:.1f}]")
-                
-                # Refresh current view to apply new dB range
-                self.refresh_current_view()
+                    # Force visual refresh without recomputing data
+                    self.spectrogram_canvas.update()
                 
         except Exception as e:
             logger.error(f"Error updating dB range: {e}")
@@ -2685,9 +2682,7 @@ class MainWindow(QMainWindow):
         # TODO: Implement log and mel scale transformations
         # For now, just store the setting - full implementation requires
         # transforming the frequency axis display
-        
-        if self.current_file:
-            self.refresh_current_view()
+        # NOTE: No recomputation needed - this is just a display transform
     
     def set_auto_db_range(self, auto: bool):
         """Set automatic dB range adjustment.

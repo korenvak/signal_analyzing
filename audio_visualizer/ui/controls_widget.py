@@ -1,14 +1,15 @@
 """
 Controls widget for spectrogram settings.
+Includes debouncing for smooth performance.
 """
 from .qt_compat import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
                         QComboBox, QPushButton, QFrame, QToolButton,
                         QMenu, QWidgetAction, QSlider, QSizePolicy,
-                        Qt, Signal)
+                        Qt, Signal, QTimer)
 
 
 class ControlsWidget(QWidget):
-    """Widget containing analysis controls."""
+    """Widget containing analysis controls with debounced signals."""
     
     # Signals
     parameters_changed = Signal(dict)
@@ -23,6 +24,27 @@ class ControlsWidget(QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        
+        # Debounce timers for smooth performance
+        self._db_range_timer = QTimer()
+        self._db_range_timer.setSingleShot(True)
+        self._db_range_timer.setInterval(100)  # 100ms debounce for dB sliders
+        self._db_range_timer.timeout.connect(self._emit_db_range)
+        
+        self._gamma_timer = QTimer()
+        self._gamma_timer.setSingleShot(True)
+        self._gamma_timer.setInterval(50)  # 50ms debounce for gamma (faster response)
+        self._gamma_timer.timeout.connect(self._emit_gamma)
+        
+        self._fft_params_timer = QTimer()
+        self._fft_params_timer.setSingleShot(True)
+        self._fft_params_timer.setInterval(300)  # 300ms debounce for FFT params (heavy computation)
+        self._fft_params_timer.timeout.connect(self._emit_parameters)
+        
+        # Pending values for debounced signals
+        self._pending_db_range = None
+        self._pending_gamma = None
+        
         self.setup_ui()
         self.connect_signals()
     
@@ -289,23 +311,50 @@ class ControlsWidget(QWidget):
         return group
     
     def connect_signals(self):
-        """Connect widget signals."""
-        self.fft_size_combo.currentTextChanged.connect(self.emit_parameters_changed)
-        self.overlap_combo.currentTextChanged.connect(self.emit_parameters_changed)
+        """Connect widget signals with debouncing for performance."""
+        # FFT params use debouncing (heavy computation)
+        self.fft_size_combo.currentTextChanged.connect(self._schedule_parameters_emit)
+        self.overlap_combo.currentTextChanged.connect(self._schedule_parameters_emit)
         self.window_combo.currentTextChanged.connect(self.on_window_changed)
+        
+        # Display settings - instant response
         self.colormap_combo.currentTextChanged.connect(self.on_colormap_changed_realtime)
         self.invert_colormap.toggled.connect(self.on_colormap_invert_toggled)
-        self.db_min_slider.valueChanged.connect(self.update_db_range_realtime)
-        self.db_max_slider.valueChanged.connect(self.update_db_range_realtime)
+        
+        # dB sliders - debounced
+        self.db_min_slider.valueChanged.connect(self._schedule_db_range_emit)
+        self.db_max_slider.valueChanged.connect(self._schedule_db_range_emit)
         self.auto_db_range.toggled.connect(self.on_auto_db_toggled)
+        
+        # Other display settings - instant
         self.interpolation_combo.currentTextChanged.connect(self.on_interpolation_changed)
         self.freq_scale_combo.currentTextChanged.connect(self.on_freq_scale_changed)
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         self.normalization_combo.currentTextChanged.connect(self.on_normalization_mode_changed)
-        self.gamma_slider.valueChanged.connect(self.on_gamma_changed)
+        
+        # Gamma slider - debounced
+        self.gamma_slider.valueChanged.connect(self._schedule_gamma_emit)
+    
+    def _schedule_parameters_emit(self):
+        """Schedule debounced FFT parameters emit."""
+        self._fft_params_timer.start()
+    
+    def _emit_parameters(self):
+        """Actually emit the parameters after debounce delay."""
+        fft_size = int(self.fft_size_combo.currentText())
+        overlap_str = self.overlap_combo.currentText().replace('%', '')
+        overlap_pct = float(overlap_str) / 100.0
+        hop_length = max(1, int(fft_size * (1.0 - overlap_pct)))
+        
+        params = {
+            'fft_size': fft_size,
+            'hop_length': hop_length,
+            'window_type': self.window_combo.currentText()
+        }
+        self.parameters_changed.emit(params)
 
     def emit_parameters_changed(self):
-        """Emit parameters changed signal."""
+        """Emit parameters changed signal (immediate - for programmatic use)."""
         fft_size = int(self.fft_size_combo.currentText())
         
         overlap_str = self.overlap_combo.currentText().replace('%', '')
@@ -347,8 +396,39 @@ class ControlsWidget(QWidget):
         self.db_min_slider.setEnabled(not auto)
         self.db_max_slider.setEnabled(not auto)
     
+    def _schedule_db_range_emit(self):
+        """Schedule debounced dB range update."""
+        db_min = self.db_min_slider.value()
+        db_max = self.db_max_slider.value()
+        
+        # Validate range immediately for visual feedback
+        if db_min >= db_max:
+            if self.sender() == self.db_min_slider:
+                db_max = db_min + 10
+                self.db_max_slider.blockSignals(True)
+                self.db_max_slider.setValue(db_max)
+                self.db_max_slider.blockSignals(False)
+            else:
+                db_min = db_max - 10
+                self.db_min_slider.blockSignals(True)
+                self.db_min_slider.setValue(db_min)
+                self.db_min_slider.blockSignals(False)
+        
+        # Update labels immediately for visual feedback
+        self.db_min_label.setText(f"{db_min} dB")
+        self.db_max_label.setText(f"{db_max} dB")
+        
+        # Store pending values and schedule emit
+        self._pending_db_range = (float(db_min), float(db_max))
+        self._db_range_timer.start()
+    
+    def _emit_db_range(self):
+        """Actually emit dB range after debounce delay."""
+        if self._pending_db_range:
+            self.db_range_changed.emit(*self._pending_db_range)
+    
     def update_db_range_realtime(self):
-        """Handle dB range changes."""
+        """Handle dB range changes (legacy - immediate emit)."""
         db_min = self.db_min_slider.value()
         db_max = self.db_max_slider.value()
         
@@ -391,8 +471,22 @@ class ControlsWidget(QWidget):
         mode_text = self.normalization_combo.currentText()
         return 'std' if mode_text == 'STD' else 'minmax'
 
+    def _schedule_gamma_emit(self, value: int):
+        """Schedule debounced gamma update."""
+        gamma = value / 100.0
+        # Update label immediately for visual feedback
+        self.gamma_label.setText(f"{gamma:.2f}")
+        # Store pending value and schedule emit
+        self._pending_gamma = gamma
+        self._gamma_timer.start()
+    
+    def _emit_gamma(self):
+        """Actually emit gamma after debounce delay."""
+        if self._pending_gamma is not None:
+            self.gamma_changed.emit(self._pending_gamma)
+
     def on_gamma_changed(self, value: int):
-        """Handle gamma slider change."""
+        """Handle gamma slider change (legacy - immediate emit)."""
         gamma = value / 100.0
         self.gamma_label.setText(f"{gamma:.2f}")
         self.gamma_changed.emit(gamma)
