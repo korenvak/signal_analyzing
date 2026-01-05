@@ -14,8 +14,94 @@ from .qt_compat import (
     QWidget, QToolBar, QLabel, QPushButton, QFileDialog,
     QMessageBox, QSplitter, QFrame, QSizePolicy, QDialog,
     Qt, QTimer, QAction, QKeySequence, QMenu, QCursor, QTabWidget,
-    QInputDialog
+    QInputDialog, QThread, Signal, QObject
 )
+
+
+class SpectrogramWorker(QObject):
+    """Background worker for spectrogram computation - keeps UI responsive."""
+    
+    # Signals for thread-safe communication
+    finished = Signal(object, object, object)  # magnitude_db, times, extent
+    progress = Signal(int, str)  # progress percent, message
+    error = Signal(str)  # error message
+    
+    def __init__(self, engine, audio_data, fft_params, view_time_range=None):
+        super().__init__()
+        self.engine = engine
+        self.audio_data = audio_data
+        self.fft_params = fft_params
+        self.view_time_range = view_time_range
+        self._cancelled = False
+    
+    def cancel(self):
+        """Request cancellation of computation."""
+        self._cancelled = True
+    
+    def run(self):
+        """Compute spectrogram in background thread."""
+        try:
+            if self._cancelled:
+                return
+            
+            self.progress.emit(10, "Starting FFT computation...")
+            
+            fft_size = self.fft_params.get('fft_size', 4096)
+            hop_length = self.fft_params.get('hop_length', 512)
+            window = self.fft_params.get('window', 'hamming')
+            sample_rate = float(getattr(self.engine, 'sample_rate', 44100))
+            use_gpu = self.fft_params.get('use_gpu', self.engine.use_gpu)
+            
+            if self._cancelled:
+                return
+            
+            self.progress.emit(30, "Computing STFT...")
+            
+            # Use batched FFT engine
+            magnitude_db, times = self.engine.batched_fft_engine.compute_stft_batched(
+                self.audio_data,
+                fft_size=fft_size,
+                hop_length=hop_length,
+                window=window,
+                sample_rate=int(sample_rate),
+                use_gpu=use_gpu
+            )
+            
+            if self._cancelled:
+                return
+            
+            self.progress.emit(70, "Generating frequency axis...")
+            
+            frequencies = np.fft.rfftfreq(fft_size, 1.0 / sample_rate).astype(np.float32)
+            
+            # Calculate extent
+            frame_duration = hop_length / sample_rate if sample_rate > 0 else 0.0
+            
+            if frequencies is not None and len(frequencies) > 0:
+                freq_min = float(np.nanmin(frequencies))
+                freq_max = float(np.nanmax(frequencies))
+            else:
+                freq_min = 0.0
+                freq_max = sample_rate / 2.0
+            
+            time_offset = self.view_time_range[0] if self.view_time_range else 0.0
+            
+            if times is not None and len(times) > 0:
+                time_min = float(np.nanmin(times)) + time_offset
+                time_max = float(np.nanmax(times)) + time_offset + frame_duration
+            else:
+                time_min = time_offset
+                time_max = time_offset + (len(self.audio_data) / sample_rate if sample_rate > 0 else 1.0)
+            
+            extent = (time_min, time_max, freq_min, freq_max)
+            
+            self.progress.emit(90, "Finalizing...")
+            
+            # Emit result
+            self.finished.emit(magnitude_db, times, extent)
+            
+        except Exception as e:
+            self.error.emit(str(e))
 
 try:
     from vispy import scene
@@ -153,6 +239,11 @@ class MainWindow(QMainWindow):
         self.adaptive_manager = get_adaptive_spectrogram_manager(
             sample_rate=self.spectrogram_engine.sample_rate
         )
+        
+        # Background worker management for non-blocking spectrogram computation
+        self._spectrogram_thread = None
+        self._spectrogram_worker = None
+        self._pending_spectrogram_result = None
         
         # Settings state
         self.auto_db_range_enabled = True
@@ -3163,8 +3254,8 @@ class MainWindow(QMainWindow):
             print(f"Cache data is None: {self.spectrogram_cache['data'] is None}")
             print(f"Cache time_range: {self.spectrogram_cache['time_range']}")
             
-            # DISABLED CACHE FOR DEBUGGING - always recompute
-            use_cache = False  # FORCE RECOMPUTE
+            # PERFORMANCE: Use cache when possible to avoid expensive FFT recomputation
+            use_cache = True  # Enable caching for performance
             if use_cache and not preserve_view:
                 cache = self.spectrogram_cache
                 if (cache['data'] is not None and 
@@ -3381,6 +3472,147 @@ class MainWindow(QMainWindow):
         
         self.current_view_range = ((0.0, duration), (0.0, sample_rate / 2))
         self.refresh_current_view()
+    
+    # =========================================================================
+    # Background Spectrogram Computation (Performance Optimization)
+    # =========================================================================
+    
+    def start_background_spectrogram(self, audio_data: np.ndarray, view_time_range: tuple = None):
+        """Start spectrogram computation in background thread - keeps UI responsive.
+        
+        Use this for large audio files to prevent UI freezing.
+        
+        Args:
+            audio_data: Audio samples to process
+            view_time_range: Optional (start, end) time range
+        """
+        # Cancel any existing worker
+        self.cancel_background_spectrogram()
+        
+        # Show progress
+        self.status_widget.show_progress("Computing spectrogram...")
+        self.status_widget.update_progress(5)
+        
+        # Calculate FFT parameters
+        base_fft = self.spectrogram_engine.fft_size
+        base_hop = self.spectrogram_engine.hop_length
+        sample_rate = float(getattr(self.spectrogram_engine, "sample_rate", 44100))
+        
+        # Adaptive hop length for performance
+        n_samples = len(audio_data)
+        max_texture_size = 16384
+        min_hop_for_texture = max(1, n_samples // (max_texture_size - 100))
+        
+        canvas_width = 800
+        if hasattr(self, 'spectrogram_canvas') and self.spectrogram_canvas.native:
+            try:
+                canvas_width = max(400, self.spectrogram_canvas.native.width())
+            except:
+                pass
+        
+        target_frames = canvas_width * 4
+        hop_for_canvas = max(1, n_samples // target_frames)
+        effective_hop = max(min_hop_for_texture, min(base_hop, hop_for_canvas))
+        
+        fft_params = {
+            'fft_size': base_fft,
+            'hop_length': effective_hop,
+            'window': self.spectrogram_engine.window_type,
+            'sample_rate': int(sample_rate),
+            'use_gpu': self.spectrogram_engine.use_gpu
+        }
+        
+        # Create worker and thread
+        self._spectrogram_thread = QThread()
+        self._spectrogram_worker = SpectrogramWorker(
+            self.spectrogram_engine, 
+            audio_data, 
+            fft_params, 
+            view_time_range
+        )
+        
+        # Move worker to thread
+        self._spectrogram_worker.moveToThread(self._spectrogram_thread)
+        
+        # Connect signals
+        self._spectrogram_thread.started.connect(self._spectrogram_worker.run)
+        self._spectrogram_worker.progress.connect(self._on_spectrogram_progress)
+        self._spectrogram_worker.finished.connect(self._on_spectrogram_finished)
+        self._spectrogram_worker.error.connect(self._on_spectrogram_error)
+        self._spectrogram_worker.finished.connect(self._spectrogram_thread.quit)
+        self._spectrogram_worker.error.connect(self._spectrogram_thread.quit)
+        self._spectrogram_thread.finished.connect(self._cleanup_spectrogram_worker)
+        
+        # Start
+        self._spectrogram_thread.start()
+        logger.info(f"Started background spectrogram computation: {n_samples} samples, hop={effective_hop}")
+    
+    def cancel_background_spectrogram(self):
+        """Cancel any running background spectrogram computation."""
+        if self._spectrogram_worker:
+            self._spectrogram_worker.cancel()
+        if self._spectrogram_thread and self._spectrogram_thread.isRunning():
+            self._spectrogram_thread.quit()
+            self._spectrogram_thread.wait(1000)  # Wait up to 1 second
+    
+    def _on_spectrogram_progress(self, percent: int, message: str):
+        """Handle spectrogram computation progress updates."""
+        self.status_widget.update_progress(percent)
+        if message:
+            self.statusBar().showMessage(message)
+    
+    def _on_spectrogram_finished(self, magnitude_db, times, extent):
+        """Handle spectrogram computation completion."""
+        try:
+            if magnitude_db is None or magnitude_db.size == 0:
+                self.status_widget.hide_progress()
+                self.statusBar().showMessage("Spectrogram computation returned empty data")
+                return
+            
+            self.status_widget.update_progress(95)
+            
+            # Update display
+            preserve_view = getattr(self, '_preserve_view_on_update', False)
+            self.spectrogram_canvas.update_image(magnitude_db, extent, preserve_view=preserve_view)
+            
+            # Update cache
+            time_min, time_max, freq_min, freq_max = extent
+            self.spectrogram_cache = {
+                'time_range': (time_min, time_max),
+                'freq_range': (freq_min, freq_max),
+                'fft_size': self.spectrogram_engine.fft_size,
+                'hop_length': self.spectrogram_engine.hop_length,
+                'data': magnitude_db.copy(),
+                'extent': extent
+            }
+            
+            # Update view range
+            self.current_view_range = ((time_min, time_max), (freq_min, freq_max))
+            
+            self.status_widget.hide_progress()
+            frames = magnitude_db.shape[1]
+            self.statusBar().showMessage(f"Spectrogram ready ({frames} frames)")
+            logger.info(f"Background spectrogram completed: {magnitude_db.shape}")
+            
+        except Exception as e:
+            logger.exception(f"Error handling spectrogram result: {e}")
+            self.status_widget.hide_progress()
+            self.statusBar().showMessage(f"Error: {str(e)}")
+    
+    def _on_spectrogram_error(self, error_msg: str):
+        """Handle spectrogram computation error."""
+        self.status_widget.hide_progress()
+        self.statusBar().showMessage(f"Spectrogram error: {error_msg}")
+        logger.error(f"Background spectrogram error: {error_msg}")
+    
+    def _cleanup_spectrogram_worker(self):
+        """Clean up worker after thread finishes."""
+        if self._spectrogram_worker:
+            self._spectrogram_worker.deleteLater()
+            self._spectrogram_worker = None
+        if self._spectrogram_thread:
+            self._spectrogram_thread.deleteLater()
+            self._spectrogram_thread = None
     
     # =========================================================================
     # Filter Application Methods

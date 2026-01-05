@@ -1238,55 +1238,58 @@ class VisPyCanvas(scene.SceneCanvas):
     def _apply_normalized_data(self, clim_min: float, clim_max: float):
         """Normalize and display data with improved perceptual mapping.
 
-        Uses techniques from professional audio visualization tools:
-        - Percentile-based clipping for robustness
-        - Optional gamma correction for better contrast
-        - Adaptive scaling based on visible region
+        PERFORMANCE OPTIMIZED:
+        - Uses in-place operations where possible
+        - Reuses workspace buffer to avoid allocations
+        - Minimizes array copies (2 allocations max instead of 5-6)
         """
         if self.raw_display_data is None:
             logger.warning("_apply_normalized_data: No raw_display_data!")
             return
 
-        logger.info(f"Applying normalized data: clim=[{clim_min:.1f}, {clim_max:.1f}], shape={self.raw_display_data.shape}")
+        logger.debug(f"Applying normalized data: clim=[{clim_min:.1f}, {clim_max:.1f}], shape={self.raw_display_data.shape}")
 
-        # Gamma value for perceptual contrast enhancement (1.0 = linear, <1.0 = brighter mids)
-        # Professional tools like Sonic Visualiser use similar approach
+        # Gamma value for perceptual contrast enhancement
         gamma = getattr(self, 'gamma_correction', 0.85)
+        
+        # PERFORMANCE: Reuse workspace buffer if same shape, otherwise allocate once
+        shape = self.raw_display_data.shape
+        if (self.normalized_display_data is None or 
+            self.normalized_display_data.shape != shape or
+            self.normalized_display_data.dtype != np.float32):
+            # Allocate workspace - this is the ONLY allocation we need
+            self.normalized_display_data = np.empty(shape, dtype=np.float32)
+        
+        normalized = self.normalized_display_data  # Use as workspace (in-place)
 
         if self.normalization_mode == 'std' and self.local_mean_std is not None:
-            # STD-based normalization - better for signals with varying dynamic range
+            # STD-based normalization
             mean, std = self.local_mean_std
             std = max(std, 1e-6)
-
-            # Map using percentile-based bounds instead of raw z-scores
-            # This provides better contrast for audio spectrograms
             lower_bound = mean - self.std_scale * std
             upper_bound = mean + self.std_scale * std
-
-            normalized = (self.raw_display_data - lower_bound) / max(upper_bound - lower_bound, 1e-6)
-            normalized = np.clip(normalized, 0.0, 1.0)
-
-            # Apply gamma correction for better perceptual contrast
-            if gamma != 1.0:
-                normalized = np.power(normalized, gamma)
-
-            normalized = normalized.astype(np.float32)
+            scale = 1.0 / max(upper_bound - lower_bound, 1e-6)
+            
+            # In-place: (data - lower) * scale, clipped to [0,1]
+            np.subtract(self.raw_display_data, lower_bound, out=normalized)
+            np.multiply(normalized, scale, out=normalized)
         else:
-            # Min-Max normalization with improved dynamic range handling
+            # Min-Max normalization
             clim_range = max(clim_max - clim_min, 1e-6)
-            normalized = (self.raw_display_data - clim_min) / clim_range
-            normalized = np.clip(normalized, 0.0, 1.0)
-
-            # Apply gamma correction for better perceptual contrast
-            # This helps bring out subtle details in the spectrogram
-            if gamma != 1.0:
-                normalized = np.power(normalized, gamma)
-
-            normalized = normalized.astype(np.float32)
+            scale = 1.0 / clim_range
+            
+            # In-place: (data - min) * scale
+            np.subtract(self.raw_display_data, clim_min, out=normalized)
+            np.multiply(normalized, scale, out=normalized)
         
-        self.normalized_display_data = normalized
+        # In-place clip to [0, 1]
+        np.clip(normalized, 0.0, 1.0, out=normalized)
         
-        # ALWAYS create fresh transform from display_extent
+        # Apply gamma correction in-place if needed
+        if gamma != 1.0:
+            np.power(normalized, gamma, out=normalized)
+        
+        # Build transform from display_extent
         current_transform = None
         if self.display_extent is not None:
             time_start, time_end, freq_start, freq_end = self.display_extent
@@ -1298,24 +1301,26 @@ class VisPyCanvas(scene.SceneCanvas):
             )
         
         try:
-            # Make a fresh contiguous copy of the data to ensure new memory
-            fresh_data = np.ascontiguousarray(self.normalized_display_data.copy())
+            # PERFORMANCE: Only ensure contiguous if needed (avoid copy if already contiguous)
+            if normalized.flags['C_CONTIGUOUS']:
+                display_data = normalized
+            else:
+                display_data = np.ascontiguousarray(normalized)
 
-            # Simple approach: just use set_data
-            self.image_visual.set_data(fresh_data)
+            # Update image visual
+            self.image_visual.set_data(display_data)
             self.image_visual.clim = (0.0, 1.0)
 
-            # Set transform
             if current_transform is not None:
                 self.image_visual.transform = current_transform
 
-            # Force updates
+            # Force visual updates
             self.image_visual.update()
             self.view.scene.update()
             self.view.update()
             self.update()
 
-            logger.debug(f"Applied normalized data: shape={fresh_data.shape}, gamma={gamma:.2f}")
+            logger.debug(f"Applied normalized data: shape={display_data.shape}, gamma={gamma:.2f}")
         except Exception as e:
             logger.error(f"Error in _apply_normalized_data: {e}", exc_info=True)
     
