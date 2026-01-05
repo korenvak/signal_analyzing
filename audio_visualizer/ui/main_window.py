@@ -1323,31 +1323,9 @@ class MainWindow(QMainWindow):
                 self.save_annotations(silent=True)
                 logger.info(f"Auto-saved {len(self.annotation_manager)} annotations before file switch")
 
-            # Update annotation manager for new file (clears previous annotations)
-            self.annotation_manager.set_file_path(file_path)
-
-            # Clear annotation visuals from canvas and table
-            self.refresh_annotation_display()
-
-            # Auto-load annotations for this file
-            # First try project path, then legacy path
-            annotations_loaded = False
-            if self.project_manager.is_project_loaded():
-                annotations_path = self.project_manager.get_file_annotations_path(Path(file_path).name)
-                if annotations_path and annotations_path.exists():
-                    self.annotation_manager.load_from_file(str(annotations_path))
-                    annotations_loaded = True
-
-            # Try legacy path (next to audio file) if project didn't have annotations
-            if not annotations_loaded:
-                legacy_path = self.annotation_manager.get_json_path()
-                if legacy_path and legacy_path.exists():
-                    self.annotation_manager.load_from_file(str(legacy_path))
-                    annotations_loaded = True
-
-            if annotations_loaded:
-                self.refresh_annotation_display()
-                logger.info(f"Auto-loaded {len(self.annotation_manager)} annotations for {Path(file_path).name}")
+            # Update annotation manager for new file (keep annotations persistent across files)
+            self.annotation_manager.set_file_path(file_path, clear_annotations=False)
+            logger.info(f"Keeping {len(self.annotation_manager)} annotations for file switch")
             
             # Set default normalization mode to STD
             if hasattr(self, 'spectrogram_canvas'):
@@ -1364,7 +1342,13 @@ class MainWindow(QMainWindow):
             self._load_tracks_for_file(file_path)
 
             # Refresh current view (this computes spectrogram - has its own progress)
+            # IMPORTANT: This must happen BEFORE refreshing annotations so canvas has valid data
             self.refresh_current_view()
+
+            # Now refresh annotation display AFTER spectrogram is computed
+            # This ensures annotations are rendered on a valid canvas
+            self.refresh_annotation_display()
+            logger.info(f"Refreshed {len(self.annotation_manager)} annotation visuals after spectrogram load")
 
             # Hide progress bar when done
             self.status_widget.hide_progress()
@@ -1851,10 +1835,9 @@ class MainWindow(QMainWindow):
         if row is None:
             return
         
-        # Read updated values from table
+        # Read updated values from table (View and Curve checkboxes)
         data = self.annotation_table.get_annotation_data_from_row(row)
         if data:
-            annotation.track_label = data.get('track_label', '')
             annotation.is_visible = data.get('is_visible', True)
             annotation.show_doppler_curve = data.get('show_doppler_curve', True)
 
@@ -1869,19 +1852,23 @@ class MainWindow(QMainWindow):
             annotation_id: ID of annotation
             is_visible: New visibility state
         """
+        logger.info(f"on_annotation_visibility_changed: annotation_id={annotation_id}, is_visible={is_visible}")
+        
         annotation = self.annotation_manager.get_annotation(annotation_id)
         if not annotation:
+            logger.warning(f"Annotation {annotation_id} not found in manager")
             return
         
         annotation.is_visible = is_visible
         
-        # Update visual
+        # Update visual in renderer
         if self.annotation_renderer:
             self.annotation_renderer.set_annotation_visible(annotation_id, is_visible)
+        else:
+            logger.warning("No annotation_renderer available")
 
         # Save changes (uses project manager if loaded)
         self.save_annotations(silent=True)
-        logger.info(f"Annotation {annotation_id} visibility: {is_visible}")
     
     def on_doppler_visibility_changed(self, annotation_id: int, show_curve: bool):
         """Handle Doppler curve visibility toggle from table.
@@ -1890,19 +1877,25 @@ class MainWindow(QMainWindow):
             annotation_id: ID of annotation
             show_curve: New visibility state for Doppler curve
         """
+        logger.info(f"on_doppler_visibility_changed: annotation_id={annotation_id}, show_curve={show_curve}")
+        
         annotation = self.annotation_manager.get_annotation(annotation_id)
         if not annotation:
+            logger.warning(f"Annotation {annotation_id} not found in manager")
             return
+        
+        logger.info(f"Annotation {annotation_id} has {len(annotation.points) if annotation.points else 0} points")
         
         annotation.show_doppler_curve = show_curve
         
-        # Update visual
+        # Update visual in renderer
         if self.annotation_renderer:
             self.annotation_renderer.set_doppler_curve_visible(annotation_id, show_curve)
+        else:
+            logger.warning("No annotation_renderer available")
 
         # Save changes (uses project manager if loaded)
         self.save_annotations(silent=True)
-        logger.info(f"Annotation {annotation_id} Doppler curve visibility: {show_curve}")
     
     def select_annotation(self, annotation_id: int):
         """Select an annotation (highlight it).
@@ -2413,8 +2406,26 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error showing dialog: {e}", exc_info=True)
 
-        # If there's a selected annotation, also save the curve to it for Doppler analysis
+        # Save curve to annotation for Doppler analysis
         ann_id = self.annotation_table.get_selected_annotation_id()
+        
+        # If no annotation selected, try to find one that overlaps with the curve
+        if not ann_id and points:
+            # Get curve bounds
+            times = [p[0] for p in points]
+            freqs = [p[1] for p in points]
+            curve_t_min, curve_t_max = min(times), max(times)
+            curve_f_min, curve_f_max = min(freqs), max(freqs)
+            
+            # Find overlapping annotation
+            for ann in self.annotation_manager:
+                if (ann.t_start <= curve_t_max and ann.t_end >= curve_t_min and
+                    ann.f_min <= curve_f_max and ann.f_max >= curve_f_min):
+                    ann_id = ann.id
+                    logger.info(f"Auto-selected annotation {ann_id} based on curve overlap")
+                    self.annotation_table.select_annotation(ann_id)
+                    break
+        
         if ann_id:
             annotation = self.annotation_manager.get_annotation(ann_id)
             if annotation:
@@ -2423,20 +2434,29 @@ class MainWindow(QMainWindow):
                 annotation.show_doppler_curve = True  # Make sure curve is visible
                 logger.info(f"Saved {len(points)} curve points to annotation {ann_id}")
 
-                # Update the Doppler curve visual (regardless of point count)
+                # Update the Doppler curve visual
                 if self.annotation_renderer:
                     self.annotation_renderer.update_doppler_curve(annotation)
 
                 # Automatically calculate Doppler if enough points
                 if len(points) >= 4:
                     self.calculate_doppler_for_annotation(annotation)
-                    self.statusBar().showMessage(f"Doppler analysis complete for annotation #{ann_id}")
+                    self.statusBar().showMessage(f"Curve saved to annotation #{ann_id} - Doppler analysis complete")
+                else:
+                    self.statusBar().showMessage(f"Curve saved to annotation #{ann_id} ({len(points)} points)")
 
                 # Update table to reflect curve state
                 self.annotation_table.update_annotation(annotation)
 
                 # Save to file (uses project manager if loaded)
                 self.save_annotations(silent=True)
+        else:
+            # No annotation to associate with
+            self.statusBar().showMessage(
+                "Curve drawn but not linked to any annotation. "
+                "Select an annotation first, or create one around the curve."
+            )
+            logger.info("Curve drawn but no annotation selected or overlapping to associate it with")
         
     def on_measurement_mode_changed(self, is_on: bool):
         """Handle measurement mode toggle - update status bar."""

@@ -197,10 +197,16 @@ class AnnotationManager:
 
         return None
 
-    def set_file_path(self, file_path: str):
-        """Update the file path (called when loading a new audio file)."""
+    def set_file_path(self, file_path: str, clear_annotations: bool = False):
+        """Update the file path (called when loading a new audio file).
+
+        Args:
+            file_path: Path to the new audio file
+            clear_annotations: If True, clear existing annotations (default: False to persist across files)
+        """
         self.file_path = file_path
-        self.clear()  # Clear annotations when switching files
+        if clear_annotations:
+            self.clear()  # Only clear if explicitly requested
     
     def get_json_path(self) -> Optional[Path]:
         """Get the path to the JSON file for saving/loading annotations.

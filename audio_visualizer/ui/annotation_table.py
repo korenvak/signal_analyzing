@@ -22,14 +22,26 @@ class AnnotationTableWidget(QTableWidget):
     annotation_visibility_changed = Signal(int, bool)  # annotation_id, is_visible
     doppler_visibility_changed = Signal(int, bool)  # annotation_id, show_doppler
     
+    # Column indices (for easy reference)
+    COL_ID = 0
+    COL_FILE = 1
+    COL_T_START = 2
+    COL_T_END = 3
+    COL_F_MIN = 4
+    COL_F_MAX = 5
+    COL_SNR = 6
+    COL_SLOPE = 7
+    COL_VIEW = 8
+    COL_CURVE = 9
+    
     def __init__(self, parent=None):
         """Initialize the annotation table."""
         super().__init__(parent)
         
-        # Setup columns - removed Speed/CPA (unreliable without GPS), added SNR/Slope
+        # Setup columns - removed Label column
         columns = [
             'ID', 'File', 't_start', 't_end', 'f_min', 'f_max',
-            'SNR (dB)', 'Slope (Hz/s)', 'Label', 'View', 'Curve'
+            'SNR (dB)', 'Slope (Hz/s)', 'View', 'Curve'
         ]
         self.setColumnCount(len(columns))
         self.setHorizontalHeaderLabels(columns)
@@ -47,20 +59,19 @@ class AnnotationTableWidget(QTableWidget):
         header.setStretchLastSection(False)
 
         # Set initial column widths (pixels)
-        self.setColumnWidth(0, 40)   # ID
-        self.setColumnWidth(1, 100)  # File
-        self.setColumnWidth(2, 65)   # t_start
-        self.setColumnWidth(3, 65)   # t_end
-        self.setColumnWidth(4, 60)   # f_min
-        self.setColumnWidth(5, 60)   # f_max
-        self.setColumnWidth(6, 65)   # SNR
-        self.setColumnWidth(7, 75)   # Slope
-        self.setColumnWidth(8, 120)  # Label (stretches)
-        self.setColumnWidth(9, 45)   # View
-        self.setColumnWidth(10, 50)  # Curve
+        self.setColumnWidth(self.COL_ID, 40)      # ID
+        self.setColumnWidth(self.COL_FILE, 120)   # File
+        self.setColumnWidth(self.COL_T_START, 70) # t_start
+        self.setColumnWidth(self.COL_T_END, 70)   # t_end
+        self.setColumnWidth(self.COL_F_MIN, 65)   # f_min
+        self.setColumnWidth(self.COL_F_MAX, 65)   # f_max
+        self.setColumnWidth(self.COL_SNR, 70)     # SNR
+        self.setColumnWidth(self.COL_SLOPE, 80)   # Slope
+        self.setColumnWidth(self.COL_VIEW, 50)    # View
+        self.setColumnWidth(self.COL_CURVE, 55)   # Curve
 
-        # Label column should stretch to fill available space
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        # File column should stretch to fill available space
+        header.setSectionResizeMode(self.COL_FILE, QHeaderView.ResizeMode.Stretch)
         
         # Enable context menu
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -70,8 +81,8 @@ class AnnotationTableWidget(QTableWidget):
         self.itemChanged.connect(self.on_item_changed)
         self.itemSelectionChanged.connect(self.on_selection_changed)
         
-        # Track which columns are editable
-        self.editable_columns = {8, 9, 10}  # Label, View, Curve indices
+        # Track which columns are editable (View and Curve checkboxes)
+        self.editable_columns = {self.COL_VIEW, self.COL_CURVE}
         
         # Mapping from row to annotation ID
         self.row_to_id: dict = {}
@@ -109,30 +120,30 @@ class AnnotationTableWidget(QTableWidget):
         # ID (read-only)
         id_item = QTableWidgetItem(str(annotation.id))
         id_item.setFlags(id_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, 0, id_item)
+        self.setItem(row, self.COL_ID, id_item)
         
         # File name (read-only)
         name_item = QTableWidgetItem(annotation.file_name)
         name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, 1, name_item)
+        self.setItem(row, self.COL_FILE, name_item)
         
         # Time range (read-only)
         t_start_item = QTableWidgetItem(f"{annotation.t_start:.3f}")
         t_start_item.setFlags(t_start_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, 2, t_start_item)
+        self.setItem(row, self.COL_T_START, t_start_item)
         
         t_end_item = QTableWidgetItem(f"{annotation.t_end:.3f}")
         t_end_item.setFlags(t_end_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, 3, t_end_item)
+        self.setItem(row, self.COL_T_END, t_end_item)
         
         # Frequency range (read-only)
         f_min_item = QTableWidgetItem(f"{annotation.f_min:.1f}")
         f_min_item.setFlags(f_min_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, 4, f_min_item)
+        self.setItem(row, self.COL_F_MIN, f_min_item)
         
         f_max_item = QTableWidgetItem(f"{annotation.f_max:.1f}")
         f_max_item.setFlags(f_max_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, 5, f_max_item)
+        self.setItem(row, self.COL_F_MAX, f_max_item)
         
         # SNR (dB) (read-only, from track analysis)
         snr_text = ""
@@ -140,7 +151,7 @@ class AnnotationTableWidget(QTableWidget):
             snr_text = f"{annotation.snr_db:.1f}"
         snr_item = QTableWidgetItem(snr_text)
         snr_item.setFlags(snr_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, 6, snr_item)
+        self.setItem(row, self.COL_SNR, snr_item)
         
         # Slope (Hz/s) (read-only, from track analysis)
         slope_text = ""
@@ -148,29 +159,27 @@ class AnnotationTableWidget(QTableWidget):
             slope_text = f"{annotation.slope_hz_per_sec:.1f}"
         slope_item = QTableWidgetItem(slope_text)
         slope_item.setFlags(slope_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, 7, slope_item)
+        self.setItem(row, self.COL_SLOPE, slope_item)
         
-        # Label (editable)
-        label_item = QTableWidgetItem(annotation.track_label)
-        label_item.setFlags(label_item.flags() | Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, 8, label_item)
-        
-        # View checkbox (show/hide annotation) - replaces Approved
+        # View checkbox (show/hide annotation rectangle) - always enabled
         view_item = QTableWidgetItem()
         view_item.setCheckState(Qt.CheckState.Checked if annotation.is_visible else Qt.CheckState.Unchecked)
-        view_item.setFlags(view_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        self.setItem(row, 9, view_item)
+        view_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+        self.setItem(row, self.COL_VIEW, view_item)
         
         # Curve checkbox (show/hide Doppler curve)
+        # Only enabled if annotation has curve points
         curve_item = QTableWidgetItem()
         has_curve = bool(annotation.points)
         curve_item.setCheckState(Qt.CheckState.Checked if annotation.show_doppler_curve and has_curve else Qt.CheckState.Unchecked)
-        # Only enable if annotation has Doppler points
         if has_curve:
-            curve_item.setFlags(curve_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            curve_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+            curve_item.setToolTip(f"Toggle curve visibility ({len(annotation.points)} points)")
         else:
-            curve_item.setFlags(curve_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
-        self.setItem(row, 10, curve_item)
+            # Disabled - no curve points
+            curve_item.setFlags(Qt.ItemFlag.ItemIsSelectable)
+            curve_item.setToolTip("No curve drawn. Select this annotation, then draw a curve to enable.")
+        self.setItem(row, self.COL_CURVE, curve_item)
     
     def remove_annotation(self, annotation_id: int) -> bool:
         """Remove an annotation row from the table.
@@ -281,13 +290,15 @@ class AnnotationTableWidget(QTableWidget):
         col = item.column()
         
         # Handle visibility toggle (View column)
-        if col == 9:
+        if col == self.COL_VIEW:
             is_visible = item.checkState() == Qt.CheckState.Checked
+            logger.debug(f"View checkbox changed for annotation {annotation_id}: {is_visible}")
             self.annotation_visibility_changed.emit(annotation_id, is_visible)
         
         # Handle Doppler curve visibility toggle (Curve column)
-        elif col == 10:
+        elif col == self.COL_CURVE:
             show_curve = item.checkState() == Qt.CheckState.Checked
+            logger.debug(f"Curve checkbox changed for annotation {annotation_id}: {show_curve}")
             self.doppler_visibility_changed.emit(annotation_id, show_curve)
         
         # Emit general update signal for other changes
@@ -345,16 +356,13 @@ class AnnotationTableWidget(QTableWidget):
             return None
         
         try:
-            label = self.item(row, 8).text() if self.item(row, 8) else ""
-            is_visible = self.item(row, 9).checkState() == Qt.CheckState.Checked
-            show_doppler_curve = self.item(row, 10).checkState() == Qt.CheckState.Checked
+            is_visible = self.item(row, self.COL_VIEW).checkState() == Qt.CheckState.Checked
+            show_doppler_curve = self.item(row, self.COL_CURVE).checkState() == Qt.CheckState.Checked
             
             return {
-                'track_label': label,
                 'is_visible': is_visible,
                 'show_doppler_curve': show_doppler_curve
             }
         except (ValueError, AttributeError) as e:
             logger.error(f"Error reading annotation data from row {row}: {e}")
             return None
-

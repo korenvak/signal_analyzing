@@ -33,6 +33,9 @@ class AnnotationRenderer:
         self.annotations: Dict[int, dict] = {}  # annotation_id -> {rect, ridge, doppler_curve, doppler_markers, ...}
         self.ridges: Dict[int, dict] = {}  # annotation_id -> ridge visual info
         
+        # Store annotation references for visibility updates
+        self._annotation_refs: Dict[int, Annotation] = {}
+        
         # Temporary rectangle for drawing
         self.temp_border = None
         self.temp_fill = None
@@ -95,6 +98,8 @@ class AnnotationRenderer:
     def create_doppler_curve_visuals(self, annotation: Annotation) -> Dict:
         """Create Doppler curve visuals (line + markers) for an annotation.
         
+        Uses PCHIP (monotone cubic) interpolation for smooth curves, same as curve mode.
+        
         Args:
             annotation: The annotation with Doppler curve points
         
@@ -102,18 +107,52 @@ class AnnotationRenderer:
             Dictionary with 'doppler_curve' and 'doppler_markers' visuals
         """
         if not HAS_VISPY or not annotation.points:
+            logger.debug(f"No points for annotation {annotation.id}, skipping curve creation")
             return {}
         
+        logger.info(f"Creating doppler curve for annotation {annotation.id} with {len(annotation.points)} points")
         points = np.array(annotation.points)
         
-        # Create curve line
+        # Apply PCHIP monotone cubic interpolation for smooth curve (same as curve mode)
+        smooth_curve = points  # Default to raw points
+        if len(points) >= 2:
+            try:
+                from scipy.interpolate import PchipInterpolator
+                
+                # Sort by time
+                sorted_indices = np.argsort(points[:, 0])
+                times = points[sorted_indices, 0]
+                freqs = points[sorted_indices, 1]
+                
+                # Remove duplicate times (required for interpolation)
+                unique_indices = np.where(np.diff(times, prepend=times[0]-1) > 0)[0]
+                if len(unique_indices) > 1:
+                    times = times[unique_indices]
+                    freqs = freqs[unique_indices]
+                
+                if len(times) >= 2:
+                    # Create PCHIP interpolator (monotone cubic - no oscillations)
+                    interpolator = PchipInterpolator(times, freqs)
+                    
+                    # Generate smooth curve with many points
+                    t_min, t_max = times[0], times[-1]
+                    t_smooth = np.linspace(t_min, t_max, max(100, len(points) * 10))
+                    f_smooth = interpolator(t_smooth)
+                    
+                    smooth_curve = np.column_stack((t_smooth, f_smooth))
+                    logger.debug(f"PCHIP interpolation: {len(points)} points -> {len(t_smooth)} smooth points")
+            except ImportError:
+                logger.debug("scipy.interpolate.PchipInterpolator not available, using linear")
+            except Exception as e:
+                logger.debug(f"PCHIP interpolation failed: {e}, using linear")
+        
+        # Create curve line with smooth interpolated points
         curve = scene.visuals.Line(parent=self.view.scene, method='gl')
-        curve.set_data(pos=points, color='cyan', width=2.5)
+        curve.set_data(pos=smooth_curve, color='cyan', width=2.5)
         curve.order = 120  # Above rectangle but below markers
         curve.set_gl_state('translucent', depth_test=False)
-        curve.visible = annotation.show_doppler_curve and annotation.is_visible
         
-        # Create markers for points
+        # Create markers for the ORIGINAL control points (not interpolated)
         markers = scene.visuals.Markers(parent=self.view.scene)
         markers.set_data(
             pos=points,
@@ -124,7 +163,6 @@ class AnnotationRenderer:
         )
         markers.order = 130  # On top of curve
         markers.set_gl_state('translucent', depth_test=False)
-        markers.visible = annotation.show_doppler_curve and annotation.is_visible
         
         return {'doppler_curve': curve, 'doppler_markers': markers}
     
@@ -135,22 +173,40 @@ class AnnotationRenderer:
             annotation: The annotation to display
             is_selected: Whether this annotation is selected
         """
+        logger.debug(f"Adding annotation {annotation.id} to renderer (points={len(annotation.points) if annotation.points else 0}, "
+                    f"is_visible={annotation.is_visible}, show_doppler={annotation.show_doppler_curve})")
+        
         if annotation.id in self.annotations:
             self.remove_annotation(annotation.id)
         
         visuals = self.create_rectangle_visuals(annotation, is_selected)
         
+        # Store annotation reference for later visibility updates
+        self._annotation_refs[annotation.id] = annotation
+        
         # Add Doppler curve if annotation has points
         if annotation.points:
             doppler_visuals = self.create_doppler_curve_visuals(annotation)
             visuals.update(doppler_visuals)
+            logger.info(f"Added doppler curve for annotation {annotation.id}")
         
-        # Apply visibility settings
+        # Apply visibility settings from annotation data
+        rect_visible = annotation.is_visible
+        curve_visible = annotation.is_visible and annotation.show_doppler_curve
+        
         if visuals.get('rect'):
-            visuals['rect'].visible = annotation.is_visible
+            visuals['rect'].visible = rect_visible
+        if visuals.get('doppler_curve'):
+            visuals['doppler_curve'].visible = curve_visible
+            logger.debug(f"Curve visibility set to {curve_visible} for annotation {annotation.id}")
+        if visuals.get('doppler_markers'):
+            visuals['doppler_markers'].visible = curve_visible
         
         self.annotations[annotation.id] = visuals
         annotation.graphics_handle = visuals
+        
+        # Force canvas update
+        self._update_canvas()
     
     def remove_annotation(self, annotation_id: int):
         """Remove an annotation rectangle and Doppler curve from the display.
@@ -190,9 +246,12 @@ class AnnotationRenderer:
             
             del self.annotations[annotation_id]
             
+            # Remove annotation reference
+            if annotation_id in self._annotation_refs:
+                del self._annotation_refs[annotation_id]
+            
             # Force canvas update to ensure visual removal
-            if hasattr(self.view, 'canvas'):
-                self.view.canvas.update()
+            self._update_canvas()
             
             logger.debug(f"Removed visual for annotation {annotation_id}")
     
@@ -281,6 +340,7 @@ class AnnotationRenderer:
         annotation_ids = list(self.annotations.keys())
         for ann_id in annotation_ids:
             self.remove_annotation(ann_id)
+        self._annotation_refs.clear()
     
     def show_temp_rectangle(self, t_start: float, t_end: float, 
                             f_min: float, f_max: float):
@@ -360,23 +420,38 @@ class AnnotationRenderer:
                 visuals['doppler_markers'].visible = visible
     
     def set_annotation_visible(self, annotation_id: int, visible: bool):
-        """Set visibility of a specific annotation (rectangle + Doppler curve).
+        """Set visibility of a specific annotation (rectangle + Doppler curve based on curve flag).
         
         Args:
             annotation_id: ID of the annotation
-            visible: Whether to show or hide
+            visible: Whether to show or hide the annotation
         """
-        if annotation_id in self.annotations:
-            visuals = self.annotations[annotation_id]
-            if visuals.get('rect'):
-                visuals['rect'].visible = visible
-            if visuals.get('doppler_curve'):
-                visuals['doppler_curve'].visible = visible
-            if visuals.get('doppler_markers'):
-                visuals['doppler_markers'].visible = visible
+        logger.info(f"set_annotation_visible called: annotation_id={annotation_id}, visible={visible}")
+        
+        if annotation_id not in self.annotations:
+            logger.warning(f"Annotation {annotation_id} not found in renderer")
+            return
+        
+        visuals = self.annotations[annotation_id]
+        annotation = self._annotation_refs.get(annotation_id)
+        
+        # Update rectangle visibility
+        if visuals.get('rect'):
+            visuals['rect'].visible = visible
+        
+        # Update curve visibility based on both is_visible and show_doppler_curve
+        if annotation:
+            curve_visible = visible and annotation.show_doppler_curve
+        else:
+            curve_visible = visible
             
-            if hasattr(self.view, 'canvas'):
-                self.view.canvas.update()
+        if visuals.get('doppler_curve'):
+            visuals['doppler_curve'].visible = curve_visible
+            logger.debug(f"Set doppler_curve.visible = {curve_visible}")
+        if visuals.get('doppler_markers'):
+            visuals['doppler_markers'].visible = curve_visible
+        
+        self._update_canvas()
     
     def set_doppler_curve_visible(self, annotation_id: int, visible: bool):
         """Set visibility of just the Doppler curve for an annotation.
@@ -385,15 +460,34 @@ class AnnotationRenderer:
             annotation_id: ID of the annotation
             visible: Whether to show or hide the Doppler curve
         """
-        if annotation_id in self.annotations:
-            visuals = self.annotations[annotation_id]
-            if visuals.get('doppler_curve'):
-                visuals['doppler_curve'].visible = visible
-            if visuals.get('doppler_markers'):
-                visuals['doppler_markers'].visible = visible
+        logger.info(f"set_doppler_curve_visible called: annotation_id={annotation_id}, visible={visible}")
+        
+        if annotation_id not in self.annotations:
+            logger.warning(f"Annotation {annotation_id} not found in renderer (known ids: {list(self.annotations.keys())})")
+            return
+        
+        visuals = self.annotations[annotation_id]
+        annotation = self._annotation_refs.get(annotation_id)
+        
+        # Check if annotation is visible - curve should only show if annotation is also visible
+        is_annotation_visible = True
+        if annotation:
+            is_annotation_visible = annotation.is_visible
+        
+        final_visibility = visible and is_annotation_visible
+        
+        if visuals.get('doppler_curve'):
+            visuals['doppler_curve'].visible = final_visibility
+            logger.info(f"Set doppler_curve.visible = {final_visibility} (annotation_visible={is_annotation_visible}, show_curve={visible})")
+        else:
+            logger.warning(f"No doppler_curve visual found for annotation {annotation_id}")
             
-            if hasattr(self.view, 'canvas'):
-                self.view.canvas.update()
+        if visuals.get('doppler_markers'):
+            visuals['doppler_markers'].visible = final_visibility
+        else:
+            logger.warning(f"No doppler_markers visual found for annotation {annotation_id}")
+        
+        self._update_canvas()
     
     def update_doppler_curve(self, annotation: Annotation):
         """Update or add the Doppler curve for an annotation.
@@ -421,7 +515,20 @@ class AnnotationRenderer:
         if annotation.points:
             doppler_visuals = self.create_doppler_curve_visuals(annotation)
             visuals.update(doppler_visuals)
+            
+            # Apply visibility based on annotation settings
+            curve_visible = annotation.is_visible and annotation.show_doppler_curve
+            if visuals.get('doppler_curve'):
+                visuals['doppler_curve'].visible = curve_visible
+            if visuals.get('doppler_markers'):
+                visuals['doppler_markers'].visible = curve_visible
         
-        if hasattr(self.view, 'canvas'):
+        # Update annotation reference
+        self._annotation_refs[annotation.id] = annotation
+        
+        self._update_canvas()
+    
+    def _update_canvas(self):
+        """Force canvas update."""
+        if hasattr(self.view, 'canvas') and self.view.canvas:
             self.view.canvas.update()
-
