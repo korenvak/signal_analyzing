@@ -1524,7 +1524,7 @@ class VisPyCanvas(scene.SceneCanvas):
             # Show visual feedback
             self.update_text_readout("CURVE MODE: Click to add points (need 2 min) | Right-click to clear | Enter to finish", (10, 60))
             logger.info("Curve mode: ON (Click to add points, Right-click to clear, Enter to finish)")
-        el        if not enabled and was_enabled:
+        elif not enabled and was_enabled:
             self.update_text_readout("", (10, 60))
             self.curve_ghost.visible = False
             logger.info("Curve mode: OFF")
