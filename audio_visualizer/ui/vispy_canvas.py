@@ -1244,7 +1244,8 @@ class VisPyCanvas(scene.SceneCanvas):
         - Minimizes array copies (2 allocations max instead of 5-6)
         """
         if self.raw_display_data is None:
-            logger.warning("_apply_normalized_data: No raw_display_data!")
+            # This can happen during file transitions - not an error
+            logger.debug("_apply_normalized_data: No raw_display_data (file transition in progress)")
             return
 
         logger.debug(f"Applying normalized data: clim=[{clim_min:.1f}, {clim_max:.1f}], shape={self.raw_display_data.shape}")

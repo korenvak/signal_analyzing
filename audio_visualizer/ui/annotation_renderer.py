@@ -146,16 +146,36 @@ class AnnotationRenderer:
             except Exception as e:
                 logger.debug(f"PCHIP interpolation failed: {e}, using linear")
         
+        # Validate smooth_curve data - must have valid finite values
+        if not np.all(np.isfinite(smooth_curve)):
+            logger.warning(f"smooth_curve contains NaN/Inf values, filtering them out")
+            valid_mask = np.all(np.isfinite(smooth_curve), axis=1)
+            smooth_curve = smooth_curve[valid_mask]
+            if len(smooth_curve) < 2:
+                logger.warning("Not enough valid points for doppler curve after filtering")
+                return {}
+        
+        # Ensure at least 2 points for a valid line
+        if len(smooth_curve) < 2:
+            logger.warning(f"Not enough points for doppler curve: {len(smooth_curve)}")
+            return {}
+        
         # Create curve line with smooth interpolated points
         curve = scene.visuals.Line(parent=self.view.scene, method='gl')
-        curve.set_data(pos=smooth_curve, color='cyan', width=2.5)
+        curve.set_data(pos=smooth_curve.astype(np.float32), color='cyan', width=2.5)
         curve.order = 120  # Above rectangle but below markers
         curve.set_gl_state('translucent', depth_test=False)
+        
+        # Validate points data for markers
+        valid_points = points[np.all(np.isfinite(points), axis=1)] if len(points) > 0 else points
+        if len(valid_points) == 0:
+            logger.warning("No valid points for markers")
+            return {'doppler_curve': curve, 'doppler_markers': None}
         
         # Create markers for the ORIGINAL control points (not interpolated)
         markers = scene.visuals.Markers(parent=self.view.scene)
         markers.set_data(
-            pos=points,
+            pos=valid_points.astype(np.float32),
             face_color=(0, 1, 1, 0.8),  # Cyan
             edge_color='white',
             size=10,
@@ -208,52 +228,94 @@ class AnnotationRenderer:
         # Force canvas update
         self._update_canvas()
     
+    def _remove_annotation_visuals(self, annotation_id: int):
+        """Internal method to remove annotation visuals without canvas update.
+        
+        This is the core removal logic without triggering canvas updates,
+        used by both remove_annotation() and clear_all().
+        
+        Args:
+            annotation_id: ID of the annotation to remove
+        """
+        if annotation_id not in self.annotations:
+            return
+            
+        visuals = self.annotations[annotation_id]
+        
+        # IMPORTANT: For Line visuals, we must set invisible and clear data BEFORE
+        # removing from parent to prevent "Error drawing visual" during render queue flush
+        
+        # Remove Doppler curve visuals FIRST (most error-prone)
+        if visuals.get('doppler_curve'):
+            try:
+                curve = visuals['doppler_curve']
+                curve.visible = False
+                # Try to set minimal data instead of zeros to see if it's more stable
+                # Some VisPy versions prefer at least 2 points for Line visuals
+                empty_data = np.array([[0, 0], [0.001, 0.001]], dtype=np.float32)
+                curve.set_data(pos=empty_data)
+                if curve.parent:
+                    curve.parent = None
+            except Exception as e:
+                logger.debug(f"Error removing doppler_curve: {e}")
+        
+        if visuals.get('doppler_markers'):
+            try:
+                markers = visuals['doppler_markers']
+                markers.visible = False
+                # Use a small finite position instead of zeros
+                empty_markers = np.array([[0, 0]], dtype=np.float32)
+                markers.set_data(pos=empty_markers)
+                if markers.parent:
+                    markers.parent = None
+            except Exception as e:
+                logger.debug(f"Error removing doppler_markers: {e}")
+        
+        # Remove rectangle visuals from scene
+        if visuals.get('rect'):
+            try:
+                visuals['rect'].visible = False
+                if visuals['rect'].parent:
+                    visuals['rect'].parent = None
+            except Exception as e:
+                logger.debug(f"Error removing rect: {e}")
+            
+        if visuals.get('border') and visuals['border']:
+            try:
+                visuals['border'].visible = False
+                if visuals['border'].parent:
+                    visuals['border'].parent = None
+            except Exception as e:
+                logger.debug(f"Error removing border: {e}")
+            
+        if visuals.get('fill') and visuals['fill']:
+            try:
+                visuals['fill'].visible = False
+                if visuals['fill'].parent:
+                    visuals['fill'].parent = None
+            except Exception as e:
+                logger.debug(f"Error removing fill: {e}")
+        
+        # Remove annotation reference
+        if annotation_id in self._annotation_refs:
+            del self._annotation_refs[annotation_id]
+        
+        logger.debug(f"Removed visual for annotation {annotation_id}")
+    
     def remove_annotation(self, annotation_id: int):
         """Remove an annotation rectangle and Doppler curve from the display.
         
         Args:
             annotation_id: ID of the annotation to remove
         """
-        if annotation_id in self.annotations:
-            visuals = self.annotations[annotation_id]
+        if annotation_id not in self.annotations:
+            return
             
-            # Remove rectangle visuals from scene
-            if visuals.get('rect'):
-                if visuals['rect'].parent:
-                    visuals['rect'].parent = None
-                visuals['rect'].visible = False
-                
-            if visuals.get('border') and visuals['border']:
-                if visuals['border'].parent:
-                    visuals['border'].parent = None
-                visuals['border'].visible = False
-                
-            if visuals.get('fill') and visuals['fill']:
-                if visuals['fill'].parent:
-                    visuals['fill'].parent = None
-                visuals['fill'].visible = False
-            
-            # Remove Doppler curve visuals
-            if visuals.get('doppler_curve'):
-                if visuals['doppler_curve'].parent:
-                    visuals['doppler_curve'].parent = None
-                visuals['doppler_curve'].visible = False
-            
-            if visuals.get('doppler_markers'):
-                if visuals['doppler_markers'].parent:
-                    visuals['doppler_markers'].parent = None
-                visuals['doppler_markers'].visible = False
-            
-            del self.annotations[annotation_id]
-            
-            # Remove annotation reference
-            if annotation_id in self._annotation_refs:
-                del self._annotation_refs[annotation_id]
-            
-            # Force canvas update to ensure visual removal
-            self._update_canvas()
-            
-            logger.debug(f"Removed visual for annotation {annotation_id}")
+        self._remove_annotation_visuals(annotation_id)
+        del self.annotations[annotation_id]
+        
+        # Force canvas update to ensure visual removal
+        self._update_canvas()
     
     def update_annotation(self, annotation: Annotation, is_selected: bool = False):
         """Update an existing annotation rectangle.
@@ -336,11 +398,34 @@ class AnnotationRenderer:
                     rect.border_color = (1.0, 0.0, 0.0, 1.0)  # Red border
     
     def clear_all(self):
-        """Remove all annotation rectangles."""
-        annotation_ids = list(self.annotations.keys())
-        for ann_id in annotation_ids:
-            self.remove_annotation(ann_id)
-        self._annotation_refs.clear()
+        """Remove all annotation rectangles.
+        
+        This method freezes the canvas during removal to prevent draw errors
+        when visuals are in an inconsistent state.
+        """
+        # Freeze canvas to prevent draws during batch removal
+        canvas = None
+        try:
+            if hasattr(self.view, 'canvas') and self.view.canvas:
+                canvas = self.view.canvas
+                canvas.freeze()
+        except Exception as e:
+            logger.debug(f"Could not freeze canvas: {e}")
+        
+        try:
+            annotation_ids = list(self.annotations.keys())
+            for ann_id in annotation_ids:
+                self._remove_annotation_visuals(ann_id)
+            self.annotations.clear()
+            self._annotation_refs.clear()
+        finally:
+            # Always unfreeze canvas
+            if canvas:
+                try:
+                    canvas.unfreeze()
+                    canvas.update()
+                except Exception as e:
+                    logger.debug(f"Could not unfreeze canvas: {e}")
     
     def show_temp_rectangle(self, t_start: float, t_end: float, 
                             f_min: float, f_max: float):
@@ -500,15 +585,27 @@ class AnnotationRenderer:
         
         visuals = self.annotations[annotation.id]
         
-        # Remove old Doppler visuals
+        # Remove old Doppler visuals - MUST set invisible and clear data before removing
         if visuals.get('doppler_curve'):
-            if visuals['doppler_curve'].parent:
-                visuals['doppler_curve'].parent = None
+            try:
+                curve = visuals['doppler_curve']
+                curve.visible = False
+                curve.set_data(pos=np.zeros((2, 2), dtype=np.float32))
+                if curve.parent:
+                    curve.parent = None
+            except Exception as e:
+                logger.debug(f"Error removing old doppler_curve: {e}")
             del visuals['doppler_curve']
         
         if visuals.get('doppler_markers'):
-            if visuals['doppler_markers'].parent:
-                visuals['doppler_markers'].parent = None
+            try:
+                markers = visuals['doppler_markers']
+                markers.visible = False
+                markers.set_data(pos=np.zeros((1, 2), dtype=np.float32))
+                if markers.parent:
+                    markers.parent = None
+            except Exception as e:
+                logger.debug(f"Error removing old doppler_markers: {e}")
             del visuals['doppler_markers']
         
         # Add new Doppler visuals if points exist
@@ -528,7 +625,76 @@ class AnnotationRenderer:
         
         self._update_canvas()
     
+    def batch_add_annotations(self, annotations: list, selected_id: Optional[int] = None):
+        """Add multiple annotations in a single batch with canvas frozen.
+        
+        This is more efficient than calling add_annotation repeatedly,
+        and prevents draw errors during batch operations.
+        
+        Args:
+            annotations: List of Annotation objects to add
+            selected_id: Optional ID of the selected annotation
+        """
+        if not annotations:
+            return
+            
+        # Freeze canvas to prevent draws during batch addition
+        canvas = None
+        try:
+            if hasattr(self.view, 'canvas') and self.view.canvas:
+                canvas = self.view.canvas
+                canvas.freeze()
+        except Exception as e:
+            logger.debug(f"Could not freeze canvas: {e}")
+        
+        try:
+            for annotation in annotations:
+                is_selected = (annotation.id == selected_id)
+                
+                if annotation.id in self.annotations:
+                    self._remove_annotation_visuals(annotation.id)
+                    del self.annotations[annotation.id]
+                
+                visuals = self.create_rectangle_visuals(annotation, is_selected)
+                
+                # Store annotation reference for later visibility updates
+                self._annotation_refs[annotation.id] = annotation
+                
+                # Add Doppler curve if annotation has points
+                if annotation.points:
+                    doppler_visuals = self.create_doppler_curve_visuals(annotation)
+                    visuals.update(doppler_visuals)
+                    logger.debug(f"Added doppler curve for annotation {annotation.id}")
+                
+                # Apply visibility settings from annotation data
+                rect_visible = annotation.is_visible
+                curve_visible = annotation.is_visible and annotation.show_doppler_curve
+                
+                if visuals.get('rect'):
+                    visuals['rect'].visible = rect_visible
+                if visuals.get('doppler_curve'):
+                    visuals['doppler_curve'].visible = curve_visible
+                if visuals.get('doppler_markers'):
+                    visuals['doppler_markers'].visible = curve_visible
+                
+                self.annotations[annotation.id] = visuals
+                annotation.graphics_handle = visuals
+                
+        finally:
+            # Always unfreeze canvas
+            if canvas:
+                try:
+                    canvas.unfreeze()
+                    canvas.update()
+                except Exception as e:
+                    logger.debug(f"Could not unfreeze canvas: {e}")
+        
+        logger.info(f"Batch added {len(annotations)} annotations")
+    
     def _update_canvas(self):
         """Force canvas update."""
-        if hasattr(self.view, 'canvas') and self.view.canvas:
-            self.view.canvas.update()
+        try:
+            if hasattr(self.view, 'canvas') and self.view.canvas:
+                self.view.canvas.update()
+        except Exception as e:
+            logger.debug(f"Canvas update failed: {e}")

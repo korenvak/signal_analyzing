@@ -1302,7 +1302,18 @@ class MainWindow(QMainWindow):
         - Cancel pending background computations immediately
         - Lightweight cleanup (preserve GPU memory, just clear caches)
         - Fast audio loader with memory mapping for large files
+        - Robust canvas freezing to prevent draw errors during transitions
         """
+        # FREEZE CANVAS: Prevent any draws during the entire file loading process
+        # This is critical for preventing "black canvas" and recursive draw errors
+        canvas_to_freeze = None
+        if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+            canvas_to_freeze = self.spectrogram_canvas
+            try:
+                canvas_to_freeze.freeze()
+            except:
+                canvas_to_freeze = None
+
         try:
             # IMMEDIATE: Cancel any pending background spectrogram computation
             self.cancel_background_spectrogram()
@@ -1319,9 +1330,13 @@ class MainWindow(QMainWindow):
 
                 # Clear event markers (but keep CSV data)
                 self._clear_event_markers_on_file_switch()
+                
+                # IMPORTANT: Clear old annotation visuals immediately so they don't 
+                # try to draw with incorrect coordinates during the loading process
+                if self.annotation_renderer:
+                    self.annotation_renderer.clear_all()
 
                 # LIGHTWEIGHT: Only clear essential caches, preserve GPU memory pool
-                # GPU memory is expensive to reallocate - reuse it
                 self.spectrogram_cache = {
                     'time_range': None, 'freq_range': None,
                     'fft_size': None, 'hop_length': None,
@@ -1453,8 +1468,17 @@ class MainWindow(QMainWindow):
 
         except Exception as e:
             self.status_widget.hide_progress()
+            logger.error(f"Error loading audio file: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to load audio file:\n{str(e)}")
             self.statusBar().showMessage("Ready")
+        finally:
+            # ALWAYS unfreeze the canvas at the end of the loading process
+            if canvas_to_freeze:
+                try:
+                    canvas_to_freeze.unfreeze()
+                    canvas_to_freeze.update()
+                except Exception as e:
+                    logger.debug(f"Error unfreezing canvas: {e}")
     
     # ==================== Annotation Methods ====================
     
@@ -2011,21 +2035,49 @@ class MainWindow(QMainWindow):
         self.annotation_table.select_annotation(annotation_id)
     
     def refresh_annotation_display(self):
-        """Refresh all annotation visuals from manager."""
+        """Refresh all annotation visuals from manager.
+        
+        Uses batch operations with canvas freezing to prevent black screens and 
+        recursive draw errors during file switching.
+        """
         if not self.annotation_renderer:
             return
+            
+        # Freeze canvas for the entire refresh process to prevent intermediate draw errors
+        canvas = None
+        if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+            canvas = self.spectrogram_canvas
+            try:
+                canvas.freeze()
+            except:
+                canvas = None
         
-        # Clear existing visuals
-        self.annotation_renderer.clear_all()
-        self.annotation_table.clear_all()
-        
-        # Re-add all annotations
-        for annotation in self.annotation_manager:
-            self.annotation_renderer.add_annotation(
-                annotation, 
-                is_selected=(annotation.id == self.selected_annotation_id)
-            )
-            self.annotation_table.add_annotation(annotation)
+        try:
+            # Clear existing visuals
+            self.annotation_renderer.clear_all()
+            self.annotation_table.clear_all()
+            
+            # Collect all annotations for batch addition
+            annotations = list(self.annotation_manager)
+            
+            # Batch add annotations
+            if annotations:
+                self.annotation_renderer.batch_add_annotations(
+                    annotations, 
+                    selected_id=self.selected_annotation_id
+                )
+                
+                # Add to table
+                for annotation in annotations:
+                    self.annotation_table.add_annotation(annotation)
+        finally:
+            # Always unfreeze and force a single final update
+            if canvas:
+                try:
+                    canvas.unfreeze()
+                    canvas.update()
+                except:
+                    pass
     
     def toggle_annotation_mode(self):
         """Toggle annotation drawing mode on/off."""
