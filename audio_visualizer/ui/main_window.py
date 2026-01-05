@@ -517,7 +517,7 @@ class MainWindow(QMainWindow):
         self.global_ann_panel.jump_requested.connect(self.on_global_jump_requested)
         
         # Connect spectrum magnifier signal
-        self.spectrogram_canvas.spectrum_slice_requested.connect(self.spectrum_magnifier.update_slice)
+        self.spectrogram_canvas.qt_signals.spectrum_slice_requested.connect(self.spectrum_magnifier.update_slice)
         
         # Connect right sidebar tab change to sync event mode
         self.right_sidebar.currentChanged.connect(self._on_right_sidebar_tab_changed)

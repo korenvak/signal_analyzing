@@ -6,7 +6,7 @@ import logging
 from typing import Optional, Tuple, Callable
 import numpy as np
 
-from .qt_compat import QTimer, Signal, QApplication
+from .qt_compat import QTimer, Signal, QApplication, QObject
 
 try:
     from vispy import scene
@@ -20,6 +20,13 @@ except ImportError:
 from ..core.adaptive_spectrogram import ViewRegion, ZoomLevelDetector
 
 logger = logging.getLogger(__name__)
+
+
+class CanvasSignals(QObject):
+    """Proxy QObject for Qt signals on VisPy canvas."""
+    on_zoom_undo_available = Signal(bool)
+    on_zoom_redo_available = Signal(bool)
+    spectrum_slice_requested = Signal(np.ndarray, np.ndarray, float)  # power_db, freqs, time
 
 
 class TimeAxisFormatter:
@@ -226,18 +233,19 @@ class TiledImageRenderer:
 class VisPyCanvas(scene.SceneCanvas):
     """Custom VisPy canvas for audio visualization with proper axes."""
     
-    # Signals
-    on_zoom_undo_available = Signal(bool)
-    on_zoom_redo_available = Signal(bool)
-    spectrum_slice_requested = Signal(np.ndarray, np.ndarray, float)  # power_db, freqs, time
-    
     def __init__(self, view_type: str, parent=None):
         if not HAS_VISPY:
             raise RuntimeError("VisPy not available")
         
         super().__init__(keys='interactive', parent=parent, size=(800, 600))
         
+        # VisPy canvases are "frozen" by default in __init__.
+        # We must unfreeze to add our own attributes.
         self.unfreeze()
+        
+        # Instantiate signal proxy
+        self.qt_signals = CanvasSignals()
+        
         self.view_type = view_type
         
         # Grid layout for axes
@@ -1022,7 +1030,7 @@ class VisPyCanvas(scene.SceneCanvas):
                         if 0 <= col_idx < cols:
                             slice_data = data[:, col_idx]
                             freq_axis = np.linspace(freq_start, freq_end, rows)
-                            self.spectrum_slice_requested.emit(slice_data, freq_axis, time_pos)
+                            self.qt_signals.spectrum_slice_requested.emit(slice_data, freq_axis, time_pos)
                     except:
                         pass
                 
