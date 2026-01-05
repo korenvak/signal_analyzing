@@ -712,6 +712,19 @@ class MainWindow(QMainWindow):
         self.toggle_event_panel_action.setCheckable(True)
         self.toggle_event_panel_action.triggered.connect(self.toggle_event_panel)
         view_menu.addAction(self.toggle_event_panel_action)
+        
+        view_menu.addSeparator()
+        
+        # File Navigation shortcuts
+        next_file_action = QAction("Next File", self)
+        next_file_action.setShortcut("Ctrl+]")
+        next_file_action.triggered.connect(self.goto_next_file)
+        view_menu.addAction(next_file_action)
+        
+        prev_file_action = QAction("Previous File", self)
+        prev_file_action.setShortcut("Ctrl+[")
+        prev_file_action.triggered.connect(self.goto_previous_file)
+        view_menu.addAction(prev_file_action)
 
         # Analysis menu
         analysis_menu = menubar.addMenu("Analysis")
@@ -1290,49 +1303,50 @@ class MainWindow(QMainWindow):
             self.load_audio_file(file_path)
     
     def load_audio_file(self, file_path: str):
-        """Load an audio file for analysis with optimized cleanup."""
+        """Load an audio file for analysis with optimized cleanup.
+        
+        PERFORMANCE OPTIMIZATIONS:
+        - Cancel pending background computations immediately
+        - Lightweight cleanup (preserve GPU memory, just clear caches)
+        - Fast audio loader with memory mapping for large files
+        """
         try:
-            # Show progress feedback for large file loading
+            # IMMEDIATE: Cancel any pending background spectrogram computation
+            self.cancel_background_spectrogram()
+            
+            # Show progress feedback
             self.status_widget.show_progress("Loading audio file")
             self.status_widget.update_progress(5)
-            self.statusBar().showMessage("Loading audio file...")
-            QApplication.processEvents()  # Allow UI to update
+            self.statusBar().showMessage(f"Loading {os.path.basename(file_path)}...")
+            QApplication.processEvents()
 
-            # PERFORMANCE: Aggressive cleanup before loading new file
+            # PERFORMANCE: Lightweight cleanup for fast file switching
             if hasattr(self, 'current_file') and self.current_file is not None:
-                logger.info(f"Switching from {os.path.basename(self.current_file)} to {os.path.basename(file_path)}")
+                logger.info(f"Fast switch: {os.path.basename(self.current_file)} -> {os.path.basename(file_path)}")
 
-                # Clear event markers when switching files (but keep CSV data)
+                # Clear event markers (but keep CSV data)
                 self._clear_event_markers_on_file_switch()
 
-                self.file_switch_manager.cleanup_for_new_file(
-                    cache_manager=self.cache_manager,
-                    gpu_memory_manager=self.gpu_memory_manager,
-                    memory_pools=getattr(self.spectrogram_engine, 'memory_optimizer', None),
-                    tile_cache=self.tile_cache,
-                    engines=self.engines
-                )
-
-                # Clear spectrogram cache explicitly
+                # LIGHTWEIGHT: Only clear essential caches, preserve GPU memory pool
+                # GPU memory is expensive to reallocate - reuse it
                 self.spectrogram_cache = {
                     'time_range': None, 'freq_range': None,
                     'fft_size': None, 'hop_length': None,
                     'data': None, 'extent': None
                 }
 
-                # Clear canvas display data and zoom history
+                # Clear canvas display data (reuses buffer on next update)
                 if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
                     self.spectrogram_canvas.raw_display_data = None
-                    self.spectrogram_canvas.normalized_display_data = None
+                    # Keep normalized_display_data buffer for reuse
                     self.spectrogram_canvas.reset_zoom_history()
 
-                # CRITICAL: Clear audio loader cache to ensure new file data is loaded
-                if hasattr(self, 'audio_loader') and hasattr(self.audio_loader, 'clear_cache'):
+                # Clear audio chunk cache only (preserves memory-mapped file)
+                if hasattr(self, 'audio_loader'):
                     self.audio_loader.clear_cache()
-                    logger.info("Cleared audio loader cache for file switch")
 
-            # Update progress: file cleanup done
-            self.status_widget.update_progress(20)
+            # Update progress: cleanup done
+            self.status_widget.update_progress(15)
             QApplication.processEvents()
 
             sample_rate, duration = self.audio_loader.load_file(file_path)
@@ -3503,6 +3517,30 @@ class MainWindow(QMainWindow):
         # Force full file computation when fitting to view
         self.refresh_current_view(force_full=True)
     
+    def goto_next_file(self):
+        """Go to the next file in the playlist (Ctrl+])."""
+        if hasattr(self, 'playlist_widget'):
+            current_idx = self.playlist_widget.get_current_index()
+            total = self.playlist_widget.get_total_files()
+            
+            if self.playlist_widget.select_next_file():
+                new_idx = self.playlist_widget.get_current_index()
+                self.statusBar().showMessage(f"File {new_idx + 1}/{total}")
+            else:
+                self.statusBar().showMessage(f"Already at last file ({total}/{total})")
+    
+    def goto_previous_file(self):
+        """Go to the previous file in the playlist (Ctrl+[)."""
+        if hasattr(self, 'playlist_widget'):
+            current_idx = self.playlist_widget.get_current_index()
+            total = self.playlist_widget.get_total_files()
+            
+            if self.playlist_widget.select_previous_file():
+                new_idx = self.playlist_widget.get_current_index()
+                self.statusBar().showMessage(f"File {new_idx + 1}/{total}")
+            else:
+                self.statusBar().showMessage(f"Already at first file (1/{total})")
+    
     # =========================================================================
     # Background Spectrogram Computation (Performance Optimization)
     # =========================================================================
@@ -4849,13 +4887,21 @@ class MainWindow(QMainWindow):
         shortcuts_text = """
 <h2>Keyboard Shortcuts</h2>
 
-<h3>Navigation</h3>
+<h3>File Navigation</h3>
+<table>
+<tr><td><b>Ctrl+]</b></td><td>Next file in playlist</td></tr>
+<tr><td><b>Ctrl+[</b></td><td>Previous file in playlist</td></tr>
+<tr><td><b>Ctrl+O</b></td><td>Open audio file</td></tr>
+</table>
+
+<h3>View Navigation</h3>
 <table>
 <tr><td><b>Scroll</b></td><td>Zoom both axes</td></tr>
 <tr><td><b>Shift + Scroll</b></td><td>Zoom time axis only</td></tr>
 <tr><td><b>Ctrl + Scroll</b></td><td>Zoom frequency axis only</td></tr>
 <tr><td><b>Drag</b></td><td>Pan view</td></tr>
 <tr><td><b>R</b></td><td>Reset zoom to show all</td></tr>
+<tr><td><b>Ctrl+0</b></td><td>Zoom to fit</td></tr>
 </table>
 
 <h3>Keyboard Zoom</h3>
@@ -4875,10 +4921,9 @@ class MainWindow(QMainWindow):
 
 <h3>General</h3>
 <table>
-<tr><td><b>Ctrl+O</b></td><td>Open audio file</td></tr>
 <tr><td><b>F5</b></td><td>Refresh / Recompute</td></tr>
-<tr><td><b>Ctrl+0</b></td><td>Zoom to fit</td></tr>
 <tr><td><b>Ctrl+E</b></td><td>Export as image</td></tr>
+<tr><td><b>Ctrl+S</b></td><td>Save annotations</td></tr>
 <tr><td><b>F1</b></td><td>Show this help</td></tr>
 </table>
 """

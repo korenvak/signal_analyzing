@@ -8,12 +8,48 @@ import logging
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass
+from datetime import datetime
 from .qt_compat import (QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
                         QListWidget, QListWidgetItem, QPushButton, QLabel,
-                        QSplitter, QFrame, QFileDialog, QMessageBox,
+                        QSplitter, QFrame, QFileDialog, QMessageBox, QMenu,
                         Qt, Signal, QTimer, QDragEnterEvent, QDropEvent)
+from ..core.filename_parser import parse_pixel_filename
 
 logger = logging.getLogger(__name__)
+
+
+class SmartFileSorter:
+    """Smart file sorting - extracts time from filenames when possible."""
+    
+    @staticmethod
+    def get_sort_key(file_path: str) -> Tuple:
+        """Get sort key for a file - (has_time, datetime or name, name).
+        
+        Files with parseable timestamps sort by time.
+        Files without timestamps sort alphabetically after them.
+        """
+        path = Path(file_path)
+        parsed = parse_pixel_filename(file_path)
+        
+        if parsed is not None:
+            # Has timestamp - sort by start_time, then filename
+            return (0, parsed.start_time, path.name.lower())
+        else:
+            # No timestamp - sort alphabetically (after timestamped files)
+            return (1, datetime.min, path.name.lower())
+    
+    @staticmethod
+    def sort_files(file_paths: List[str], reverse: bool = False) -> List[str]:
+        """Sort file paths smartly - by time if parseable, else alphabetically.
+        
+        Args:
+            file_paths: List of file paths to sort
+            reverse: If True, sort newest first / Z-A
+            
+        Returns:
+            Sorted list of file paths
+        """
+        return sorted(file_paths, key=SmartFileSorter.get_sort_key, reverse=reverse)
 
 @dataclass
 class AudioFileInfo:
@@ -27,7 +63,7 @@ class AudioFileInfo:
     is_loaded: bool = False
 
 class PlaylistWidget(QWidget):
-    """Playlist widget for managing multiple audio files."""
+    """Playlist widget for managing multiple audio files with smart sorting."""
     
     # Signals
     file_selected = Signal(str)  # path
@@ -38,6 +74,8 @@ class PlaylistWidget(QWidget):
         super().__init__()
         self.setAcceptDrops(True)
         self.audio_files: Dict[str, AudioFileInfo] = {}
+        self._current_sort = 'smart'  # 'smart', 'name', 'size', 'none'
+        self._sort_reverse = False
         self.setup_ui()
         
     def setup_ui(self):
@@ -51,10 +89,17 @@ class PlaylistWidget(QWidget):
         self.title_label.setStyleSheet("font-weight: bold; font-size: 12px;")
         header_layout.addWidget(self.title_label)
         
+        # Sort button
+        self.sort_button = QPushButton("Sort ▼")
+        self.sort_button.setMaximumWidth(55)
+        self.sort_button.setToolTip("Sort playlist")
+        self.sort_button.clicked.connect(self.show_sort_menu)
+        header_layout.addWidget(self.sort_button)
+        
         # Add files button
-        self.add_button = QPushButton("Add Files...")
+        self.add_button = QPushButton("Add...")
         self.add_button.clicked.connect(self.add_files)
-        self.add_button.setMaximumWidth(80)
+        self.add_button.setMaximumWidth(50)
         header_layout.addWidget(self.add_button)
         
         layout.addLayout(header_layout)
@@ -72,6 +117,144 @@ class PlaylistWidget(QWidget):
         self.status_label.setStyleSheet("color: #888; font-size: 10px;")
         layout.addWidget(self.status_label)
         
+    def show_sort_menu(self):
+        """Show sorting options menu."""
+        menu = QMenu(self)
+        
+        # Smart sort (by time from filename, then alphabetical)
+        smart_action = menu.addAction("📅 Smart Sort (by time)")
+        smart_action.setCheckable(True)
+        smart_action.setChecked(self._current_sort == 'smart' and not self._sort_reverse)
+        smart_action.triggered.connect(lambda: self.sort_playlist('smart', False))
+        
+        smart_rev_action = menu.addAction("📅 Smart Sort (newest first)")
+        smart_rev_action.setCheckable(True)
+        smart_rev_action.setChecked(self._current_sort == 'smart' and self._sort_reverse)
+        smart_rev_action.triggered.connect(lambda: self.sort_playlist('smart', True))
+        
+        menu.addSeparator()
+        
+        # Alphabetical
+        name_action = menu.addAction("🔤 Name (A-Z)")
+        name_action.setCheckable(True)
+        name_action.setChecked(self._current_sort == 'name' and not self._sort_reverse)
+        name_action.triggered.connect(lambda: self.sort_playlist('name', False))
+        
+        name_rev_action = menu.addAction("🔤 Name (Z-A)")
+        name_rev_action.setCheckable(True)
+        name_rev_action.setChecked(self._current_sort == 'name' and self._sort_reverse)
+        name_rev_action.triggered.connect(lambda: self.sort_playlist('name', True))
+        
+        menu.addSeparator()
+        
+        # Size
+        size_action = menu.addAction("📊 Size (smallest first)")
+        size_action.setCheckable(True)
+        size_action.setChecked(self._current_sort == 'size' and not self._sort_reverse)
+        size_action.triggered.connect(lambda: self.sort_playlist('size', False))
+        
+        size_rev_action = menu.addAction("📊 Size (largest first)")
+        size_rev_action.setCheckable(True)
+        size_rev_action.setChecked(self._current_sort == 'size' and self._sort_reverse)
+        size_rev_action.triggered.connect(lambda: self.sort_playlist('size', True))
+        
+        # Show menu below button
+        menu.exec(self.sort_button.mapToGlobal(self.sort_button.rect().bottomLeft()))
+    
+    def sort_playlist(self, sort_type: str = 'smart', reverse: bool = False):
+        """Sort the playlist by specified criteria.
+        
+        Args:
+            sort_type: 'smart' (by time from filename), 'name', 'size'
+            reverse: If True, reverse the sort order
+        """
+        if not self.audio_files:
+            return
+        
+        self._current_sort = sort_type
+        self._sort_reverse = reverse
+        
+        file_paths = list(self.audio_files.keys())
+        
+        if sort_type == 'smart':
+            # Smart sort - by time from filename, then alphabetical
+            sorted_paths = SmartFileSorter.sort_files(file_paths, reverse=reverse)
+        elif sort_type == 'name':
+            # Alphabetical sort
+            sorted_paths = sorted(file_paths, key=lambda p: Path(p).name.lower(), reverse=reverse)
+        elif sort_type == 'size':
+            # Sort by file size
+            sorted_paths = sorted(file_paths, key=lambda p: self.audio_files[p].size_mb, reverse=reverse)
+        else:
+            sorted_paths = file_paths
+        
+        # Rebuild the list widget
+        self._rebuild_list_from_paths(sorted_paths)
+        
+        sort_desc = {
+            'smart': 'time' if not reverse else 'time (newest first)',
+            'name': 'A-Z' if not reverse else 'Z-A',
+            'size': 'smallest' if not reverse else 'largest'
+        }
+        logger.info(f"Playlist sorted by {sort_desc.get(sort_type, sort_type)}")
+    
+    def _rebuild_list_from_paths(self, sorted_paths: List[str]):
+        """Rebuild the list widget with sorted paths."""
+        # Save current selection
+        current_item = self.file_list.currentItem()
+        current_path = current_item.data(Qt.ItemDataRole.UserRole) if current_item else None
+        
+        # Clear and rebuild
+        self.file_list.clear()
+        
+        for file_path in sorted_paths:
+            file_info = self.audio_files.get(file_path)
+            if file_info:
+                item = self._create_list_item(file_path, file_info)
+                self.file_list.addItem(item)
+        
+        # Restore selection
+        if current_path:
+            for i in range(self.file_list.count()):
+                item = self.file_list.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) == current_path:
+                    self.file_list.setCurrentItem(item)
+                    break
+    
+    def _create_list_item(self, file_path: str, file_info: AudioFileInfo) -> QListWidgetItem:
+        """Create a list widget item for a file."""
+        # Check if file has parseable timestamp
+        parsed = parse_pixel_filename(file_path)
+        
+        # Build display text
+        status = "●" if file_info.is_loaded else "○"
+        
+        info_parts = [f"{file_info.size_mb:.1f} MB"]
+        if file_info.duration > 0:
+            info_parts.append(f"{file_info.duration:.1f}s")
+        if file_info.sample_rate > 0:
+            info_parts.append(f"{file_info.sample_rate}Hz")
+        
+        # Add time info if parseable
+        if parsed:
+            time_str = parsed.start_time.strftime("%H:%M:%S")
+            display_text = f"{status} {file_info.name}\n    📅 {time_str} ({', '.join(info_parts)})"
+        else:
+            display_text = f"{status} {file_info.name} ({', '.join(info_parts)})"
+        
+        item = QListWidgetItem(display_text)
+        item.setData(Qt.ItemDataRole.UserRole, file_path)
+        
+        # Add tooltip with full info
+        tooltip = f"Path: {file_path}\nSize: {file_info.size_mb:.2f} MB"
+        if parsed:
+            tooltip += f"\nStart: {parsed.start_time}"
+            tooltip += f"\nEnd: {parsed.end_time}"
+            tooltip += f"\nSensor: {parsed.sensor_name} ({parsed.sensor_id})"
+        item.setToolTip(tooltip)
+        
+        return item
+    
     def add_files(self):
         """Open file dialog to add audio files."""
         files, _ = QFileDialog.getOpenFileNames(
@@ -84,20 +267,37 @@ class PlaylistWidget(QWidget):
         if files:
             self.add_file_paths(files)
     
-    def add_file_paths(self, file_paths: List[str]):
-        """Add multiple file paths to the playlist."""
+    def add_file_paths(self, file_paths: List[str], auto_sort: bool = True):
+        """Add multiple file paths to the playlist.
+        
+        Args:
+            file_paths: List of file paths to add
+            auto_sort: If True, automatically sort after adding (default: True)
+        """
         added_count = 0
         
         for file_path in file_paths:
-            if self.add_file_path(file_path):
+            if self.add_file_path(file_path, auto_sort=False):
                 added_count += 1
         
         if added_count > 0:
             self.update_status()
             logger.info(f"Added {added_count} files to playlist")
+            
+            # Auto-sort after batch add
+            if auto_sort and self._current_sort != 'none':
+                self.sort_playlist(self._current_sort, self._sort_reverse)
     
-    def add_file_path(self, file_path: str) -> bool:
-        """Add a single file path to the playlist."""
+    def add_file_path(self, file_path: str, auto_sort: bool = False) -> bool:
+        """Add a single file path to the playlist.
+        
+        Args:
+            file_path: Path to add
+            auto_sort: If True, sort playlist after adding
+            
+        Returns:
+            True if file was added successfully
+        """
         try:
             path = Path(file_path)
             if not path.exists():
@@ -120,13 +320,16 @@ class PlaylistWidget(QWidget):
                 size_mb=path.stat().st_size / (1024 * 1024)
             )
             
-            # Add to playlist
+            # Add to playlist data
             self.audio_files[file_path] = file_info
             
-            # Add to UI list
-            item = QListWidgetItem(f"{file_info.name} ({file_info.size_mb:.1f} MB)")
-            item.setData(Qt.ItemDataRole.UserRole, file_path)
+            # Add to UI list using helper
+            item = self._create_list_item(file_path, file_info)
             self.file_list.addItem(item)
+            
+            # Optional auto-sort
+            if auto_sort and self._current_sort != 'none':
+                self.sort_playlist(self._current_sort, self._sort_reverse)
             
             return True
             
@@ -191,18 +394,23 @@ class PlaylistWidget(QWidget):
         for i in range(self.file_list.count()):
             item = self.file_list.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == file_path:
-                # Update text with more info
+                # Create updated item text using same format as _create_list_item
+                parsed = parse_pixel_filename(file_path)
                 status = "●" if file_info.is_loaded else "○"
-                duration_str = f"{file_info.duration:.1f}s" if file_info.duration > 0 else ""
-                sr_str = f"{file_info.sample_rate}Hz" if file_info.sample_rate > 0 else ""
                 
                 info_parts = [f"{file_info.size_mb:.1f} MB"]
-                if duration_str:
-                    info_parts.append(duration_str)
-                if sr_str:
-                    info_parts.append(sr_str)
+                if file_info.duration > 0:
+                    info_parts.append(f"{file_info.duration:.1f}s")
+                if file_info.sample_rate > 0:
+                    info_parts.append(f"{file_info.sample_rate}Hz")
                 
-                item.setText(f"{status} {file_info.name} ({', '.join(info_parts)})")
+                if parsed:
+                    time_str = parsed.start_time.strftime("%H:%M:%S")
+                    display_text = f"{status} {file_info.name}\n    📅 {time_str} ({', '.join(info_parts)})"
+                else:
+                    display_text = f"{status} {file_info.name} ({', '.join(info_parts)})"
+                
+                item.setText(display_text)
                 break
     
     def update_status(self):
@@ -222,6 +430,62 @@ class PlaylistWidget(QWidget):
             self.file_selected.emit(file_path)
         else:
             logger.warning("PlaylistWidget: No file_path data in clicked item")
+    
+    def select_next_file(self) -> bool:
+        """Select the next file in the playlist.
+        
+        Returns:
+            True if a next file was selected, False if at end or empty
+        """
+        if self.file_list.count() == 0:
+            return False
+        
+        current_row = self.file_list.currentRow()
+        next_row = current_row + 1
+        
+        if next_row >= self.file_list.count():
+            return False  # Already at end
+        
+        self.file_list.setCurrentRow(next_row)
+        item = self.file_list.item(next_row)
+        if item:
+            file_path = item.data(Qt.ItemDataRole.UserRole)
+            if file_path:
+                self.file_selected.emit(file_path)
+                return True
+        return False
+    
+    def select_previous_file(self) -> bool:
+        """Select the previous file in the playlist.
+        
+        Returns:
+            True if a previous file was selected, False if at start or empty
+        """
+        if self.file_list.count() == 0:
+            return False
+        
+        current_row = self.file_list.currentRow()
+        prev_row = current_row - 1
+        
+        if prev_row < 0:
+            return False  # Already at start
+        
+        self.file_list.setCurrentRow(prev_row)
+        item = self.file_list.item(prev_row)
+        if item:
+            file_path = item.data(Qt.ItemDataRole.UserRole)
+            if file_path:
+                self.file_selected.emit(file_path)
+                return True
+        return False
+    
+    def get_current_index(self) -> int:
+        """Get current file index (0-based)."""
+        return self.file_list.currentRow()
+    
+    def get_total_files(self) -> int:
+        """Get total number of files in playlist."""
+        return self.file_list.count()
     
     def show_context_menu(self, position):
         """Show context menu for file operations."""
