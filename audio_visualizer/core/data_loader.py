@@ -401,7 +401,7 @@ class ChunkedAudioLoader:
         """Clear chunk cache to free memory."""
         self._chunk_cache.clear()
         self._cache_order.clear()
-        gc.collect()
+        # gc.collect() - Removed to improve file switching speed
     
     def close(self):
         """Close file handles and clear cache."""

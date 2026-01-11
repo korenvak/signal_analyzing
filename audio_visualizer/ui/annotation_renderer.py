@@ -242,18 +242,11 @@ class AnnotationRenderer:
             
         visuals = self.annotations[annotation_id]
         
-        # IMPORTANT: For Line visuals, we must set invisible and clear data BEFORE
-        # removing from parent to prevent "Error drawing visual" during render queue flush
-        
-        # Remove Doppler curve visuals FIRST (most error-prone)
+        # Remove Doppler curve visuals FIRST
         if visuals.get('doppler_curve'):
             try:
                 curve = visuals['doppler_curve']
                 curve.visible = False
-                # Try to set minimal data instead of zeros to see if it's more stable
-                # Some VisPy versions prefer at least 2 points for Line visuals
-                empty_data = np.array([[0, 0], [0.001, 0.001]], dtype=np.float32)
-                curve.set_data(pos=empty_data)
                 if curve.parent:
                     curve.parent = None
             except Exception as e:
@@ -263,9 +256,6 @@ class AnnotationRenderer:
             try:
                 markers = visuals['doppler_markers']
                 markers.visible = False
-                # Use a small finite position instead of zeros
-                empty_markers = np.array([[0, 0]], dtype=np.float32)
-                markers.set_data(pos=empty_markers)
                 if markers.parent:
                     markers.parent = None
             except Exception as e:
@@ -397,20 +387,22 @@ class AnnotationRenderer:
                     rect.color = (1.0, 0.0, 0.0, 0.3)    # Red tint
                     rect.border_color = (1.0, 0.0, 0.0, 1.0)  # Red border
     
-    def clear_all(self):
+    def clear_all(self, freeze_canvas: bool = True):
         """Remove all annotation rectangles.
         
-        This method freezes the canvas during removal to prevent draw errors
-        when visuals are in an inconsistent state.
+        Args:
+            freeze_canvas: Whether to freeze the canvas during removal (default: True).
+                           Set to False if caller has already frozen the canvas.
         """
         # Freeze canvas to prevent draws during batch removal
         canvas = None
-        try:
-            if hasattr(self.view, 'canvas') and self.view.canvas:
-                canvas = self.view.canvas
-                canvas.freeze()
-        except Exception as e:
-            logger.debug(f"Could not freeze canvas: {e}")
+        if freeze_canvas:
+            try:
+                if hasattr(self.view, 'canvas') and self.view.canvas:
+                    canvas = self.view.canvas
+                    canvas.freeze()
+            except Exception as e:
+                logger.debug(f"Could not freeze canvas: {e}")
         
         try:
             annotation_ids = list(self.annotations.keys())
@@ -419,7 +411,7 @@ class AnnotationRenderer:
             self.annotations.clear()
             self._annotation_refs.clear()
         finally:
-            # Always unfreeze canvas
+            # Always unfreeze canvas if we froze it
             if canvas:
                 try:
                     canvas.unfreeze()
@@ -585,12 +577,11 @@ class AnnotationRenderer:
         
         visuals = self.annotations[annotation.id]
         
-        # Remove old Doppler visuals - MUST set invisible and clear data before removing
+        # Remove old Doppler visuals
         if visuals.get('doppler_curve'):
             try:
                 curve = visuals['doppler_curve']
                 curve.visible = False
-                curve.set_data(pos=np.zeros((2, 2), dtype=np.float32))
                 if curve.parent:
                     curve.parent = None
             except Exception as e:
@@ -601,7 +592,6 @@ class AnnotationRenderer:
             try:
                 markers = visuals['doppler_markers']
                 markers.visible = False
-                markers.set_data(pos=np.zeros((1, 2), dtype=np.float32))
                 if markers.parent:
                     markers.parent = None
             except Exception as e:
@@ -625,27 +615,28 @@ class AnnotationRenderer:
         
         self._update_canvas()
     
-    def batch_add_annotations(self, annotations: list, selected_id: Optional[int] = None):
-        """Add multiple annotations in a single batch with canvas frozen.
-        
-        This is more efficient than calling add_annotation repeatedly,
-        and prevents draw errors during batch operations.
+    def batch_add_annotations(self, annotations: list, selected_id: Optional[int] = None,
+                              freeze_canvas: bool = True):
+        """Add multiple annotations in a single batch.
         
         Args:
             annotations: List of Annotation objects to add
             selected_id: Optional ID of the selected annotation
+            freeze_canvas: Whether to freeze the canvas during addition (default: True).
+                           Set to False if caller has already frozen the canvas.
         """
         if not annotations:
             return
             
         # Freeze canvas to prevent draws during batch addition
         canvas = None
-        try:
-            if hasattr(self.view, 'canvas') and self.view.canvas:
-                canvas = self.view.canvas
-                canvas.freeze()
-        except Exception as e:
-            logger.debug(f"Could not freeze canvas: {e}")
+        if freeze_canvas:
+            try:
+                if hasattr(self.view, 'canvas') and self.view.canvas:
+                    canvas = self.view.canvas
+                    canvas.freeze()
+            except Exception as e:
+                logger.debug(f"Could not freeze canvas: {e}")
         
         try:
             for annotation in annotations:
@@ -681,7 +672,7 @@ class AnnotationRenderer:
                 annotation.graphics_handle = visuals
                 
         finally:
-            # Always unfreeze canvas
+            # Always unfreeze canvas if we froze it
             if canvas:
                 try:
                     canvas.unfreeze()

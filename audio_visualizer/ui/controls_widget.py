@@ -21,6 +21,7 @@ class ControlsWidget(QWidget):
     freq_scale_changed = Signal(str)
     normalization_mode_changed = Signal(str)  # 'minmax' or 'std'
     gamma_changed = Signal(float)  # Gamma correction value
+    normalization_scope_changed = Signal(str)  # 'global' or 'view'
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -85,7 +86,8 @@ class ControlsWidget(QWidget):
             'blackman', 'blackmanharris', 'hann', 'hamming',
             'kaiser', 'flattop', 'rectangular'
         ])
-        self.window_combo.setCurrentText('hamming')
+        # Match engine/canvas high-quality defaults
+        self.window_combo.setCurrentText('blackmanharris')
         self.window_combo.setFixedWidth(110)
         self.window_combo.setToolTip("Window function for FFT")
         layout.addWidget(self.window_combo)
@@ -154,8 +156,8 @@ class ControlsWidget(QWidget):
         
         fft_row.addWidget(QLabel("Overlap:"))
         self.overlap_combo = QComboBox()
-        self.overlap_combo.addItems(['50%', '75%', '87.5%', '93.75%', '96.875%'])
-        self.overlap_combo.setCurrentText('87.5%')
+        self.overlap_combo.addItems(['50%', '75%', '87.5%', '93.75%', '96%', '96.875%'])
+        self.overlap_combo.setCurrentText('96%')
         self.overlap_combo.setFixedWidth(80)
         self.overlap_combo.setToolTip("Higher overlap = smoother but slower")
         fft_row.addWidget(self.overlap_combo)
@@ -179,8 +181,9 @@ class ControlsWidget(QWidget):
         
         display_row.addWidget(QLabel("Interpolation:"))
         self.interpolation_combo = QComboBox()
-        self.interpolation_combo.addItems(['nearest', 'bilinear', 'bicubic'])
-        self.interpolation_combo.setCurrentText('bilinear')
+        # Include high-quality resampling options supported by VisPy ImageVisual
+        self.interpolation_combo.addItems(['nearest', 'bilinear', 'bicubic', 'lanczos', 'kaiser'])
+        self.interpolation_combo.setCurrentText('bicubic')
         self.interpolation_combo.setFixedWidth(90)
         display_row.addWidget(self.interpolation_combo)
         
@@ -240,6 +243,18 @@ class ControlsWidget(QWidget):
         norm_group = self._create_group("Normalization Mode")
         norm_layout = norm_group.layout()
         
+        scope_row = QHBoxLayout()
+        scope_row.setSpacing(10)
+        scope_row.addWidget(QLabel("Scope:"))
+        self.norm_scope_combo = QComboBox()
+        self.norm_scope_combo.addItems(["Global (locked)", "View (auto)"])
+        self.norm_scope_combo.setCurrentText("Global (locked)")
+        self.norm_scope_combo.setFixedWidth(140)
+        self.norm_scope_combo.setToolTip("Global: consistent contrast across the whole file. View: adapts to current zoom/window.")
+        scope_row.addWidget(self.norm_scope_combo)
+        scope_row.addStretch()
+        norm_layout.addLayout(scope_row)
+
         norm_row = QHBoxLayout()
         norm_row.setSpacing(10)
         
@@ -271,7 +286,7 @@ class ControlsWidget(QWidget):
         gamma_row.addWidget(QLabel("Gamma:"))
         self.gamma_slider = QSlider(Qt.Horizontal)
         self.gamma_slider.setRange(50, 150)  # 0.5 to 1.5
-        self.gamma_slider.setValue(85)  # Default 0.85
+        self.gamma_slider.setValue(85)  # Default 0.85 (matches canvas defaults)
         self.gamma_slider.setFixedWidth(100)
         self.gamma_slider.setToolTip("Gamma correction: <1.0 brightens mid-tones, >1.0 darkens them")
         gamma_row.addWidget(self.gamma_slider)
@@ -331,6 +346,7 @@ class ControlsWidget(QWidget):
         self.freq_scale_combo.currentTextChanged.connect(self.on_freq_scale_changed)
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         self.normalization_combo.currentTextChanged.connect(self.on_normalization_mode_changed)
+        self.norm_scope_combo.currentTextChanged.connect(self.on_normalization_scope_changed)
         
         # Gamma slider - debounced
         self.gamma_slider.valueChanged.connect(self._schedule_gamma_emit)
@@ -465,6 +481,11 @@ class ControlsWidget(QWidget):
         # Convert display text to internal mode
         mode = 'std' if mode_text == 'STD' else 'minmax'
         self.normalization_mode_changed.emit(mode)
+
+    def on_normalization_scope_changed(self, scope_text: str):
+        """Handle normalization scope change."""
+        scope = 'global' if scope_text.startswith('Global') else 'view'
+        self.normalization_scope_changed.emit(scope)
     
     def get_normalization_mode(self) -> str:
         """Get current normalization mode ('minmax' or 'std')."""

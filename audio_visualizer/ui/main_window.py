@@ -405,8 +405,9 @@ class MainWindow(QMainWindow):
             self.spectrogram_canvas.native.setMinimumSize(600, 400)
             spec_layout.addWidget(self.spectrogram_canvas.native)
             
-            # Set default normalization mode to STD (adaptive to zoom)
-            self.spectrogram_canvas.set_normalization_mode('std', std_scale=2.5)
+            # Set default normalization mode to STD (adaptive to zoom) with Gamma and Bicubic
+            self.spectrogram_canvas.set_normalization_mode('std', std_scale=2.5, gamma=0.85)
+            self.spectrogram_canvas.set_interpolation('bicubic')
             
             # Initialize annotation renderer
             self.annotation_renderer = AnnotationRenderer(self.spectrogram_canvas.view)
@@ -536,11 +537,16 @@ class MainWindow(QMainWindow):
         self.controls_widget.db_range_changed.connect(self.on_db_range_changed)
         self.controls_widget.refresh_requested.connect(self.refresh_current_view)
         self.controls_widget.interpolation_changed.connect(self.on_interpolation_changed)
+        self.controls_widget.freq_scale_changed.connect(self.on_freq_scale_changed)
         self.controls_widget.normalization_mode_changed.connect(self.on_normalization_mode_changed)
+        self.controls_widget.normalization_scope_changed.connect(self.on_normalization_scope_changed)
         self.controls_widget.gamma_changed.connect(self.on_gamma_changed)
 
         # Connect tab change signal
         self.main_tabs.currentChanged.connect(self._on_main_tab_changed)
+
+        # Sync control widget UI to actual engine/canvas defaults (avoid “settings don’t do anything” confusion)
+        self._sync_controls_with_current_settings()
     
     def _on_main_tab_changed(self, index: int):
         """Handle main tab change."""
@@ -1373,7 +1379,7 @@ class MainWindow(QMainWindow):
                 # IMPORTANT: Clear old annotation visuals immediately so they don't 
                 # try to draw with incorrect coordinates during the loading process
                 if self.annotation_renderer:
-                    self.annotation_renderer.clear_all()
+                    self.annotation_renderer.clear_all(freeze_canvas=False)
 
                 # LIGHTWEIGHT: Only clear essential caches, preserve GPU memory pool
                 self.spectrogram_cache = {
@@ -1475,9 +1481,9 @@ class MainWindow(QMainWindow):
             self.annotation_manager.set_file_path(file_path, clear_annotations=False)
             logger.info(f"Keeping {len(self.annotation_manager)} annotations for file switch")
             
-            # Set default normalization mode to STD
+            # Set default normalization mode to STD with Gamma
             if hasattr(self, 'spectrogram_canvas'):
-                self.spectrogram_canvas.set_normalization_mode('std', std_scale=2.5)
+                self.spectrogram_canvas.set_normalization_mode('std', std_scale=2.5, gamma=0.85)
 
             # Update progress: preparing view
             self.status_widget.update_progress(70)
@@ -1491,11 +1497,17 @@ class MainWindow(QMainWindow):
             # Refresh current view (this computes spectrogram - has its own progress)
             # IMPORTANT: This must happen BEFORE refreshing annotations so canvas has valid data
             # FORCE_FULL: Ensure we load the whole file view initially, not a stale partial region
+            # QUALITY: Force quality parameters for initial view to match high-quality interactive mode
+            self.spectrogram_engine.set_parameters(
+                hop_length=max(1, int(getattr(self.spectrogram_engine, 'fft_size', 4096) * 0.03125)), # High overlap
+                window_type='blackmanharris' # Better window
+            )
+            
             self.refresh_current_view(force_full=True)
 
             # Now refresh annotation display AFTER spectrogram is computed
             # This ensures annotations are rendered on a valid canvas
-            self.refresh_annotation_display()
+            self.refresh_annotation_display(freeze_canvas=False)
             logger.info(f"Refreshed {len(self.annotation_manager)} annotation visuals after spectrogram load")
 
             # Hide progress bar when done
@@ -2069,18 +2081,22 @@ class MainWindow(QMainWindow):
         # Select in table
         self.annotation_table.select_annotation(annotation_id)
     
-    def refresh_annotation_display(self):
+    def refresh_annotation_display(self, freeze_canvas: bool = True):
         """Refresh all annotation visuals from manager.
         
         Uses batch operations with canvas freezing to prevent black screens and 
         recursive draw errors during file switching.
+        
+        Args:
+            freeze_canvas: Whether to manage canvas freezing locally (default: True).
+                           Set to False if caller (e.g. load_audio_file) manages freezing.
         """
         if not self.annotation_renderer:
             return
             
         # Freeze canvas for the entire refresh process to prevent intermediate draw errors
         canvas = None
-        if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+        if freeze_canvas and HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
             canvas = self.spectrogram_canvas
             try:
                 canvas.freeze()
@@ -2088,25 +2104,26 @@ class MainWindow(QMainWindow):
                 canvas = None
         
         try:
-            # Clear existing visuals
-            self.annotation_renderer.clear_all()
+            # Clear existing visuals - don't freeze internally as we handle it here or in caller
+            self.annotation_renderer.clear_all(freeze_canvas=False)
             self.annotation_table.clear_all()
             
             # Collect all annotations for batch addition
             annotations = list(self.annotation_manager)
             
-            # Batch add annotations
+            # Batch add annotations - don't freeze internally
             if annotations:
                 self.annotation_renderer.batch_add_annotations(
                     annotations, 
-                    selected_id=self.selected_annotation_id
+                    selected_id=self.selected_annotation_id,
+                    freeze_canvas=False
                 )
                 
                 # Add to table
                 for annotation in annotations:
                     self.annotation_table.add_annotation(annotation)
         finally:
-            # Always unfreeze and force a single final update
+            # Always unfreeze and force a single final update if we froze it locally
             if canvas:
                 try:
                     canvas.unfreeze()
@@ -2466,7 +2483,13 @@ class MainWindow(QMainWindow):
         else:
             logger.info("No cache invalidation needed - all caches preserved")
         
-        self.refresh_current_view()
+        # After FFT/hop/window changes we want a stable full-file overview (no “cut canvas”),
+        # but we also want to preserve the current camera view if the user is zoomed in.
+        self._preserve_view_on_update = True
+        try:
+            self.refresh_current_view(force_full=True)
+        finally:
+            self._preserve_view_on_update = False
     
     def on_colormap_changed(self, colormap: str):
         """Handle colormap changes."""
@@ -2494,6 +2517,94 @@ class MainWindow(QMainWindow):
                 self.spectrogram_canvas.set_interpolation(interpolation)
         except Exception as e:
             logger.error(f"Error updating interpolation: {e}")
+
+    def on_freq_scale_changed(self, scale: str):
+        """Handle frequency scale changes (UI)."""
+        logger.info(f"Frequency scale changed to: {scale}")
+        # NOTE: Non-linear frequency scale transforms are not implemented yet (would require transforming
+        # the image + all overlays consistently). For now, keep linear to avoid misleading display.
+        if scale != 'linear':
+            self.statusBar().showMessage("Freq scale (log/mel) not implemented yet — staying on linear")
+            try:
+                # Revert UI back to linear without triggering signal loops
+                self.controls_widget.freq_scale_combo.blockSignals(True)
+                self.controls_widget.freq_scale_combo.setCurrentText('linear')
+                self.controls_widget.freq_scale_combo.blockSignals(False)
+            except Exception:
+                pass
+            self.set_freq_scale('linear')
+            return
+        self.set_freq_scale(scale)
+
+    def _sync_controls_with_current_settings(self):
+        """Align ControlsWidget values to current engine/canvas state (no recompute)."""
+        try:
+            if not hasattr(self, 'controls_widget') or not self.controls_widget:
+                return
+
+            # FFT size / overlap / window
+            fft_size = int(getattr(self.spectrogram_engine, 'fft_size', 4096))
+            hop = int(getattr(self.spectrogram_engine, 'hop_length', 512))
+            window = getattr(self.spectrogram_engine, 'window_type', 'hann')
+
+            overlap_pct = 0.0
+            if fft_size > 0:
+                overlap_pct = max(0.0, min(0.999, 1.0 - (hop / float(fft_size))))
+            overlap_label = f"{overlap_pct * 100:.3g}%"
+
+            # Interpolation + gamma
+            interp = 'bicubic'
+            if hasattr(self, 'spectrogram_canvas') and hasattr(self.spectrogram_canvas, 'current_interpolation'):
+                interp = self.spectrogram_canvas.current_interpolation or interp
+            gamma = 0.85
+            if hasattr(self, 'spectrogram_canvas'):
+                gamma = float(getattr(self.spectrogram_canvas, 'gamma_correction', gamma))
+
+            # Apply to widget without triggering recompute
+            self.controls_widget.fft_size_combo.blockSignals(True)
+            self.controls_widget.fft_size_combo.setCurrentText(str(fft_size))
+            self.controls_widget.fft_size_combo.blockSignals(False)
+
+            # Overlap combo options are fixed; choose nearest option
+            overlap_options = [self.controls_widget.overlap_combo.itemText(i) for i in range(self.controls_widget.overlap_combo.count())]
+            if overlap_label not in overlap_options:
+                # Pick nearest
+                def _pct(s: str) -> float:
+                    try:
+                        return float(s.replace('%', ''))
+                    except Exception:
+                        return 0.0
+                target = overlap_pct * 100.0
+                best = min(overlap_options, key=lambda s: abs(_pct(s) - target)) if overlap_options else '96%'
+                overlap_label = best
+            self.controls_widget.overlap_combo.blockSignals(True)
+            self.controls_widget.overlap_combo.setCurrentText(overlap_label)
+            self.controls_widget.overlap_combo.blockSignals(False)
+
+            self.controls_widget.window_combo.blockSignals(True)
+            self.controls_widget.window_combo.setCurrentText(window)
+            self.controls_widget.window_combo.blockSignals(False)
+
+            self.controls_widget.interpolation_combo.blockSignals(True)
+            self.controls_widget.interpolation_combo.setCurrentText(interp)
+            self.controls_widget.interpolation_combo.blockSignals(False)
+
+            # Gamma slider is 0.5-1.5 mapped to 50-150
+            self.controls_widget.gamma_slider.blockSignals(True)
+            self.controls_widget.gamma_slider.setValue(int(round(gamma * 100)))
+            self.controls_widget.gamma_label.setText(f"{gamma:.2f}")
+            self.controls_widget.gamma_slider.blockSignals(False)
+
+            # Normalization scope (if present)
+            if hasattr(self.controls_widget, 'norm_scope_combo') and hasattr(self, 'spectrogram_canvas'):
+                scope = getattr(self.spectrogram_canvas, 'normalization_scope', 'global')
+                desired = "Global (locked)" if scope == 'global' else "View (auto)"
+                self.controls_widget.norm_scope_combo.blockSignals(True)
+                self.controls_widget.norm_scope_combo.setCurrentText(desired)
+                self.controls_widget.norm_scope_combo.blockSignals(False)
+
+        except Exception as e:
+            logger.debug(f"Failed to sync controls: {e}")
     
     def on_normalization_mode_changed(self, mode: str):
         """Handle normalization mode changes."""
@@ -2506,6 +2617,17 @@ class MainWindow(QMainWindow):
                 self.spectrogram_canvas.update_dynamic_clim()
         except Exception as e:
             logger.error(f"Error updating normalization mode: {e}")
+
+    def on_normalization_scope_changed(self, scope: str):
+        """Handle normalization scope changes (global vs view)."""
+        logger.info(f"Normalization scope changed to: {scope}")
+        try:
+            if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+                self.spectrogram_canvas.set_normalization_scope(scope)
+                # Apply immediately (no recompute)
+                self.spectrogram_canvas.update_dynamic_clim()
+        except Exception as e:
+            logger.error(f"Error updating normalization scope: {e}")
 
     def on_gamma_changed(self, gamma: float):
         """Handle gamma correction changes."""
@@ -3349,6 +3471,7 @@ class MainWindow(QMainWindow):
             print(f"Cache time_range: {self.spectrogram_cache['time_range']}")
             
             # PERFORMANCE: Use cache when possible to avoid expensive FFT recomputation
+            # Cache is only valid when ALL relevant parameters match (file window, fft, hop, window, sample_rate)
             use_cache = True  # Enable caching for performance
             if use_cache and not preserve_view:
                 cache = self.spectrogram_cache
@@ -3360,8 +3483,14 @@ class MainWindow(QMainWindow):
                     req_start, req_end = view_time_range
                     
                     # Check if cached region EXACTLY matches (not just contains)
-                    time_match = abs(cached_start - req_start) < 0.1 and abs(cached_end - req_end) < 0.1
-                    if (time_match and cache['fft_size'] == self.spectrogram_engine.fft_size):
+                    time_match = abs(cached_start - req_start) < 1e-6 and abs(cached_end - req_end) < 1e-6
+                    params_match = (
+                        cache.get('fft_size') == getattr(self.spectrogram_engine, 'fft_size', None) and
+                        cache.get('hop_length') == getattr(self.spectrogram_engine, 'hop_length', None) and
+                        cache.get('window_type') == getattr(self.spectrogram_engine, 'window_type', None) and
+                        cache.get('sample_rate') == float(getattr(self.spectrogram_engine, 'sample_rate', 44100))
+                    )
+                    if time_match and params_match:
                         
                         print(f"Using cached spectrogram (exact match {req_start:.1f}-{req_end:.1f}s)")
                         self.spectrogram_canvas.update_image(cache['data'], cache['extent'])
@@ -3401,6 +3530,7 @@ class MainWindow(QMainWindow):
             max_texture_size = 16384
             
             if view_time_range:
+                # Use requested window as source of truth for extent
                 time_span = max(view_time_range[1] - view_time_range[0], 1e-6)
             else:
                 time_span = n_samples / sample_rate if sample_rate > 0 else 1.0
@@ -3465,18 +3595,14 @@ class MainWindow(QMainWindow):
                     freq_min = 0.0
                     freq_max = sample_rate / 2.0
                 
-                # Default time range before refinement
+                # IMPORTANT: Use requested time window as *exact* extent to avoid drift/inconsistency
                 if view_time_range:
-                    time_offset = view_time_range[0]
+                    time_min = float(view_time_range[0])
+                    time_max = float(view_time_range[1])
                 else:
-                    time_offset = 0.0
-                
-                if sample_rate > 0:
-                    time_min = time_offset
-                    time_max = time_offset + len(audio_data) / sample_rate
-                else:
-                    time_min = time_offset
-                    time_max = time_offset + float(magnitude_db.shape[1])
+                    # Full-file / no explicit window: use audio_data duration
+                    time_min = 0.0
+                    time_max = len(audio_data) / sample_rate if sample_rate > 0 else float(magnitude_db.shape[1])
                 
                 # Check if result exceeds OpenGL texture limits
                 max_texture_size = 16384
@@ -3495,14 +3621,6 @@ class MainWindow(QMainWindow):
                     
                     logger.info(f"Downsampled: {magnitude_db.shape[1]} frames")
                 
-                # Determine accurate time range using STFT times (center of frames)
-                if times is not None and len(times) > 0:
-                    time_min = float(np.nanmin(times)) + time_offset
-                    time_max = float(np.nanmax(times)) + time_offset + frame_duration
-                    if not np.isfinite(time_min):
-                        time_min = time_offset
-                    if not np.isfinite(time_max):
-                        time_max = time_offset + (len(audio_data) / sample_rate if sample_rate > 0 else float(magnitude_db.shape[1]))
                 # Ensure bounds are sane
                 if time_max <= time_min:
                     time_max = time_min + max(frame_duration, 1e-6)
@@ -3532,6 +3650,8 @@ class MainWindow(QMainWindow):
                     'freq_range': (freq_min, freq_max),
                     'fft_size': base_fft,
                     'hop_length': effective_hop,
+                    'window_type': self.spectrogram_engine.window_type,
+                    'sample_rate': sample_rate,
                     'data': magnitude_db.copy(),
                     'extent': extent
                 }
@@ -3553,6 +3673,14 @@ class MainWindow(QMainWindow):
         
         duration = self.audio_loader.duration
         sample_rate = self.spectrogram_engine.sample_rate
+        nyquist = sample_rate / 2 if sample_rate and sample_rate > 0 else 1.0
+
+        # Always keep navigation bounds on the FULL file (prevents “stuck zoom/time” after recompute/settings change)
+        if hasattr(self, 'spectrogram_canvas') and HAS_VISPY:
+            try:
+                self.spectrogram_canvas.set_data_bounds(0.0, float(duration), 0.0, float(nyquist))
+            except Exception:
+                pass
         
         # LAZY LOADING THRESHOLD: Files longer than 5 minutes
         # For shorter files, compute full file (better UX for scrolling)

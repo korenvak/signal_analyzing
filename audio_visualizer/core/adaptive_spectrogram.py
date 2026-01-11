@@ -160,7 +160,7 @@ class AdaptiveSpectrogramManager:
         # User-specified constraints
         self.min_fft_size = 256
         self.max_fft_size = 16384
-        self.min_hop_ratio = 0.125  # hop = fft_size * ratio (minimum 12.5% = 87.5% overlap)
+        self.min_hop_ratio = 0.03125  # Allow 97% overlap (1/32)
         self.max_hop_ratio = 0.5    # hop = fft_size * ratio (maximum 50% = 50% overlap)
         
         # Quality presets
@@ -182,7 +182,7 @@ class AdaptiveSpectrogramManager:
             window_type = self.current_params.window_type
         
         # Target: 2-4 spectrogram data points per pixel for smooth appearance
-        target_points_per_pixel = 2.0 if self.quality_mode == 'fast' else 3.0 if self.quality_mode == 'balanced' else 4.0
+        target_points_per_pixel = 2.0 if self.quality_mode == 'fast' else 4.0 if self.quality_mode == 'balanced' else 8.0
         
         # Calculate target hop length for good time resolution
         # We want: time_span / hop_length_sec = canvas_width * target_points_per_pixel
@@ -202,7 +202,8 @@ class AdaptiveSpectrogramManager:
         fft_size = max(self.min_fft_size, min(self.max_fft_size, fft_size))
         
         # Calculate hop length based on FFT size and constraints
-        min_hop = int(fft_size * self.min_hop_ratio)
+        # ALLOW smaller hop for smoothness
+        min_hop = int(fft_size * 0.03125) # Allow up to 97% overlap (1/32)
         max_hop = int(fft_size * self.max_hop_ratio)
         
         hop_length = max(min_hop, min(max_hop, target_hop_samples))

@@ -29,7 +29,7 @@ class SpectrogramEngine:
         
         # Default parameters - optimized for quality
         self.fft_size = 4096
-        self.hop_length = 512  # 87.5% overlap with 4096 FFT
+        self.hop_length = 164  # 96% overlap with 4096 FFT
         self.window_type = 'blackman'
         self.sample_rate = 44100
         

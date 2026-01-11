@@ -191,18 +191,15 @@ class FileSwitchManager:
         logger.debug("Forcing garbage collection...")
         
         try:
-            # Multiple passes to ensure cleanup of circular references
-            for i in range(3):
-                collected = gc.collect()
-                if collected == 0:
-                    break
-                logger.debug(f"GC pass {i+1}: collected {collected} objects")
+            # Single pass is usually enough and much faster
+            gc.collect()
             
             # Additional GPU-specific garbage collection
+            # Only do this if strictly necessary as it can be slow
             if HAS_CUPY:
                 # Force CuPy to release any remaining references
-                cp._default_memory_pool.free_all_blocks()
-                cp._default_pinned_memory_pool.free_all_blocks()
+                # But don't force free_all_blocks every time as it causes reallocation stutter
+                pass 
             
         except Exception as e:
             logger.debug(f"Error during garbage collection: {e}")

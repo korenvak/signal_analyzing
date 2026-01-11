@@ -465,7 +465,11 @@ class VisPyCanvas(scene.SceneCanvas):
         self.local_mean_std = None  # Mean/std for visible region (for STD normalization)
         self.normalization_mode = 'std'  # 'minmax' or 'std' - default to STD (adaptive to zoom)
         self.std_scale = 2.5  # Scale factor for STD normalization
-        self.gamma_correction = 0.85  # Gamma for perceptual contrast (1.0=linear, <1=brighter mids)
+        self.gamma_correction = 0.85  # Default (matches ControlsWidget + prior tuning)
+        # Normalization scope:
+        # - 'global': stable contrast across navigation (good for event tagging)
+        # - 'view': adapt contrast to current window/zoom (good for hunting faint details)
+        self.normalization_scope = 'global'
 
         # Zoom history for undo (Ctrl+Z or Backspace)
         self.zoom_history = []  # Stack of (x, y, width, height) tuples
@@ -582,6 +586,14 @@ class VisPyCanvas(scene.SceneCanvas):
         self.raw_display_data = None
         self.display_extent = None
         self.reset_zoom_history()
+        
+        # Reset specific modes
+        self.set_curve_mode(False)
+        self.clear_curve()
+        self.clear_preview_curves()
+        if hasattr(self, 'clear_event_markers'):
+            self.clear_event_markers()
+            
         # Reset camera to a neutral state
         self.view.camera.rect = (0, 0, 1, 1)
         self.update()
@@ -654,6 +666,15 @@ class VisPyCanvas(scene.SceneCanvas):
 
             if new_width > 0 and new_height > 0:
                 self.view.camera.rect = (new_x, new_y, new_width, new_height)
+                
+                # Check for "stuck" zoom condition (width too small for data bounds)
+                if self.data_bounds:
+                    time_min, time_max, _, _ = self.data_bounds
+                    total_width = time_max - time_min
+                    # If we're extremely zoomed in (less than 1ms view) and stuck at bounds, 
+                    # allow zooming out by clamping less aggressively in future steps
+                    pass
+
                 # Mark as zooming and delay normalization until zoom ends
                 self.is_zooming = True
                 self._zoom_end_timer.start(200)  # 200ms after last zoom event
@@ -1050,13 +1071,25 @@ class VisPyCanvas(scene.SceneCanvas):
         """Set data bounds for zoom/pan constraints."""
         self.data_bounds = (time_min, time_max, freq_min, freq_max)
         logger.info(f"Data bounds set: time=[{time_min:.3f}, {time_max:.3f}], freq=[{freq_min:.1f}, {freq_max:.1f}]")
+        
+        # Reset zoom detector to prevent getting "stuck" in a zoomed state internally
+        if hasattr(self, 'zoom_detector'):
+            self.zoom_detector.reset()
     
     def reset_camera_to_data_bounds(self):
         """Reset camera to show all data."""
         if self.data_bounds:
             time_min, time_max, freq_min, freq_max = self.data_bounds
+            # Ensure minimal valid range to prevent zero-size errors
+            if time_max <= time_min: time_max = time_min + 1.0
+            if freq_max <= freq_min: freq_max = freq_min + 1.0
+            
             self.view.camera.rect = (time_min, freq_min, time_max - time_min, freq_max - freq_min)
             self.update_dynamic_clim()
+            
+            # Reset zoom detector state
+            if hasattr(self, 'zoom_detector'):
+                self.zoom_detector.reset()
 
     def _pan_by_fraction(self, dx_fraction: float, dy_fraction: float):
         """Pan the view by a fraction of the current view size.
@@ -1121,16 +1154,32 @@ class VisPyCanvas(scene.SceneCanvas):
         
         # Handle 2D data
         if display_data.ndim == 2:
-            # Check texture limits
+            # Check texture limits and downsample intelligently
             if display_data.shape[1] > self.max_texture_size:
                 factor = int(np.ceil(display_data.shape[1] / self.max_texture_size))
-                logger.warning(f"Downsampling by {factor}x in time")
-                display_data = display_data[:, ::factor]
+                logger.warning(f"Downsampling by {factor}x in time (using Max Pooling for visibility)")
+                
+                # Reshape and take MAX to preserve spectral peaks (avoid 'holes')
+                # This is much better than slicing [::factor] which loses data
+                pad_size = (factor - (display_data.shape[1] % factor)) % factor
+                if pad_size > 0:
+                    display_data = np.pad(display_data, ((0, 0), (0, pad_size)), mode='edge')
+                
+                reshaped = display_data.reshape(display_data.shape[0], -1, factor)
+                display_data = reshaped.max(axis=2)  # Max pooling keeps peaks visible
             
             if display_data.shape[0] > self.max_texture_size:
                 factor = int(np.ceil(display_data.shape[0] / self.max_texture_size))
-                logger.warning(f"Downsampling by {factor}x in frequency")
-                display_data = display_data[::factor, :]
+                logger.warning(f"Downsampling by {factor}x in frequency (using Max Pooling for visibility)")
+                
+                # Reshape and take MAX to preserve spectral tracks (avoid 'holes')
+                pad_size = (factor - (display_data.shape[0] % factor)) % factor
+                if pad_size > 0:
+                    display_data = np.pad(display_data, ((0, pad_size), (0, 0)), mode='edge')
+                
+                reshaped = display_data.reshape(-1, factor, display_data.shape[1])
+                display_data = reshaped.max(axis=1)
+
             
             # Handle non-finite values
             display_data = np.nan_to_num(display_data, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1176,8 +1225,12 @@ class VisPyCanvas(scene.SceneCanvas):
             self.image_visual.transform = transform
             
             if not preserve_view:
-                self.set_data_bounds(time_start, time_end, freq_start, freq_end)
+                # IMPORTANT: do NOT shrink navigation bounds to the loaded display window.
+                # `data_bounds` must represent the full file (set by MainWindow), otherwise the user
+                # gets “stuck” on time ranges after settings change / lazy refresh.
                 self.view.camera.rect = (time_start, freq_start, time_width, freq_height)
+                if hasattr(self, 'zoom_detector'):
+                    self.zoom_detector.reset()
         
         # Restore camera position if preserving view
         if preserve_view and saved_camera_rect:
@@ -1226,12 +1279,51 @@ class VisPyCanvas(scene.SceneCanvas):
         """Immediately adjust color scaling based on visible region."""
         if self.raw_display_data is None:
             return
+
+        # Global/locked normalization: do not adapt to zoom/window
+        if getattr(self, 'normalization_scope', 'global') == 'global':
+            clim_min, clim_max = None, None
+
+            if self.normalization_mode == 'minmax':
+                # Manual range wins
+                if self.db_range:
+                    clim_min, clim_max = self.db_range
+                elif self.global_percentiles:
+                    clim_min, clim_max = self.global_percentiles
+                elif self.global_data_range:
+                    clim_min, clim_max = self.global_data_range
+            else:
+                # STD mode
+                if self.global_mean_std:
+                    self.local_mean_std = self.global_mean_std
+                    mean, std = self.global_mean_std
+                    clim_min = float(mean - self.std_scale * std)
+                    clim_max = float(mean + self.std_scale * std)
+
+            if clim_min is None or clim_max is None:
+                clim_min = float(np.nanmin(self.raw_display_data))
+                clim_max = float(np.nanmax(self.raw_display_data))
+
+            if clim_max - clim_min < 1e-6:
+                clim_max = clim_min + 1.0
+
+            new_clim = (float(clim_min), float(clim_max))
+            if self.current_clim is None or abs(new_clim[0] - self.current_clim[0]) > 0.01 or abs(new_clim[1] - self.current_clim[1]) > 0.01:
+                self.current_clim = new_clim
+                self._apply_normalized_data(new_clim[0], new_clim[1])
+            return
         
         clim_min, clim_max = None, None
         
         rect = getattr(self.view.camera, 'rect', None)
-        if rect is not None and self.data_bounds is not None:
-            time_min, time_max, freq_min, freq_max = self.data_bounds
+        # IMPORTANT:
+        # - `data_bounds` is used for navigation constraints (full file)
+        # - `display_extent` is the bounds of the *currently displayed* data window
+        # For statistics/normalization we must index using display_extent, otherwise we get wrong
+        # indices (and inconsistent contrast) when lazy-loading chunks.
+        bounds = self.display_extent if self.display_extent is not None else self.data_bounds
+        if rect is not None and bounds is not None:
+            time_min, time_max, freq_min, freq_max = bounds
             time_span = max(time_max - time_min, 1e-9)
             freq_span = max(freq_max - freq_min, 1e-9)
             
@@ -1270,12 +1362,12 @@ class VisPyCanvas(scene.SceneCanvas):
                         local_std = max(float(np.std(finite_vals)), 1e-6)
                         self.local_mean_std = (local_mean, local_std)
                         # Still compute clim for fallback, but use local mean/std for normalization
-                        clim_min = float(np.percentile(finite_vals, 2))
-                        clim_max = float(np.percentile(finite_vals, 98))
+                        clim_min = float(np.percentile(finite_vals, 1))
+                        clim_max = float(np.percentile(finite_vals, 99.5))
                     else:
-                        # Min-Max normalization
-                        clim_min = float(np.percentile(finite_vals, 2))
-                        clim_max = float(np.percentile(finite_vals, 98))
+                        # Min-Max normalization (slightly wider percentiles reduce “contrast pumping”)
+                        clim_min = float(np.percentile(finite_vals, 1))
+                        clim_max = float(np.percentile(finite_vals, 99.5))
         
         # Fallback
         if clim_min is None or clim_max is None:
@@ -1408,25 +1500,23 @@ class VisPyCanvas(scene.SceneCanvas):
         except Exception as e:
             logger.error(f"Error in _apply_normalized_data: {e}", exc_info=True)
     
-    def set_normalization_mode(self, mode: str, std_scale: float = 2.5):
-        """Set normalization mode.
+    def set_normalization_mode(self, mode: str, std_scale: float = 2.5, gamma: float = 1.0):
+        """Set the data normalization mode and gamma.
         
         Args:
-            mode: 'minmax' or 'std'
-            std_scale: Scale factor for STD normalization (typically 2.0-3.0)
+            mode: 'minmax' (0-1), 'std' (mean +/- scale*std)
+            std_scale: Scale factor for std mode
+            gamma: Gamma correction value (1.0 = linear, <1.0 = brighten shadows, >1.0 = darken)
         """
-        if mode not in ('minmax', 'std'):
-            logger.warning(f"Invalid normalization mode: {mode}, using 'minmax'")
-            mode = 'minmax'
-        
         self.normalization_mode = mode
-        self.std_scale = max(0.5, min(5.0, std_scale))  # Clamp to reasonable range
-        
-        # Re-apply normalization with new mode
-        if self.current_clim is not None:
-            self._apply_normalized_data(self.current_clim[0], self.current_clim[1])
-        
-        logger.debug(f"Normalization mode changed to: {mode} (std_scale={self.std_scale})")
+        self.std_scale = std_scale
+        # Update gamma if changed
+        if gamma != 1.0 and gamma != self.gamma_correction:
+            self.gamma_correction = gamma
+            
+        self.current_clim = None  # Force re-calc
+        self._update_dynamic_clim_now()
+        logger.info(f"Normalization set to {mode} (scale={std_scale}, gamma={self.gamma_correction})")
 
     def set_gamma_correction(self, gamma: float):
         """Set gamma correction value for perceptual contrast.
@@ -1509,32 +1599,95 @@ class VisPyCanvas(scene.SceneCanvas):
 
     def set_interpolation(self, mode: str):
         """Set image interpolation mode."""
-        vispy_mode_map = {'nearest': 'nearest', 'bilinear': 'linear', 'bicubic': 'cubic'}
+        vispy_mode_map = {
+            'nearest': 'nearest',
+            'bilinear': 'linear',
+            'bicubic': 'bicubic',
+            'hanning': 'hanning',
+            'kaiser': 'kaiser',
+            'lanczos': 'lanczos',
+        }
         try:
-            vispy_mode = vispy_mode_map.get(mode, 'linear')
+            vispy_mode = vispy_mode_map.get(mode, 'bicubic')  # Default to bicubic for quality
             self.image_visual.interpolation = vispy_mode
+            # Some VisPy builds silently fall back; read back the actual value if available
+            actual = getattr(self.image_visual, 'interpolation', None)
+            if actual is not None and actual != vispy_mode:
+                logger.warning(
+                    f"Requested interpolation '{vispy_mode}' not applied (actual '{actual}'). "
+                    f"This VisPy build may not support that mode."
+                )
             self.current_interpolation = mode
             self.update()
-        except Exception:
-            pass
+            logger.debug(f"Interpolation set to: {vispy_mode}")
+        except Exception as e:
+            logger.warning(f"Failed to set interpolation '{mode}': {e}. Falling back to 'linear'.")
+            try:
+                self.image_visual.interpolation = 'linear'
+                self.current_interpolation = 'bilinear'
+                self.update()
+            except Exception:
+                pass
+
+    def set_normalization_scope(self, scope: str):
+        """Set normalization scope: 'global' (stable) or 'view' (adaptive)."""
+        scope = (scope or '').lower().strip()
+        if scope not in ('global', 'view'):
+            scope = 'global'
+        self.normalization_scope = scope
+        logger.info(f"Normalization scope set to: {scope}")
     
     # ==================== Curve Drawing (Doppler) ====================
+
+    def _disable_all_modes(self):
+        """Disable all interactive modes and reset their states to ensure exclusivity.
+        
+        This prevents mode conflicts where multiple modes capture mouse events simultaneously.
+        """
+        # 1. Event Mode Cleanup
+        if self.event_mode:
+            self.event_mode = False
+            self._set_event_lines_visible(False)
+            if self._on_event_mode_toggled_callback:
+                self._on_event_mode_toggled_callback(False)
+        
+        # 2. Measurement Mode Cleanup
+        if self.measurement_mode:
+            self.measurement_mode = False
+            if self._measurement_mode_callback:
+                self._measurement_mode_callback(False)
+                
+        # 3. Curve Mode Cleanup
+        if self.curve_mode:
+            self.curve_mode = False
+            self.curve_ghost.visible = False
+            
+        # 4. Annotation Mode Cleanup
+        if self.annotation_mode:
+            self.annotation_mode = False
+            self.annotation_drawing = False
+            self.annotation_start = None
+            self.annotation_end = None
+            if hasattr(self, '_annotation_renderer') and self._annotation_renderer:
+                self._annotation_renderer.hide_temp_rectangle()
+
+        # Reset common state
+        self.is_panning = False
+        self.update_text_readout("", (10, 60))
+        self.update_mode_indicator()
 
     def set_curve_mode(self, enabled: bool):
         """Enable or disable curve drawing mode."""
         was_enabled = self.curve_mode
-        self.curve_mode = enabled
-
-        if enabled and not was_enabled:
-            # Entering curve mode - disable other modes
-            self.annotation_mode = False
-            self.measurement_mode = False
-            # Show visual feedback
+        
+        # Always disable everything first to ensure no conflicts
+        self._disable_all_modes()
+        
+        if enabled:
+            self.curve_mode = True
             self.update_text_readout("CURVE MODE: Click to add points (need 2 min) | Right-click to clear | Enter to finish", (10, 60))
-            logger.info("Curve mode: ON (Click to add points, Right-click to clear, Enter to finish)")
-        elif not enabled and was_enabled:
-            self.update_text_readout("", (10, 60))
-            self.curve_ghost.visible = False
+            logger.info("Curve mode: ON")
+        else:
             logger.info("Curve mode: OFF")
 
         # Update mode indicator and canvas
@@ -1701,16 +1854,14 @@ class VisPyCanvas(scene.SceneCanvas):
         Args:
             enabled: True to enable event mode
         """
-        was_enabled = self.event_mode
-        self.event_mode = enabled
+        # Always disable everything first
+        self._disable_all_modes()
 
-        if enabled and not was_enabled:
-            # Entering event mode - disable other modes
-            self.annotation_mode = False
-            self.measurement_mode = False
-            self.curve_mode = False
-            # Show existing lines if any
+        if enabled:
+            self.event_mode = True
             self._set_event_lines_visible(True)
+            
+            # Restore readout based on state
             if self.event_t1 is None:
                 self.update_text_readout("EVENT MODE: Click to place start line", (10, 60))
             elif self.event_t2 is None:
@@ -1718,12 +1869,15 @@ class VisPyCanvas(scene.SceneCanvas):
             else:
                 t_start = min(self.event_t1, self.event_t2)
                 t_end = max(self.event_t1, self.event_t2)
-                self.update_text_readout(f"EVENT: {t_start:.3f}s - {t_end:.3f}s | Click to start new event", (10, 60))
-            logger.info("Event mode: ON (Click to place vertical lines)")
-        elif not enabled and was_enabled:
-            # Exiting event mode - hide lines but DON'T delete them
-            self._set_event_lines_visible(False)
-            self.update_text_readout("", (10, 60))
+                duration = t_end - t_start
+                self.update_text_readout(f"EVENT: {t_start:.3f}s - {t_end:.3f}s ({duration:.3f}s)", (10, 60))
+            
+            logger.info("Event mode: ON")
+            
+            # Notify callback that it's ON
+            if self._on_event_mode_toggled_callback:
+                self._on_event_mode_toggled_callback(True)
+        else:
             logger.info("Event mode: OFF")
 
         # Update mode indicator and canvas
@@ -1880,18 +2034,22 @@ class VisPyCanvas(scene.SceneCanvas):
     
     def toggle_measurement_mode(self):
         """Toggle measurement mode on/off."""
-        self.measurement_mode = not self.measurement_mode
-        if not self.measurement_mode:
+        was_enabled = self.measurement_mode
+        
+        # Disable all other modes first
+        self._disable_all_modes()
+        
+        if not was_enabled:
+            self.measurement_mode = True
+            logger.info("Measurement mode: ON")
+            self.update_text_readout("MEASUREMENT MODE: Click points to measure | Right-click/ESC to clear", (10, 60))
+            if self._measurement_mode_callback:
+                self._measurement_mode_callback(True)
+        else:
+            logger.info("Measurement mode: OFF")
             self.clear_measurement()
-        logger.info(f"Measurement mode: {'ON' if self.measurement_mode else 'OFF'}")
-
-        # Update mode indicator
+            
         self.update_mode_indicator()
-
-        # Notify callback
-        if self._measurement_mode_callback:
-            self._measurement_mode_callback(self.measurement_mode)
-
         return self.measurement_mode
     
     def clear_measurement(self):
@@ -2107,15 +2265,15 @@ class VisPyCanvas(scene.SceneCanvas):
         Args:
             enabled: True to enable annotation mode, False to disable
         """
-        self.annotation_mode = enabled
-        if not enabled:
-            # Clean up any in-progress drawing
-            self.annotation_drawing = False
-            self.annotation_start = None
-            self.annotation_end = None
-            if self._annotation_renderer:
-                self._annotation_renderer.hide_temp_rectangle()
-        logger.info(f"Annotation mode: {'ON' if enabled else 'OFF'}")
+        # Always disable everything first
+        self._disable_all_modes()
+        
+        if enabled:
+            self.annotation_mode = True
+            logger.info("Annotation mode: ON")
+        else:
+            logger.info("Annotation mode: OFF")
+            
         self.update_mode_indicator()
     
     def set_annotation_callbacks(self, on_created=None, on_clicked=None, on_context_menu=None):

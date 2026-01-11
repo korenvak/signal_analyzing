@@ -77,9 +77,9 @@ class ProjectManager:
                 "files": [],
                 "global_settings": {
                     "default_fft_size": 4096,
-                    "default_hop_length": 512,
+                    "default_hop_length": 164,
                     "default_window": "hamming",
-                    "default_overlap_percent": 87.5
+                    "default_overlap_percent": 96.0
                 },
                 "sensor_info": {
                     "sensor_id": "",
