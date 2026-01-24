@@ -434,8 +434,7 @@ class VisPyCanvas(scene.SceneCanvas):
         self._on_event_created_callback = None    # Callback(t_start, t_end) when both lines placed
         self._on_event_mode_toggled_callback = None  # Callback(enabled: bool) when mode toggled via E key
 
-        # Detected Doppler Tracks (from full spectrogram detection)
-        self.detected_track_visuals = []  # List of Line visuals for detected tracks
+
 
         # Saved/stored tracks (persisted curves that remain visible)
         self.stored_track_visuals = {}  # Dict[track_id, {'line': visual, 'markers': visual, 'visible': bool}]
@@ -590,7 +589,7 @@ class VisPyCanvas(scene.SceneCanvas):
         # Reset specific modes
         self.set_curve_mode(False)
         self.clear_curve()
-        self.clear_preview_curves()
+
         if hasattr(self, 'clear_event_markers'):
             self.clear_event_markers()
             
@@ -1002,18 +1001,43 @@ class VisPyCanvas(scene.SceneCanvas):
                 new_left = rect.left + delta_x
                 new_bottom = rect.bottom + delta_y
                 
+                # Strict bounds enforcement:
+                # If data_bounds is None, we likely haven't loaded yet -> disable panning
+                if not self.data_bounds:
+                    return
+
                 if self.data_bounds:
                     time_min, time_max, freq_min, freq_max = self.data_bounds
                     
-                    if new_left < time_min:
-                        new_left = time_min
-                    if new_left + rect.width > time_max:
-                        new_left = time_max - rect.width
+                    # Ensure we don't pan "past" the content (no black bars)
+                    # Constraint X:
+                    # If zoomed out wider than content, pin to center or left?
+                    # Logic: 
+                    # 1. new_left must be >= time_min
+                    # 2. new_right (new_left + width) must be <= time_max
                     
-                    if new_bottom < freq_min:
+                    # If width > duration, we can't satisfy both.
+                    # Currently width is clamped by zoom logic. But let's be safe.
+                    
+                    if rect.width > (time_max - time_min):
+                        # Content smaller than view -> Center it? Or pin left.
+                        # Pin left is safer for coordinates.
+                        new_left = time_min
+                    else:
+                        if new_left < time_min:
+                            new_left = time_min
+                        if new_left + rect.width > time_max:
+                            new_left = time_max - rect.width
+                    
+                    # Constraint Y:
+                    if rect.height > (freq_max - freq_min):
                         new_bottom = freq_min
-                    if new_bottom + rect.height > freq_max:
-                        new_bottom = freq_max - rect.height
+                    else:
+                        if new_bottom < freq_min:
+                            new_bottom = freq_min
+                        if new_bottom + rect.height > freq_max:
+                            new_bottom = freq_max - rect.height
+                
                 
                 self.view.camera.rect = (new_left, new_bottom, rect.width, rect.height)
                 self.update_dynamic_clim()
@@ -1117,8 +1141,21 @@ class VisPyCanvas(scene.SceneCanvas):
         if self.data_bounds:
             time_min, time_max, freq_min, freq_max = self.data_bounds
             # Don't pan beyond data bounds
-            new_left = max(time_min, min(new_left, time_max - rect.width))
-            new_bottom = max(freq_min, min(new_bottom, freq_max - rect.height))
+            
+             # Constraint X
+            if rect.width > (time_max - time_min):
+                new_left = time_min
+            else:
+                new_left = max(time_min, min(new_left, time_max - rect.width))
+
+            # Constraint Y
+            if rect.height > (freq_max - freq_min):
+                new_bottom = freq_min
+            else:
+                new_bottom = max(freq_min, min(new_bottom, freq_max - rect.height))
+        else:
+             # No bounds -> disable panning to prevent getting lost
+             return
 
         # Apply new camera rect
         self.view.camera.rect = (new_left, new_bottom, rect.width, rect.height)
@@ -1809,38 +1846,7 @@ class VisPyCanvas(scene.SceneCanvas):
         logger.info(f"Curve markers set to visible with {len(points)} points at order 300")
         self.update()
 
-    # ==================== Preview Curves (for DSP detection) ====================
 
-    def draw_preview_curve(self, points: np.ndarray, color: str = 'yellow'):
-        """Draw a preview curve on the spectrogram.
-
-        Args:
-            points: Nx2 array of (time, freq) points
-            color: Color for the curve
-        """
-        if not hasattr(self, '_preview_curves'):
-            self._preview_curves = []
-
-        if len(points) < 2:
-            return
-
-        # Create a new line visual for preview
-        preview_line = scene.visuals.Line(parent=self.view.scene, method='gl')
-        preview_line.set_data(pos=points, color=color, width=3.0)
-        preview_line.visible = True
-        preview_line.order = 160  # Above annotations
-        preview_line.set_gl_state('translucent', depth_test=False)
-
-        self._preview_curves.append(preview_line)
-        self.update()
-
-    def clear_preview_curves(self):
-        """Clear all preview curves from the spectrogram."""
-        if hasattr(self, '_preview_curves'):
-            for curve in self._preview_curves:
-                curve.parent = None  # Remove from scene
-            self._preview_curves = []
-            self.update()
 
     # ==================== Event Tagging Mode (Vertical Lines) ====================
 
@@ -2517,67 +2523,7 @@ class VisPyCanvas(scene.SceneCanvas):
 
         return region, region_times, region_freqs
 
-    # ==================== Detected Tracks Visualization ====================
 
-    def add_detected_track(self, times: list, freqs: list, track_id: int = 0,
-                          color: tuple = (1.0, 0.3, 0.3, 0.8)):
-        """Add a detected Doppler track to the visualization.
-
-        Args:
-            times: List of time values in seconds
-            freqs: List of frequency values in Hz
-            track_id: Unique identifier for this track
-            color: RGBA color tuple for the track line
-        """
-        if len(times) < 2 or len(freqs) < 2:
-            return
-
-        # Create points array
-        points = np.column_stack([times, freqs]).astype(np.float32)
-
-        # Create a new Line visual for this track
-        track_visual = scene.visuals.Line(parent=self.view.scene, method='gl')
-        track_visual.set_data(pos=points, color=color, width=2.5)
-        track_visual.visible = True
-        track_visual.order = 160  # Above spectrogram, below annotations
-        track_visual.set_gl_state('translucent', depth_test=False)
-
-        # Store reference
-        self.detected_track_visuals.append({
-            'visual': track_visual,
-            'track_id': track_id,
-            'times': times,
-            'freqs': freqs
-        })
-
-        logger.debug(f"Added detected track {track_id} with {len(times)} points")
-
-    def clear_detected_tracks(self):
-        """Remove all detected track visuals from the display."""
-        for track_data in self.detected_track_visuals:
-            visual = track_data['visual']
-            if visual is not None:
-                visual.parent = None  # Remove from scene
-
-        self.detected_track_visuals = []
-        self.update()
-        logger.debug("Cleared all detected track visuals")
-
-    def set_detected_tracks_visible(self, visible: bool):
-        """Show or hide all detected track visuals.
-
-        Args:
-            visible: True to show, False to hide
-        """
-        for track_data in self.detected_track_visuals:
-            visual = track_data['visual']
-            if visual is not None:
-                visual.visible = visible
-        self.update()
-
-    def get_detected_track_count(self) -> int:
-        """Get the number of detected tracks currently displayed."""
-        return len(self.detected_track_visuals)
 
     # ==================== Stored/Saved Tracks Visualization ====================
 

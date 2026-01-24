@@ -152,7 +152,20 @@ class PlaylistWidget(QWidget):
         name_rev_action.triggered.connect(lambda: self.sort_playlist('name', True))
         
         menu.addSeparator()
-        
+
+        # Pixel (sensor_id)
+        pixel_action = menu.addAction("📍 Pixel (smallest first)")
+        pixel_action.setCheckable(True)
+        pixel_action.setChecked(self._current_sort == 'pixel' and not self._sort_reverse)
+        pixel_action.triggered.connect(lambda: self.sort_playlist('pixel', False))
+
+        pixel_rev_action = menu.addAction("📍 Pixel (largest first)")
+        pixel_rev_action.setCheckable(True)
+        pixel_rev_action.setChecked(self._current_sort == 'pixel' and self._sort_reverse)
+        pixel_rev_action.triggered.connect(lambda: self.sort_playlist('pixel', True))
+
+        menu.addSeparator()
+
         # Size
         size_action = menu.addAction("📊 Size (smallest first)")
         size_action.setCheckable(True)
@@ -191,6 +204,18 @@ class PlaylistWidget(QWidget):
         elif sort_type == 'size':
             # Sort by file size
             sorted_paths = sorted(file_paths, key=lambda p: self.audio_files[p].size_mb, reverse=reverse)
+        elif sort_type == 'pixel':
+            # Sort by pixel/sensor_id from filename
+            def get_pixel_key(path: str) -> Tuple:
+                """Get pixel sort key - (has_pixel, pixel_id, name)."""
+                parsed = parse_pixel_filename(path)
+                name = Path(path).name.lower()
+                if parsed is not None:
+                    return (0, parsed.sensor_id, name)
+                else:
+                    # Files without pixel info sort after (or before if reverse)
+                    return (1, float('inf'), name)
+            sorted_paths = sorted(file_paths, key=get_pixel_key, reverse=reverse)
         else:
             sorted_paths = file_paths
         
@@ -200,7 +225,8 @@ class PlaylistWidget(QWidget):
         sort_desc = {
             'smart': 'time' if not reverse else 'time (newest first)',
             'name': 'A-Z' if not reverse else 'Z-A',
-            'size': 'smallest' if not reverse else 'largest'
+            'size': 'smallest' if not reverse else 'largest',
+            'pixel': 'pixel (smallest first)' if not reverse else 'pixel (largest first)'
         }
         logger.info(f"Playlist sorted by {sort_desc.get(sort_type, sort_type)}")
     

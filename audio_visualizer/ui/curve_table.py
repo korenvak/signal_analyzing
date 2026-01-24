@@ -12,25 +12,22 @@ from .annotation_data import Annotation
 logger = logging.getLogger(__name__)
 
 
-class AnnotationTableWidget(QTableWidget):
-    """Table widget for displaying and editing annotations."""
+class CurveTableWidget(QTableWidget):
+    """Table widget for displaying and editing curves."""
     
     # Signals
     annotation_selected = Signal(int)  # annotation_id
     annotation_deleted = Signal(int)  # annotation_id
     annotation_updated = Signal(int)  # annotation_id
     annotation_visibility_changed = Signal(int, bool)  # annotation_id, is_visible
-
+    curve_visibility_changed = Signal(int, bool)  # annotation_id, show_curve
     
+    # Column indices (for easy reference)
     # Column indices (for easy reference)
     COL_ID = 0
     COL_FILE = 1
-    COL_T_START = 2
-    COL_T_END = 3
-    COL_F_MIN = 4
-    COL_F_MAX = 5
-    COL_VIEW = 6
-
+    COL_POINTS = 2
+    COL_VIEW = 3
     
     def __init__(self, parent=None):
         """Initialize the annotation table."""
@@ -60,10 +57,9 @@ class AnnotationTableWidget(QTableWidget):
             }
         """)
         
-        # Setup columns - removed Label column
+        # Setup columns
         columns = [
-            'ID', 'File', 't_start', 't_end', 'f_min', 'f_max',
-            'View'
+            'ID', 'File', 'Points', 'View'
         ]
         self.setColumnCount(len(columns))
         self.setHorizontalHeaderLabels(columns)
@@ -81,14 +77,11 @@ class AnnotationTableWidget(QTableWidget):
         header.setStretchLastSection(False)
 
         # Set initial column widths (pixels)
-        self.setColumnWidth(self.COL_ID, 40)      # ID
-        self.setColumnWidth(self.COL_FILE, 120)   # File
-        self.setColumnWidth(self.COL_T_START, 70) # t_start
-        self.setColumnWidth(self.COL_T_END, 70)   # t_end
-        self.setColumnWidth(self.COL_F_MIN, 65)   # f_min
-        self.setColumnWidth(self.COL_F_MAX, 65)   # f_max
-        self.setColumnWidth(self.COL_VIEW, 50)    # View
-
+        # Set initial column widths (pixels)
+        self.setColumnWidth(self.COL_ID, 40)
+        self.setColumnWidth(self.COL_FILE, 120)
+        self.setColumnWidth(self.COL_POINTS, 60)
+        self.setColumnWidth(self.COL_VIEW, 50)
 
         # File column should stretch to fill available space
         header.setSectionResizeMode(self.COL_FILE, QHeaderView.ResizeMode.Stretch)
@@ -147,33 +140,16 @@ class AnnotationTableWidget(QTableWidget):
         name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.setItem(row, self.COL_FILE, name_item)
         
-        # Time range (read-only)
-        t_start_item = QTableWidgetItem(f"{annotation.t_start:.3f}")
-        t_start_item.setFlags(t_start_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, self.COL_T_START, t_start_item)
+        # Points count (read-only)
+        points_item = QTableWidgetItem(str(len(annotation.points)))
+        points_item.setFlags(points_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.setItem(row, self.COL_POINTS, points_item)
         
-        t_end_item = QTableWidgetItem(f"{annotation.t_end:.3f}")
-        t_end_item.setFlags(t_end_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, self.COL_T_END, t_end_item)
-        
-        # Frequency range (read-only)
-        f_min_item = QTableWidgetItem(f"{annotation.f_min:.1f}")
-        f_min_item.setFlags(f_min_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, self.COL_F_MIN, f_min_item)
-        
-        f_max_item = QTableWidgetItem(f"{annotation.f_max:.1f}")
-        f_max_item.setFlags(f_max_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.setItem(row, self.COL_F_MAX, f_max_item)
-        
-
-        
-        # View checkbox (show/hide annotation rectangle) - always enabled
+        # View checkbox (show/hide curve)
         view_item = QTableWidgetItem()
-        view_item.setCheckState(Qt.CheckState.Checked if annotation.is_visible else Qt.CheckState.Unchecked)
+        view_item.setCheckState(Qt.CheckState.Checked if annotation.show_doppler_curve else Qt.CheckState.Unchecked)
         view_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
         self.setItem(row, self.COL_VIEW, view_item)
-        
-
     
     def remove_annotation(self, annotation_id: int) -> bool:
         """Remove an annotation row from the table.
@@ -285,11 +261,9 @@ class AnnotationTableWidget(QTableWidget):
         
         # Handle visibility toggle (View column)
         if col == self.COL_VIEW:
-            is_visible = item.checkState() == Qt.CheckState.Checked
-            logger.debug(f"View checkbox changed for annotation {annotation_id}: {is_visible}")
-            self.annotation_visibility_changed.emit(annotation_id, is_visible)
-        
-
+            show_curve = item.checkState() == Qt.CheckState.Checked
+            logger.debug(f"Curve view checkbox changed for annotation {annotation_id}: {show_curve}")
+            self.curve_visibility_changed.emit(annotation_id, show_curve)
         
         # Emit general update signal for other changes
         self.annotation_updated.emit(annotation_id)
@@ -346,9 +320,10 @@ class AnnotationTableWidget(QTableWidget):
             return None
         
         try:
-            is_visible = self.item(row, self.COL_VIEW).checkState() == Qt.CheckState.Checked
+            show_doppler_curve = self.item(row, self.COL_VIEW).checkState() == Qt.CheckState.Checked
+            
             return {
-                'is_visible': is_visible
+                'show_doppler_curve': show_doppler_curve
             }
         except (ValueError, AttributeError) as e:
             logger.error(f"Error reading annotation data from row {row}: {e}")

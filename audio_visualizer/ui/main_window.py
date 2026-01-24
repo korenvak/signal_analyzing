@@ -14,7 +14,7 @@ from .qt_compat import (
     QWidget, QToolBar, QLabel, QPushButton, QFileDialog,
     QMessageBox, QSplitter, QFrame, QSizePolicy, QDialog,
     Qt, QTimer, QAction, QKeySequence, QMenu, QCursor, QTabWidget,
-    QInputDialog, QThread, Signal, QObject
+    QInputDialog, QThread, Signal, QObject, QKeyEvent
 )
 
 
@@ -132,13 +132,15 @@ from .status_widget import StatusWidget
 from .multi_file_manager import PlaylistWidget
 from .annotation_manager import AnnotationManager
 from .annotation_table import AnnotationTableWidget
+from .curve_table import CurveTableWidget
 from .annotation_renderer import AnnotationRenderer
 from .annotation_data import Annotation
 from .interaction_manager import InteractionManager, CoordinateMapper
 from .cutout_dialog import CutoutDialog
 from .spectrum_dialog import SpectrumDialog
 from .measurement_panel import MeasurementPanel
-from .auto_detect_dialog import AutoDetectDialog, run_auto_detect_dialog
+from .settings_dialog import SpectrogramSettingsDialog
+from .measurement_panel import MeasurementPanel
 from .event_manager import EventManager
 from .event_panel import EventPanel
 from .global_annotation_panel import GlobalAnnotationPanel
@@ -151,17 +153,9 @@ from ..core.filter_manager import FilterManager
 from ..core.filename_parser import parse_pixel_filename
 from .filter_dialog import (
     GaussianBlurDialog, MedianFilterDialog, ContrastEnhanceDialog,
-    ThresholdDialog, MeijeringDialog, MorphologicalDialog,
-    HorizontalLineRemovalDialog, VerticalLineRemovalDialog,
-    SpectralSubtractionDialog, PCENDialog, AdaptiveNoiseGateDialog,
-    TrackSuppressionDialog, LowPassFilterDialog, HighPassFilterDialog,
-    BandPassFilterDialog, BandStopFilterDialog, WienerFilterDialog,
-    BilateralFilterDialog, HarmonicPercussiveDialog, SpectralGatingDialog,
-    TotalVariationDialog, NonLocalMeansDialog, LocalContrastNormDialog,
-    CLAHEDialog
+    ThresholdDialog, LowPassFilterDialog, HighPassFilterDialog,
+    BandPassFilterDialog, BandStopFilterDialog
 )
-from .detector_dialog import DetectorParamsDialog
-from ..core.spectrogram_detector import SpectrogramDetector, DopplerTrack
 from ..core.cutout_analyzer import (
     extract_spectrogram_cutout,
     normalize_cutout,
@@ -171,16 +165,7 @@ from ..core.cutout_analyzer import (
 )
 from ..core.gpu_dsp_engine import get_dsp_engine, DetectedCurve, SNRResult, HarmonicResult
 
-# DAS Multi-channel tab (lazy import to avoid circular deps)
-DASTab = None
 
-def _get_das_tab_class():
-    """Lazy import of DASTab to avoid circular imports."""
-    global DASTab
-    if DASTab is None:
-        from .das_tab import DASTab as _DASTab
-        DASTab = _DASTab
-    return DASTab
 
 logger = logging.getLogger(__name__)
 
@@ -290,10 +275,9 @@ class MainWindow(QMainWindow):
         # Filter manager
         self.filter_manager = FilterManager()
 
-        # Doppler track detector
-        self.spectrogram_detector = SpectrogramDetector()
-        self.detected_tracks = []  # List of DopplerTrack objects
-        self.detected_tracks_undo_stack = []  # For Ctrl+Z undo of tracks
+        # Doppler track detector removed
+        self.detected_tracks = []  # Kept for compatibility if referenced, but unused
+        self.detected_tracks_undo_stack = []
 
         # Spectrogram cache to avoid recomputation
         self.spectrogram_cache = {
@@ -452,25 +436,39 @@ class MainWindow(QMainWindow):
         
         # Add annotation table below the spectrogram with resizable splitter
         self.annotation_table = AnnotationTableWidget()
-        self.annotation_table.setMinimumHeight(80)  # Minimum when collapsed
-
+        self.annotation_table.setMinimumHeight(80)
+        
         # Connect annotation table signals
         self.annotation_table.annotation_selected.connect(self.on_table_annotation_selected)
         self.annotation_table.annotation_deleted.connect(self.on_table_annotation_deleted)
         self.annotation_table.annotation_updated.connect(self.on_table_annotation_updated)
         self.annotation_table.annotation_visibility_changed.connect(self.on_annotation_visibility_changed)
-        self.annotation_table.doppler_visibility_changed.connect(self.on_doppler_visibility_changed)
 
-        # Create vertical splitter for spectrogram and annotation table
+        # Create Curve Table
+        self.curve_table = CurveTableWidget()
+        self.curve_table.setMinimumHeight(80)
+        
+        # Connect curve table signals
+        self.curve_table.annotation_selected.connect(self.on_table_annotation_selected)
+        self.curve_table.annotation_deleted.connect(self.on_table_annotation_deleted)
+        self.curve_table.annotation_updated.connect(self.on_table_annotation_updated)
+        self.curve_table.curve_visibility_changed.connect(self.on_curve_visibility_changed)
+
+        # Create tabs for tables
+        self.table_tabs = QTabWidget()
+        self.table_tabs.addTab(self.annotation_table, "Annotations")
+        self.table_tabs.addTab(self.curve_table, "Curves (Tracks)")
+
+        # Create vertical splitter for spectrogram and annotation tables
         if HAS_VISPY:
             self.spec_table_splitter = QSplitter(Qt.Orientation.Vertical)
             self.spec_table_splitter.addWidget(spec_container)
-            self.spec_table_splitter.addWidget(self.annotation_table)
+            self.spec_table_splitter.addWidget(self.table_tabs)
             # Set initial sizes (80% spectrogram, 20% table)
             self.spec_table_splitter.setSizes([600, 150])
-            # Allow collapsing of annotation table
-            self.spec_table_splitter.setCollapsible(0, False)  # Spectrogram not collapsible
-            self.spec_table_splitter.setCollapsible(1, True)   # Table is collapsible
+            # Allow collapsing of table section
+            self.spec_table_splitter.setCollapsible(0, False)
+            self.spec_table_splitter.setCollapsible(1, True)
             single_channel_layout.addWidget(self.spec_table_splitter)
         else:
             single_channel_layout.addWidget(QLabel("VisPy not available"))
@@ -479,18 +477,8 @@ class MainWindow(QMainWindow):
         self.main_tabs.addTab(single_channel_tab, "Single Channel")
 
         # ============ TAB 2: DAS Multi-Channel ============
-        try:
-            DASTabClass = _get_das_tab_class()
-            self.das_tab = DASTabClass(parent=self)
-            self.das_tab.status_message.connect(self._on_das_status_message)
-            self.main_tabs.addTab(self.das_tab, "DAS Multi-Channel")
-            logger.info("DAS Multi-Channel tab created successfully")
-        except Exception as e:
-            logger.error(f"Failed to create DAS tab: {e}")
-            das_placeholder = QLabel("DAS Multi-Channel tab failed to load.\nCheck logs for details.")
-            das_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.main_tabs.addTab(das_placeholder, "DAS Multi-Channel")
-            self.das_tab = None
+        # DAS Multi-Channel Tab removed
+
 
         # Add Right Sidebar with Tabs (Event Panel and Global Annotations)
         self.right_sidebar = QTabWidget()
@@ -562,11 +550,9 @@ class MainWindow(QMainWindow):
             # Show playlist sidebar for single channel mode
             if hasattr(self, 'playlist_widget'):
                 self.playlist_widget.show()
-        elif index == 1:  # DAS Multi-Channel
-            self.setWindowTitle("DAS Multi-Channel Visualizer")
-            # Hide playlist sidebar for DAS mode (DAS has its own sidebar)
-            if hasattr(self, 'playlist_widget'):
-                self.playlist_widget.hide()
+        elif index == 1:  # DAS Multi-Channel (Removed)
+            pass
+
 
     def _on_right_sidebar_tab_changed(self, index: int):
         """Handle right sidebar tab change."""
@@ -585,9 +571,8 @@ class MainWindow(QMainWindow):
             if index == 1:
                 self._refresh_global_annotations()
 
-    def _on_das_status_message(self, message: str):
-        """Handle status messages from DAS tab."""
-        self.statusBar().showMessage(message, 5000)
+    # DAS status message handler removed
+
 
     def connect_playlist_signals(self):
         """Connect signals from playlist widget."""
@@ -782,38 +767,10 @@ class MainWindow(QMainWindow):
 
         analysis_menu.addSeparator()
 
-        # === DSP Analysis Submenu ===
-        dsp_menu = analysis_menu.addMenu("DSP Analysis")
+        # DSP Menu removed items
 
-        # Auto-detect tracks in visible area
-        detect_tracks_action = QAction("Detect Curved Tracks in View...", self)
-        detect_tracks_action.setShortcut("Ctrl+Shift+D")
-        detect_tracks_action.triggered.connect(self.detect_tracks_in_view)
-        dsp_menu.addAction(detect_tracks_action)
 
-        dsp_menu.addSeparator()
 
-        # SNR for selected annotation
-        snr_action = QAction("Estimate SNR (Selected Annotation)", self)
-        snr_action.triggered.connect(self.estimate_selected_annotation_snr)
-        dsp_menu.addAction(snr_action)
-
-        # Harmonics for selected annotation
-        harmonics_action = QAction("Detect Harmonics (Selected Annotation)", self)
-        harmonics_action.triggered.connect(self.detect_harmonics_selected_annotation)
-        dsp_menu.addAction(harmonics_action)
-
-        # Detect track for selected annotation
-        detect_curve_action = QAction("Detect Curved Track (Selected Annotation)", self)
-        detect_curve_action.triggered.connect(self.detect_curved_track_selected_annotation)
-        dsp_menu.addAction(detect_curve_action)
-
-        dsp_menu.addSeparator()
-
-        # Suppress track
-        suppress_action = QAction("Suppress Track (Selected Annotation)", self)
-        suppress_action.triggered.connect(self.suppress_selected_annotation_track)
-        dsp_menu.addAction(suppress_action)
 
         # Annotation menu
         annotation_menu = menubar.addMenu("Annotations")
@@ -861,7 +818,7 @@ class MainWindow(QMainWindow):
         help_menu.addAction(shortcuts_action)
     
     def setup_filter_menu(self, menubar):
-        """Setup the Filters menu with all available filters."""
+        """Setup the Filters menu with basic filters."""
         filter_menu = menubar.addMenu("Filters")
 
         # === Basic Filters Submenu ===
@@ -902,105 +859,9 @@ class MainWindow(QMainWindow):
         bandstop_action.triggered.connect(self.apply_bandstop_filter)
         freq_menu.addAction(bandstop_action)
 
-        # === Ridge/Edge Detection Submenu ===
-        detection_menu = filter_menu.addMenu("Ridge/Edge Detection")
-
-        meijering_action = QAction("Meijering Ridge Detection...", self)
-        meijering_action.triggered.connect(self.apply_meijering_filter)
-        detection_menu.addAction(meijering_action)
-
-        morphological_action = QAction("Morphological Filter...", self)
-        morphological_action.triggered.connect(self.apply_morphological_filter)
-        detection_menu.addAction(morphological_action)
-
-        # === Noise Removal Submenu ===
-        noise_menu = filter_menu.addMenu("Noise Removal")
-
-        spectral_sub_action = QAction("Spectral Subtraction...", self)
-        spectral_sub_action.triggered.connect(self.apply_spectral_subtraction_filter)
-        noise_menu.addAction(spectral_sub_action)
-
-        pcen_action = QAction("PCEN (Per-Channel Energy Norm)...", self)
-        pcen_action.triggered.connect(self.apply_pcen_filter)
-        noise_menu.addAction(pcen_action)
-
-        adaptive_gate_action = QAction("Adaptive Noise Gate...", self)
-        adaptive_gate_action.triggered.connect(self.apply_adaptive_noise_gate_filter)
-        noise_menu.addAction(adaptive_gate_action)
-
-        spectral_gate_action = QAction("Spectral Gating...", self)
-        spectral_gate_action.triggered.connect(self.apply_spectral_gating_filter)
-        noise_menu.addAction(spectral_gate_action)
-
-        wiener_action = QAction("Wiener Filter...", self)
-        wiener_action.triggered.connect(self.apply_wiener_filter)
-        noise_menu.addAction(wiener_action)
-
-        # === Track Removal Submenu ===
-        track_menu = filter_menu.addMenu("Track/Line Removal")
-
-        h_line_action = QAction("Remove Horizontal Lines (Constant Freq)...", self)
-        h_line_action.triggered.connect(self.apply_horizontal_line_removal_filter)
-        track_menu.addAction(h_line_action)
-
-        v_line_action = QAction("Remove Vertical Lines (Clicks)...", self)
-        v_line_action.triggered.connect(self.apply_vertical_line_removal_filter)
-        track_menu.addAction(v_line_action)
-
-        track_suppress_action = QAction("Track Suppression...", self)
-        track_suppress_action.triggered.connect(self.apply_track_suppression_filter)
-        track_menu.addAction(track_suppress_action)
-
-        hps_action = QAction("Harmonic-Percussive Separation...", self)
-        hps_action.triggered.connect(self.apply_harmonic_percussive_filter)
-        track_menu.addAction(hps_action)
-
-        # === Advanced Denoising Submenu ===
-        advanced_menu = filter_menu.addMenu("Advanced Denoising")
-
-        bilateral_action = QAction("Bilateral Filter (Edge-Preserving)...", self)
-        bilateral_action.triggered.connect(self.apply_bilateral_filter)
-        advanced_menu.addAction(bilateral_action)
-
-        tv_action = QAction("Total Variation Denoising...", self)
-        tv_action.triggered.connect(self.apply_tv_denoise_filter)
-        advanced_menu.addAction(tv_action)
-
-        nlm_action = QAction("Non-Local Means...", self)
-        nlm_action.triggered.connect(self.apply_nlm_filter)
-        advanced_menu.addAction(nlm_action)
-
-        lcn_action = QAction("Local Contrast Normalization...", self)
-        lcn_action.triggered.connect(self.apply_lcn_filter)
-        advanced_menu.addAction(lcn_action)
-
-        clahe_action = QAction("CLAHE (Adaptive Histogram)...", self)
-        clahe_action.triggered.connect(self.apply_clahe_filter)
-        advanced_menu.addAction(clahe_action)
-
-        # === Koren's Filter (Multi-Stage Enhancement) ===
-        filter_menu.addSeparator()
-        koren_action = QAction("Koren's Filter (Adaptive Enhancement)", self)
-        koren_action.triggered.connect(self.apply_koren_filter)
-        filter_menu.addAction(koren_action)
-
-        filter_menu.addSeparator()
-
-        # === Doppler Track Detection ===
-        detect_menu = filter_menu.addMenu("Doppler Detection")
-
-        detect_full_action = QAction("Detect Tracks in Full Spectrogram...", self)
-        detect_full_action.triggered.connect(self.detect_doppler_tracks_full)
-        detect_menu.addAction(detect_full_action)
-
-        detect_clear_action = QAction("Clear Detected Tracks", self)
-        detect_clear_action.triggered.connect(self.clear_detected_tracks)
-        detect_menu.addAction(detect_clear_action)
-
         filter_menu.addSeparator()
 
         # === Undo/Redo ===
-        # General undo action - handles annotations first, then filters
         self.undo_action = QAction("Undo", self)
         self.undo_action.setShortcut("Ctrl+Z")
         self.undo_action.triggered.connect(self.undo_last_action)
@@ -1054,8 +915,15 @@ class MainWindow(QMainWindow):
             }
         """)
         
-        # Settings button - toggles settings panel visibility
-        settings_action = QAction("⚙ Settings", self)
+        # Spectrogram Settings
+        spec_settings_action = QAction("📊 Spec Settings", self)
+        spec_settings_action.triggered.connect(self.open_spectrogram_settings)
+        self.toolbar.addAction(spec_settings_action)
+
+        self.toolbar.addSeparator()
+
+        # Visual Settings (Sidebar)
+        settings_action = QAction("⚙ Visuals", self)
         settings_action.setCheckable(True)
         settings_action.triggered.connect(lambda checked: self.controls_widget.setVisible(checked))
         self.toolbar.addAction(settings_action)
@@ -1097,57 +965,42 @@ class MainWindow(QMainWindow):
         self.toolbar_info.setStyleSheet("color: #888; padding: 0 10px;")
         self.toolbar.addWidget(self.toolbar_info)
         
-    def show_settings_menu(self):
-        """Show settings menu with FFT parameters."""
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background: rgba(30, 30, 40, 0.95);
-                border: 1px solid rgba(255, 255, 255, 0.2);
-                border-radius: 8px;
-                padding: 4px;
-            }
-            QMenu::item {
-                color: #B0B0B0;
-                padding: 6px 20px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background: rgba(100, 100, 255, 0.3);
-                color: white;
-            }
-        """)
-        
-        # FFT Size submenu
-        fft_menu = menu.addMenu("FFT Size")
+    def open_spectrogram_settings(self):
+        """Open the spectrogram settings dialog."""
+        # Get current values
         current_fft = getattr(self.spectrogram_engine, 'fft_size', 4096)
-        for size in [1024, 2048, 4096, 8192, 16384]:
-            action = fft_menu.addAction(f"{size}" + (" ✓" if size == current_fft else ""))
-            action.triggered.connect(lambda checked, s=size: self.set_fft_size(s))
-        
-        # Overlap submenu - calculate current overlap from fft_size and hop_length
-        overlap_menu = menu.addMenu("Overlap %")
         current_hop = getattr(self.spectrogram_engine, 'hop_length', 512)
-        current_overlap = 1 - (current_hop / current_fft) if current_fft > 0 else 0.75
-        for overlap in [0.5, 0.75, 0.875, 0.9375]:
-            pct = int(overlap * 100)
-            action = overlap_menu.addAction(f"{pct}%" + (" ✓" if abs(overlap - current_overlap) < 0.05 else ""))
-            action.triggered.connect(lambda checked, o=overlap: self.set_overlap(o))
-        
-        # Window function submenu
-        window_menu = menu.addMenu("Window Function")
-        current_window = getattr(self.spectrogram_engine, 'window_type', 'blackman')
-        for win in ['hann', 'hamming', 'blackman', 'bartlett', 'kaiser']:
-            action = window_menu.addAction(win.capitalize() + (" ✓" if win == current_window else ""))
-            action.triggered.connect(lambda checked, w=win: self.set_window(w))
-        
-        menu.addSeparator()
-        
-        # Toggle controls panel
-        toggle_action = menu.addAction("Show/Hide Advanced Settings")
-        toggle_action.triggered.connect(lambda: self.controls_widget.setVisible(not self.controls_widget.isVisible()))
-        
-        menu.exec(QCursor.pos())
+        current_overlap = 1.0 - (current_hop / current_fft) if current_fft > 0 else 0.75
+        current_window = getattr(self.spectrogram_engine, 'window_type', 'hann')
+        # Try to get interpolation from canvas
+        current_interp = 'bicubic'
+        if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+            # Accessing via private attribute or method if public getter missing
+            # Assuming 'bicubic' default if fails
+            pass
+
+        dialog = SpectrogramSettingsDialog(self, current_fft, current_overlap, current_window, current_interp)
+        if dialog.exec() == QDialog.Accepted:
+            values = dialog.get_values()
+            
+            # Apply FFT Size
+            if values['fft_size'] != current_fft:
+                self.set_fft_size(values['fft_size'])
+            
+            # Apply Overlap
+            # set_overlap logic usually recomputes hop_length
+            target_overlap = values['overlap']
+            if abs(target_overlap - current_overlap) > 0.001:
+                self.set_overlap(target_overlap)
+            
+            # Apply Window
+            if values['window'] != current_window:
+                self.set_window_function(values['window'])
+                
+            # Apply Interpolation
+            if HAS_VISPY and hasattr(self, 'spectrogram_canvas'):
+                self.spectrogram_canvas.set_interpolation(values['interpolation'])
+
         
     def set_fft_size(self, size: int):
         """Set FFT size and recompute spectrogram."""
@@ -1209,49 +1062,10 @@ class MainWindow(QMainWindow):
     def show_dsp_menu(self):
         """Show DSP analysis menu from toolbar."""
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background: rgba(30, 30, 40, 0.95);
-                border: 1px solid rgba(255, 255, 255, 0.2);
-                border-radius: 8px;
-                padding: 4px;
-            }
-            QMenu::item {
-                color: #B0B0B0;
-                padding: 6px 20px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background: rgba(100, 100, 255, 0.3);
-                color: white;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: rgba(255, 255, 255, 0.1);
-                margin: 4px 10px;
-            }
-        """)
-
-        # Detect tracks in view (most commonly used)
-        detect_view_action = menu.addAction("🔍 Detect Tracks in View...")
-        detect_view_action.triggered.connect(self.detect_tracks_in_view)
-
-        menu.addSeparator()
-
-        # Analysis for selected annotation
-        snr_action = menu.addAction("📊 Estimate SNR (Selected)")
-        snr_action.triggered.connect(self.estimate_selected_annotation_snr)
-
+        
+        # Harmonics for selected annotation
         harmonics_action = menu.addAction("🎵 Detect Harmonics (Selected)")
         harmonics_action.triggered.connect(self.detect_harmonics_selected_annotation)
-
-        detect_track_action = menu.addAction("📈 Detect Track (Selected)")
-        detect_track_action.triggered.connect(self.detect_curved_track_selected_annotation)
-
-        menu.addSeparator()
-
-        suppress_action = menu.addAction("🚫 Suppress Track (Selected)")
-        suppress_action.triggered.connect(self.suppress_selected_annotation_track)
 
         menu.exec(QCursor.pos())
 
@@ -1381,7 +1195,7 @@ class MainWindow(QMainWindow):
                 if self.annotation_renderer:
                     self.annotation_renderer.clear_all(freeze_canvas=False)
 
-                # LIGHTWEIGHT: Only clear essential caches, preserve GPU memory pool
+                # LIGHTWEIGHT: Only clear essential caches, preserve memory pool
                 self.spectrogram_cache = {
                     'time_range': None, 'freq_range': None,
                     'fft_size': None, 'hop_length': None,
@@ -1477,9 +1291,13 @@ class MainWindow(QMainWindow):
                 self.save_annotations(silent=True)
                 logger.info(f"Auto-saved {len(self.annotation_manager)} annotations before file switch")
 
-            # Update annotation manager for new file (keep annotations persistent across files)
-            self.annotation_manager.set_file_path(file_path, clear_annotations=False)
-            logger.info(f"Keeping {len(self.annotation_manager)} annotations for file switch")
+            # Update annotation manager for new file
+            # CLEAR annotations from previous file to prevent ghosts/performance issues
+            self.annotation_manager.set_file_path(file_path, clear_annotations=True)
+            
+            # Load annotations for the new file
+            self.annotation_manager.load_from_json(project_manager=self.project_manager)
+            logger.info(f"Loaded {len(self.annotation_manager)} annotations for new file")
             
             # Set default normalization mode to STD with Gamma
             if hasattr(self, 'spectrogram_canvas'):
@@ -1492,16 +1310,13 @@ class MainWindow(QMainWindow):
             self._restore_event_markers_for_file(file_path)
 
             # Load and display saved tracks for this file
-            self._load_tracks_for_file(file_path)
+            # REMOVED: Legacy track session loading. Manual tracks are in annotations.
+            # self._load_tracks_for_file(file_path)
 
             # Refresh current view (this computes spectrogram - has its own progress)
             # IMPORTANT: This must happen BEFORE refreshing annotations so canvas has valid data
-            # FORCE_FULL: Ensure we load the whole file view initially, not a stale partial region
-            # QUALITY: Force quality parameters for initial view to match high-quality interactive mode
-            self.spectrogram_engine.set_parameters(
-                hop_length=max(1, int(getattr(self.spectrogram_engine, 'fft_size', 4096) * 0.03125)), # High overlap
-                window_type='blackmanharris' # Better window
-            )
+            # Respect user settings for FFT/Overlap instead of forcing overrides
+            # self.spectrogram_engine.set_parameters(...)
             
             self.refresh_current_view(force_full=True)
 
@@ -1566,7 +1381,7 @@ class MainWindow(QMainWindow):
             self.annotation_renderer.add_annotation(annotation, is_selected=False)
 
         # Add to table
-        self.annotation_table.add_annotation(annotation)
+        self._add_annotation_to_table(annotation)
 
         # Auto-save to persist new annotation
         self.save_annotations(silent=True)
@@ -1621,10 +1436,8 @@ class MainWindow(QMainWindow):
         extract_action = menu.addAction("Extract Cutout...")
         extract_action.triggered.connect(lambda: self.extract_and_show_cutout(annotation))
         
-        # Auto-detect track
-        auto_detect_action = menu.addAction("Auto Detect Track (Ctrl+D)")
-        auto_detect_action.triggered.connect(lambda: self.auto_detect_track_for_annotation(annotation))
-
+        # Auto-detect track removed
+        
         menu.addSeparator()
 
         # Draw Doppler Curve (if no curve yet)
@@ -1632,36 +1445,13 @@ class MainWindow(QMainWindow):
             draw_curve_action = menu.addAction("Draw Doppler Curve (C)")
             draw_curve_action.triggered.connect(lambda: self.start_curve_for_annotation(annotation))
         else:
-            # Already has curve - offer to calculate or redraw
-            doppler_action = menu.addAction("Calculate Doppler Velocity")
-            doppler_action.triggered.connect(lambda: self.calculate_doppler_for_annotation(annotation))
-
+            # Already has curve - redraw
             redraw_action = menu.addAction("Redraw Curve")
             redraw_action.triggered.connect(lambda: self.start_curve_for_annotation(annotation))
 
         menu.addSeparator()
 
-        # === Advanced DSP Analysis ===
-        dsp_menu = menu.addMenu("Advanced Analysis")
 
-        # SNR Estimation
-        snr_action = dsp_menu.addAction("Estimate SNR")
-        snr_action.triggered.connect(lambda: self.estimate_annotation_snr(annotation))
-
-        # Harmonic Detection
-        harmonic_action = dsp_menu.addAction("Detect Harmonics")
-        harmonic_action.triggered.connect(lambda: self.detect_harmonics_in_annotation(annotation))
-
-        # Curved Track Detection
-        curve_detect_action = dsp_menu.addAction("Detect Curved Tracks")
-        curve_detect_action.triggered.connect(lambda: self.detect_curved_tracks_in_annotation(annotation))
-
-        dsp_menu.addSeparator()
-
-        # Track Suppression (if has curve)
-        if annotation.points and len(annotation.points) >= 4:
-            suppress_action = dsp_menu.addAction("Suppress Track from Spectrogram")
-            suppress_action.triggered.connect(lambda: self.suppress_annotation_track(annotation))
 
         menu.addSeparator()
 
@@ -1759,7 +1549,7 @@ class MainWindow(QMainWindow):
                     self.annotation_renderer.update_doppler_curve(annotation)
                 
                 # Update table to show the new values
-                self.annotation_table.update_annotation(annotation)
+                self.curve_table.update_annotation(annotation)
 
                 # Save to file (uses project manager if loaded)
                 self.save_annotations(silent=True)
@@ -1819,7 +1609,7 @@ class MainWindow(QMainWindow):
                     self.annotation_renderer.update_doppler_curve(annotation)
 
                 # Update the table
-                self.annotation_table.update_annotation(annotation)
+                self.curve_table.update_annotation(annotation)
 
                 # Save to file (uses project manager if loaded)
                 self.save_annotations(silent=True)
@@ -1971,6 +1761,7 @@ class MainWindow(QMainWindow):
             # Remove from table (if called from elsewhere)
             # Note: if called from table itself, this might be redundant but safe
             self.annotation_table.remove_annotation(annotation_id)
+            self.curve_table.remove_annotation(annotation_id) # Also remove from curve table
             
             # Clear selection if this was selected
             if self.selected_annotation_id == annotation_id:
@@ -1996,16 +1787,24 @@ class MainWindow(QMainWindow):
         
         # Get updated data from table
         row = None
+        # Check annotation table first
         for r, ann_id in self.annotation_table.row_to_id.items():
             if ann_id == annotation_id:
                 row = r
+                data = self.annotation_table.get_annotation_data_from_row(row)
                 break
+        # If not found, check curve table
+        if row is None:
+            for r, ann_id in self.curve_table.row_to_id.items():
+                if ann_id == annotation_id:
+                    row = r
+                    data = self.curve_table.get_annotation_data_from_row(row)
+                    break
         
         if row is None:
             return
         
         # Read updated values from table (View and Curve checkboxes)
-        data = self.annotation_table.get_annotation_data_from_row(row)
         if data:
             annotation.is_visible = data.get('is_visible', True)
             annotation.show_doppler_curve = data.get('show_doppler_curve', True)
@@ -2039,32 +1838,39 @@ class MainWindow(QMainWindow):
         # Save changes (uses project manager if loaded)
         self.save_annotations(silent=True)
     
-    def on_doppler_visibility_changed(self, annotation_id: int, show_curve: bool):
-        """Handle Doppler curve visibility toggle from table.
+    
+    def on_curve_visibility_changed(self, annotation_id: int, is_visible: bool):
+        """Handle curve visibility toggle from table.
         
         Args:
             annotation_id: ID of annotation
-            show_curve: New visibility state for Doppler curve
+            is_visible: New visibility state for curve
         """
-        logger.info(f"on_doppler_visibility_changed: annotation_id={annotation_id}, show_curve={show_curve}")
+        logger.info(f"on_curve_visibility_changed: annotation_id={annotation_id}, is_visible={is_visible}")
         
         annotation = self.annotation_manager.get_annotation(annotation_id)
         if not annotation:
             logger.warning(f"Annotation {annotation_id} not found in manager")
             return
         
-        logger.info(f"Annotation {annotation_id} has {len(annotation.points) if annotation.points else 0} points")
+        # Update model
+        annotation.show_doppler_curve = is_visible
         
-        annotation.show_doppler_curve = show_curve
-        
-        # Update visual in renderer
+        # Update renderer
         if self.annotation_renderer:
-            self.annotation_renderer.set_doppler_curve_visible(annotation_id, show_curve)
+            self.annotation_renderer.set_doppler_curve_visible(annotation_id, is_visible)
         else:
             logger.warning("No annotation_renderer available")
 
-        # Save changes (uses project manager if loaded)
+        # Save changes
         self.save_annotations(silent=True)
+
+    def _add_annotation_to_table(self, annotation: Annotation):
+        """Add annotation to the appropriate table based on whether it has curve points."""
+        if annotation.points:
+            self.curve_table.add_annotation(annotation)
+        else:
+            self.annotation_table.add_annotation(annotation)
     
     def select_annotation(self, annotation_id: int):
         """Select an annotation (highlight it).
@@ -2080,6 +1886,7 @@ class MainWindow(QMainWindow):
         
         # Select in table
         self.annotation_table.select_annotation(annotation_id)
+        self.curve_table.select_annotation(annotation_id)
     
     def refresh_annotation_display(self, freeze_canvas: bool = True):
         """Refresh all annotation visuals from manager.
@@ -2107,6 +1914,7 @@ class MainWindow(QMainWindow):
             # Clear existing visuals - don't freeze internally as we handle it here or in caller
             self.annotation_renderer.clear_all(freeze_canvas=False)
             self.annotation_table.clear_all()
+            self.curve_table.clear_all()
             
             # Collect all annotations for batch addition
             annotations = list(self.annotation_manager)
@@ -2121,7 +1929,7 @@ class MainWindow(QMainWindow):
                 
                 # Add to table
                 for annotation in annotations:
-                    self.annotation_table.add_annotation(annotation)
+                    self._add_annotation_to_table(annotation)
         finally:
             # Always unfreeze and force a single final update if we froze it locally
             if canvas:
@@ -3748,7 +3556,21 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"File {new_idx + 1}/{total}")
             else:
                 self.statusBar().showMessage(f"Already at first file (1/{total})")
-    
+
+    def keyPressEvent(self, event: QKeyEvent):
+        """Handle key press events for the main window.
+
+        Space key: Go to next file in playlist
+        """
+        if event.key() == Qt.Key.Key_Space:
+            # Space key - go to next file
+            self.goto_next_file()
+            event.accept()
+            return
+
+        # Pass to parent for default handling
+        super().keyPressEvent(event)
+
     # =========================================================================
     # Background Spectrogram Computation (Performance Optimization)
     # =========================================================================
@@ -3987,120 +3809,11 @@ class MainWindow(QMainWindow):
                 binary=params['binary']
             )
 
-    # === Ridge/Edge Detection ===
 
-    def apply_meijering_filter(self):
-        """Apply Meijering ridge detection filter with dialog."""
-        dialog = MeijeringDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            sigmas = range(params['sigma_min'], params['sigma_max'] + 1)
-            self._apply_filter_common(
-                self.filter_manager.apply_meijering,
-                "Meijering Ridge Detection",
-                sigmas=sigmas,
-                black_ridges=params['black_ridges']
-            )
 
-    def apply_morphological_filter(self):
-        """Apply morphological filter with dialog."""
-        dialog = MorphologicalDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_morphological,
-                "Morphological Filter",
-                operation=params['operation'],
-                kernel_width=params['kernel_width'],
-                kernel_height=params['kernel_height']
-            )
 
-    # === Noise Removal ===
 
-    def apply_spectral_subtraction_filter(self):
-        """Apply spectral subtraction with dialog."""
-        dialog = SpectralSubtractionDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_spectral_subtraction,
-                "Spectral Subtraction",
-                noise_percentile=params['noise_percentile'],
-                subtraction_factor=params['subtraction_factor'],
-                floor=params['floor']
-            )
 
-    def apply_pcen_filter(self):
-        """Apply PCEN (Per-Channel Energy Normalization) with dialog."""
-        dialog = PCENDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_pcen,
-                "PCEN",
-                time_constant=params['time_constant'],
-                gain=params['gain'],
-                power=params['power'],
-                bias=params['bias'],
-                eps=params['eps']
-            )
-
-    def apply_adaptive_noise_gate_filter(self):
-        """Apply adaptive noise gate with dialog."""
-        dialog = AdaptiveNoiseGateDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_adaptive_noise_gate,
-                "Adaptive Noise Gate",
-                window_time=params['window_time'],
-                window_freq=params['window_freq'],
-                threshold_db=params['threshold_db'],
-                soft_knee=params['soft_knee']
-            )
-
-    # === Track/Line Removal ===
-
-    def apply_horizontal_line_removal_filter(self):
-        """Apply horizontal line removal with dialog."""
-        dialog = HorizontalLineRemovalDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_horizontal_line_removal,
-                "Horizontal Line Removal",
-                threshold_percentile=params['threshold_percentile'],
-                min_width_ratio=params['min_width_ratio'],
-                method=params['method']
-            )
-
-    def apply_vertical_line_removal_filter(self):
-        """Apply vertical line removal with dialog."""
-        dialog = VerticalLineRemovalDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_vertical_line_removal,
-                "Vertical Line Removal",
-                threshold_percentile=params['threshold_percentile'],
-                min_height_ratio=params['min_height_ratio'],
-                method=params['method']
-            )
-
-    def apply_track_suppression_filter(self):
-        """Apply track suppression with dialog."""
-        dialog = TrackSuppressionDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_track_suppression,
-                "Track Suppression",
-                method=params['method'],
-                sigma=params['sigma'],
-                threshold=params['threshold'],
-                suppression_strength=params['suppression_strength'],
-                inpaint=params['inpaint']
-            )
 
     # === Frequency Domain Filters ===
 
@@ -4154,226 +3867,11 @@ class MainWindow(QMainWindow):
                 rolloff=params['rolloff']
             )
 
-    # === Advanced Denoising Filters ===
 
-    def apply_wiener_filter(self):
-        """Apply Wiener filter with dialog."""
-        dialog = WienerFilterDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_wiener_filter,
-                "Wiener Filter",
-                noise_variance=params['noise_variance'],
-                window_size=params['window_size']
-            )
 
-    def apply_bilateral_filter(self):
-        """Apply bilateral filter with dialog."""
-        dialog = BilateralFilterDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_bilateral_filter,
-                "Bilateral Filter",
-                sigma_spatial=params['sigma_spatial'],
-                sigma_color=params['sigma_color']
-            )
 
-    def apply_harmonic_percussive_filter(self):
-        """Apply harmonic-percussive separation with dialog."""
-        dialog = HarmonicPercussiveDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_harmonic_percussive_separation,
-                "Harmonic-Percussive Separation",
-                kernel_size_harmonic=params['kernel_size_harmonic'],
-                kernel_size_percussive=params['kernel_size_percussive'],
-                output=params['output']
-            )
 
-    def apply_spectral_gating_filter(self):
-        """Apply spectral gating with dialog."""
-        dialog = SpectralGatingDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_spectral_gating,
-                "Spectral Gating",
-                noise_percentile=params['noise_percentile'],
-                threshold_db=params['threshold_db'],
-                smoothing_time=params['smoothing_time'],
-                smoothing_freq=params['smoothing_freq']
-            )
 
-    def apply_tv_denoise_filter(self):
-        """Apply Total Variation denoising with dialog."""
-        dialog = TotalVariationDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_denoise_tv,
-                "Total Variation Denoising",
-                weight=params['weight']
-            )
-
-    def apply_nlm_filter(self):
-        """Apply Non-Local Means denoising with dialog."""
-        dialog = NonLocalMeansDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_non_local_means,
-                "Non-Local Means Denoising",
-                patch_size=params['patch_size'],
-                patch_distance=params['patch_distance'],
-                h=params['h']
-            )
-
-    def apply_lcn_filter(self):
-        """Apply Local Contrast Normalization with dialog."""
-        dialog = LocalContrastNormDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_local_contrast_normalization,
-                "Local Contrast Normalization",
-                window_size=params['window_size'],
-                epsilon=params['epsilon']
-            )
-
-    def apply_clahe_filter(self):
-        """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) with dialog."""
-        dialog = CLAHEDialog(self)
-        if dialog.exec() == QDialog.Accepted:
-            params = dialog.get_values()
-            self._apply_filter_common(
-                self.filter_manager.apply_clahe,
-                "CLAHE",
-                clip_limit=params['clip_limit'],
-                tile_grid_size=params['tile_grid_size']
-            )
-
-    def apply_koren_filter(self):
-        """Apply Koren's multi-stage filter pipeline (V11.py) - fully adaptive, no parameters needed."""
-        # Get actual sample rate and hop length from spectrogram engine
-        sr = getattr(self.spectrogram_engine, 'sample_rate', 44100)
-        hop_length = self.spectrogram_cache.get('hop_length',
-                     getattr(self.spectrogram_engine, 'hop_length', 512))
-
-        # Koren's filter is fully adaptive - uses optimal parameters from V11.py
-        # No dialog needed - just apply with default parameters
-        self._apply_filter_common(
-            self.filter_manager.apply_koren_filter,
-            "Koren's Filter",
-            sr=sr,
-            hop_length=hop_length
-        )
-
-    # === Doppler Track Detection ===
-
-    def detect_doppler_tracks_full(self):
-        """Detect Doppler tracks in the full spectrogram."""
-        # Get spectrogram data
-        full_data, times, freqs = self._get_spectrogram_axes()
-        if full_data is None:
-            QMessageBox.warning(self, "Warning", "No spectrogram data available. Load a file first.")
-            return
-
-        # Show parameters dialog
-        dialog = DetectorParamsDialog(self, self.spectrogram_detector)
-        if dialog.exec() != QDialog.Accepted:
-            return
-
-        # Apply parameters to detector
-        dialog.apply_to_detector(self.spectrogram_detector)
-
-        # Save current tracks for undo
-        if self.detected_tracks:
-            self.detected_tracks_undo_stack.append(self.detected_tracks.copy())
-            # Limit undo stack size
-            if len(self.detected_tracks_undo_stack) > 10:
-                self.detected_tracks_undo_stack.pop(0)
-
-        # Run detection
-        self.statusBar().showMessage("Detecting Doppler tracks...")
-        QApplication.processEvents()
-
-        try:
-            def progress_callback(progress, message):
-                self.statusBar().showMessage(message)
-                QApplication.processEvents()
-
-            tracks = self.spectrogram_detector.detect(
-                full_data, freqs, times,
-                progress_callback=progress_callback
-            )
-
-            self.detected_tracks = tracks
-            logger.info(f"Detected {len(tracks)} Doppler tracks")
-
-            # Draw tracks on spectrogram
-            self._draw_detected_tracks()
-
-            self.statusBar().showMessage(f"Detected {len(tracks)} Doppler tracks")
-        except Exception as e:
-            logger.error(f"Track detection failed: {e}")
-            QMessageBox.critical(self, "Error", f"Track detection failed: {e}")
-            self.statusBar().showMessage("Track detection failed")
-
-    def clear_detected_tracks(self):
-        """Clear all detected tracks from the display."""
-        if not self.detected_tracks:
-            self.statusBar().showMessage("No detected tracks to clear")
-            return
-
-        # Save for undo
-        self.detected_tracks_undo_stack.append(self.detected_tracks.copy())
-        if len(self.detected_tracks_undo_stack) > 10:
-            self.detected_tracks_undo_stack.pop(0)
-
-        self.detected_tracks = []
-        self._draw_detected_tracks()
-        self.statusBar().showMessage("Detected tracks cleared")
-
-    def undo_detected_tracks(self):
-        """Undo the last track detection or clear operation."""
-        if not self.detected_tracks_undo_stack:
-            self.statusBar().showMessage("No track changes to undo")
-            return
-
-        # Restore previous tracks
-        self.detected_tracks = self.detected_tracks_undo_stack.pop()
-        self._draw_detected_tracks()
-        self.statusBar().showMessage(f"Restored {len(self.detected_tracks)} tracks")
-
-    def _draw_detected_tracks(self):
-        """Draw detected tracks on the spectrogram canvas."""
-        if not hasattr(self, 'spectrogram_canvas'):
-            return
-
-        # Clear existing track visuals
-        if hasattr(self.spectrogram_canvas, 'clear_detected_tracks'):
-            self.spectrogram_canvas.clear_detected_tracks()
-
-        if not self.detected_tracks:
-            return
-
-        # Draw each track
-        for i, track in enumerate(self.detected_tracks):
-            if hasattr(self.spectrogram_canvas, 'add_detected_track'):
-                # Pass track data to canvas for rendering
-                self.spectrogram_canvas.add_detected_track(
-                    times=track.times,
-                    freqs=track.freqs,
-                    track_id=i,
-                    color=(1.0, 0.3, 0.3, 0.8)  # Red-ish color
-                )
-
-        # Trigger redraw
-        if hasattr(self.spectrogram_canvas, 'update'):
-            self.spectrogram_canvas.update()
 
     # === Undo/Redo ===
 
@@ -5097,6 +4595,7 @@ class MainWindow(QMainWindow):
 
 <h3>File Navigation</h3>
 <table>
+<tr><td><b>Space</b></td><td>Next file in playlist</td></tr>
 <tr><td><b>Ctrl+]</b></td><td>Next file in playlist</td></tr>
 <tr><td><b>Ctrl+[</b></td><td>Previous file in playlist</td></tr>
 <tr><td><b>Ctrl+O</b></td><td>Open audio file</td></tr>
